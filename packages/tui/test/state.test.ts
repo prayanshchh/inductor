@@ -242,15 +242,17 @@ describe("transcript reducer", () => {
     })
 
     expect(state.transcript.map((item) => item.kind)).toEqual([
+      "user",
       "assistant",
       "tool",
       "assistant",
       "tool",
       "assistant",
     ])
-    expect(state.transcript[0]).toMatchObject({ kind: "assistant", text: "initial thoughts" })
-    expect(state.transcript[2]).toMatchObject({ kind: "assistant", text: "middle thoughts" })
-    expect(state.transcript[4]).toMatchObject({ kind: "assistant", text: "final thoughts" })
+    expect(state.transcript[0]).toMatchObject({ kind: "user", text: "do work" })
+    expect(state.transcript[1]).toMatchObject({ kind: "assistant", text: "initial thoughts" })
+    expect(state.transcript[3]).toMatchObject({ kind: "assistant", text: "middle thoughts" })
+    expect(state.transcript[5]).toMatchObject({ kind: "assistant", text: "final thoughts" })
   })
 
   test("shows stopped agent for interrupted results", () => {

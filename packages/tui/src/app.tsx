@@ -84,6 +84,13 @@ const theme = {
   progressTrack: "#343b3f",
 }
 
+const SESSION_SIDEBAR_WIDTH = 68
+const SESSION_SIDEBAR_TEXT_WIDTH = SESSION_SIDEBAR_WIDTH - 6
+const TELEMETRY_SIDEBAR_WIDTH = 21
+const TELEMETRY_PROGRESS_WIDTH = 15
+const TELEMETRY_FILE_WIDTH = 11
+const TELEMETRY_FOOTER_WIDTH = 17
+
 const commands: Command[] = [
   { name: "/agents", description: "Switch agent", action: "agents" },
   { name: "/connect", description: "Connect provider", action: "connect" },
@@ -876,7 +883,7 @@ function SessionSidebar(props: {
 }) {
   return (
     <box
-      width={18}
+      width={SESSION_SIDEBAR_WIDTH}
       height="100%"
       flexShrink={0}
       backgroundColor={theme.panelSoft}
@@ -905,7 +912,7 @@ function SessionSidebar(props: {
         <text fg={theme.cyan}>SESSIONS</text>
         <box flexGrow={1} />
       </box>
-      <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, 28)}</text>}>
+      <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, SESSION_SIDEBAR_TEXT_WIDTH)}</text>}>
         <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
           <box flexDirection="column" gap={1}>
             <Show when={props.sessions.length > 0} fallback={<text fg={theme.dim}>No previous sessions</text>}>
@@ -924,7 +931,7 @@ function SessionSidebar(props: {
                       onMouseUp={() => props.loadSession(session.id)}
                     >
                       <text fg={active() ? theme.text : theme.muted} attributes={active() ? TextAttributes.BOLD : undefined} wrapMode="none">
-                        {truncateRight(sessionTitle(session), 14)}
+                        {truncateRight(sessionTitle(session), SESSION_SIDEBAR_TEXT_WIDTH)}
                       </text>
                       <box flexDirection="row" gap={1}>
                         <text fg={theme.dim}>{truncateRight(shortModel(session.model), 12)}</text>
@@ -1598,7 +1605,7 @@ function TelemetrySidebar(props: {
 }) {
   return (
     <box
-      width={42}
+      width={TELEMETRY_SIDEBAR_WIDTH}
       height="100%"
       flexShrink={0}
       backgroundColor={theme.panelSoft}
@@ -1617,8 +1624,8 @@ function TelemetrySidebar(props: {
             <text fg={theme.cyan}>CONTEXT</text>
             <text fg={theme.muted}>{props.state.tokens.toLocaleString()} tokens</text>
             <text fg={theme.muted}>{props.contextPercent}% used</text>
-            <box width={30} height={1} backgroundColor={theme.progressTrack} marginTop={1}>
-              <box width={Math.max(1, Math.floor(props.contextPercent * 0.3))} height={1} backgroundColor={theme.progress} />
+            <box width={TELEMETRY_PROGRESS_WIDTH} height={1} backgroundColor={theme.progressTrack} marginTop={1}>
+              <box width={Math.max(1, Math.floor((props.contextPercent / 100) * TELEMETRY_PROGRESS_WIDTH))} height={1} backgroundColor={theme.progress} />
             </box>
             <text fg={theme.muted}>{money.format(props.state.costUsd)} spent</text>
           </box>
@@ -1627,7 +1634,7 @@ function TelemetrySidebar(props: {
         </box>
       </scrollbox>
       <box flexShrink={0} flexDirection="column" gap={1}>
-        <text fg={theme.muted}>{shortWorkspace(props.workspace)}:{props.branch}</text>
+        <text fg={theme.muted}>{truncateRight(`${shortWorkspace(props.workspace)}:${props.branch}`, TELEMETRY_FOOTER_WIDTH)}</text>
         <box flexDirection="row" gap={1}>
           <text fg={theme.green}>•</text>
           <text fg={theme.text} attributes={TextAttributes.BOLD}>Inductor</text>
@@ -1661,7 +1668,7 @@ function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: Modified
                 wrapMode="none"
                 selectable={false}
               >
-                {truncateLeft(file.file, 28)}
+                {truncateLeft(file.file, TELEMETRY_FILE_WIDTH)}
               </text>
               <box flexShrink={0} flexDirection="row" gap={1}>
                 <Show when={file.additions > 0}><text fg={theme.cyan}>+{file.additions}</text></Show>
