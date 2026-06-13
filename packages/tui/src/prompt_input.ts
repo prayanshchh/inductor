@@ -18,11 +18,27 @@ export function shouldNavigateHistory(value: string, cursorOffset: number, direc
   return value.indexOf("\n", offset) === -1
 }
 
+export const PROMPT_HISTORY_LIMIT = 500
+
 export function recordPromptHistory(entries: string[], value: string) {
   const item = value.trim()
   if (!item) return entries
   if (entries.at(-1) === item) return entries
   return [...entries, item]
+}
+
+export function parsePromptHistory(raw: string): string[] {
+  try {
+    const data = JSON.parse(raw)
+    if (!Array.isArray(data)) return []
+    return data.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+  } catch {
+    return []
+  }
+}
+
+export function serializePromptHistory(entries: string[]): string {
+  return JSON.stringify(entries.slice(-PROMPT_HISTORY_LIMIT))
 }
 
 export function stepPromptHistory(state: PromptHistoryState, currentDraft: string, direction: HistoryDirection) {

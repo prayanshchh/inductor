@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore, produce } from "solid-js/store"
@@ -34,7 +34,7 @@ import {
   type MentionState,
   type PromptImageAttachment,
 } from "./mentions"
-import { insertTextAtCursor, recordPromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
+import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
 
 export type AppProps = BackendOptions
 
@@ -138,6 +138,24 @@ const syntaxStyle = SyntaxStyle.fromTheme([
   { scope: ["markup.raw", "code"], style: { foreground: theme.green } },
 ])
 
+function loadPromptHistoryFile(filePath: string): string[] {
+  try {
+    if (!existsSync(filePath)) return []
+    return parsePromptHistory(readFileSync(filePath, "utf8"))
+  } catch {
+    return []
+  }
+}
+
+function savePromptHistoryFile(filePath: string, entries: string[]) {
+  try {
+    mkdirSync(path.dirname(filePath), { recursive: true })
+    writeFileSync(filePath, serializePromptHistory(entries))
+  } catch {
+    // history persistence is best-effort; ignore write failures
+  }
+}
+
 export function App(props: AppProps) {
   let input!: TextareaRenderable
   let currentRun: BackendRun | undefined
@@ -152,7 +170,8 @@ export function App(props: AppProps) {
   const [stopArmed, setStopArmed] = createSignal<StopIntent>()
   const [notice, setNotice] = createSignal<ComposerNotice>()
   const [permissionSelected, setPermissionSelected] = createSignal(0)
-  const [promptHistory, setPromptHistory] = createSignal<PromptHistoryState>({ entries: [], draft: "" })
+  const promptHistoryPath = path.join(props.workspace, ".inductor", "prompt-history.json")
+  const [promptHistory, setPromptHistory] = createSignal<PromptHistoryState>({ entries: loadPromptHistoryFile(promptHistoryPath), draft: "" })
   const [palette, setPalette] = createSignal<PaletteKind>()
   const [selected, setSelected] = createSignal(0)
   const [mention, setMention] = createSignal<MentionState>()
@@ -301,7 +320,11 @@ export function App(props: AppProps) {
   }
 
   function recordHistory(value: string) {
-    setPromptHistory((current) => ({ entries: recordPromptHistory(current.entries, value), draft: "" }))
+    setPromptHistory((current) => {
+      const entries = recordPromptHistory(current.entries, value)
+      if (entries !== current.entries) savePromptHistoryFile(promptHistoryPath, entries)
+      return { entries, draft: "" }
+    })
   }
 
   function replacePrompt(value: string) {

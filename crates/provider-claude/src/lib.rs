@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
+    sync::{Arc, Mutex},
 };
 
 use async_stream::try_stream;
@@ -14,7 +15,7 @@ use harness_core::{
 use provider_core::{PermissionResponses, ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     time::{Duration, Instant, sleep_until, timeout},
 };
@@ -85,9 +86,12 @@ impl ClaudeProvider {
             }
         }
 
+        let diagnostics = bridge.exit_diagnostics().await;
         Ok(AuthCheck {
             ok: false,
-            error: Some("Claude Agent SDK bridge exited before reporting auth status".to_string()),
+            error: Some(format!(
+                "Claude Agent SDK bridge exited before reporting auth status{diagnostics}"
+            )),
         })
     }
 }
@@ -206,9 +210,12 @@ impl ProviderPlugin for ClaudeProvider {
                     Step::Read(read) => {
                         last_activity = Instant::now();
                         let Some(value) = read? else {
+                            let diagnostics = bridge.exit_diagnostics().await;
                             yield SessionEvent::Error {
                                 session_id,
-                                message: "Claude Agent SDK bridge exited before returning a result".to_string(),
+                                message: format!(
+                                    "Claude Agent SDK bridge exited before returning a result{diagnostics}"
+                                ),
                             };
                             return;
                         };
@@ -515,7 +522,11 @@ struct SdkBridge {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr: Arc<Mutex<String>>,
 }
+
+/// Cap on how much bridge stderr we retain for diagnostics.
+const MAX_BRIDGE_STDERR: usize = 4096;
 
 impl SdkBridge {
     async fn spawn(command: BridgeCommand, cwd: &Path) -> anyhow::Result<Self> {
@@ -524,7 +535,7 @@ impl SdkBridge {
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let stdout = child
@@ -533,11 +544,56 @@ impl SdkBridge {
             .ok_or_else(|| anyhow::anyhow!("failed to open Claude SDK bridge stdout"))?;
         let stdin = child.stdin.take();
 
+        // Drain stderr into a bounded buffer so a silent crash (e.g. a missing
+        // node module) surfaces a real reason instead of a bare EOF.
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(mut child_stderr) = child.stderr.take() {
+            let sink = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                let _ = child_stderr.read_to_string(&mut buf).await;
+                if !buf.is_empty() {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.push_str(&buf);
+                        if guard.len() > MAX_BRIDGE_STDERR {
+                            let start = guard.len() - MAX_BRIDGE_STDERR;
+                            *guard = guard[start..].to_string();
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             child,
             stdin,
             lines: BufReader::new(stdout).lines(),
+            stderr,
         })
+    }
+
+    /// Build a diagnostic suffix describing why the bridge stopped: its exit
+    /// status plus any captured stderr. Used to turn a bare EOF into a real
+    /// error message.
+    async fn exit_diagnostics(&mut self) -> String {
+        let status = match timeout(Duration::from_secs(2), self.child.wait()).await {
+            Ok(Ok(status)) => status
+                .code()
+                .map(|code| format!("exit code {code}"))
+                .unwrap_or_else(|| "terminated by signal".to_string()),
+            _ => "still running".to_string(),
+        };
+        let stderr = self
+            .stderr
+            .lock()
+            .ok()
+            .map(|guard| guard.trim().to_string())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            format!(" ({status})")
+        } else {
+            format!(" ({status}): {stderr}")
+        }
     }
 
     async fn send_request(&mut self, request: &BridgeRequest) -> anyhow::Result<()> {
