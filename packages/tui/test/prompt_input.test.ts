@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { insertTextAtCursor, recordPromptHistory, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
+import { insertTextAtCursor, parsePromptHistory, PROMPT_HISTORY_LIMIT, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
 
 describe("prompt input helpers", () => {
   test("inserts ctrl-j newline at the cursor", () => {
@@ -34,5 +34,28 @@ describe("prompt input helpers", () => {
     expect(shouldNavigateHistory(prompt, 2, -1)).toBe(true)
     expect(shouldNavigateHistory(prompt, 2, 1)).toBe(false)
     expect(shouldNavigateHistory(prompt, prompt.length, 1)).toBe(true)
+  })
+
+  test("round-trips persisted history and survives a reload", () => {
+    const entries = recordPromptHistory(recordPromptHistory([], "first"), "second")
+    const restored = parsePromptHistory(serializePromptHistory(entries))
+    expect(restored).toEqual(["first", "second"])
+
+    let state: PromptHistoryState = { entries: restored, draft: "" }
+    const result = stepPromptHistory(state, "unfinished", -1)
+    expect(result.value).toBe("second")
+  })
+
+  test("ignores malformed or non-string history payloads", () => {
+    expect(parsePromptHistory("not json")).toEqual([])
+    expect(parsePromptHistory("{}")).toEqual([])
+    expect(parsePromptHistory(JSON.stringify(["ok", 42, "", "  ", "fine"]))).toEqual(["ok", "fine"])
+  })
+
+  test("caps persisted history at the limit", () => {
+    const entries = Array.from({ length: PROMPT_HISTORY_LIMIT + 50 }, (_, i) => `cmd ${i}`)
+    const restored = parsePromptHistory(serializePromptHistory(entries))
+    expect(restored.length).toBe(PROMPT_HISTORY_LIMIT)
+    expect(restored.at(-1)).toBe(`cmd ${PROMPT_HISTORY_LIMIT + 49}`)
   })
 })
