@@ -84,12 +84,12 @@ const theme = {
   progressTrack: "#343b3f",
 }
 
-const SESSION_SIDEBAR_WIDTH = 80
+const SESSION_SIDEBAR_WIDTH = 46
 const SESSION_SIDEBAR_TEXT_WIDTH = SESSION_SIDEBAR_WIDTH - 6
-const TELEMETRY_SIDEBAR_WIDTH = 21
-const TELEMETRY_PROGRESS_WIDTH = 15
-const TELEMETRY_FILE_WIDTH = 11
-const TELEMETRY_FOOTER_WIDTH = 17
+const TELEMETRY_SIDEBAR_WIDTH = 32
+const TELEMETRY_PROGRESS_WIDTH = 24
+const TELEMETRY_FILE_WIDTH = 22
+const TELEMETRY_FOOTER_WIDTH = 24
 
 const commands: Command[] = [
   { name: "/agents", description: "Switch agent", action: "agents" },
