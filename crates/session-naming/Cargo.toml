@@ -1,0 +1,19 @@
+[package]
+name = "session-naming"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+anyhow = "1.0"
+futures-util = "0.3"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+harness-core = { path = "../harness-core" }
+provider-claude = { path = "../provider-claude" }
+provider-codex = { path = "../provider-codex" }
+provider-core = { path = "../provider-core" }
+auth = { path = "../auth" }

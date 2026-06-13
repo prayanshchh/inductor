@@ -1,0 +1,26 @@
+[package]
+name = "harness-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+context = { version = "0.1.0", path = "../context" }
+futures-core = "0.3.32"
+futures-util = "0.3.32"
+harness-core = { version = "0.1.0", path = "../harness-core" }
+provider-core = { version = "0.1.0", path = "../provider-core" }
+regex = "1.12.3"
+serde = "1.0.228"
+serde_json = "1.0.150"
+time = { version = "=0.3.46", features = ["formatting", "macros"] }
+tokio = { version = "1.52.3", features = ["macros"] }
+tokio-util = "0.7.18"
+tools = { version = "0.1.0", path = "../tools" }
+
+[dev-dependencies]
+async-trait = "0.1.89"
+secrecy = "0.10.3"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "sync"] }

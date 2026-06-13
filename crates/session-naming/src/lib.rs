@@ -1,0 +1,232 @@
+//! Automatic session naming using smaller, cheaper models.
+
+use anyhow::Result;
+use async_trait::async_trait;
+use auth::{AuthDetector, ProviderKind, RuntimeCredentialLoader};
+use futures_util::StreamExt;
+use harness_core::{SessionId, TurnRequest};
+use provider_claude::ClaudeProvider;
+use provider_codex::CodexProvider;
+use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
+use secrecy::SecretString;
+use tokio_util::sync::CancellationToken;
+
+/// Configuration for session naming
+#[derive(Debug, Clone)]
+pub struct SessionNamingConfig {
+    /// The provider to use for naming (should be cheap/fast)
+    pub provider: ProviderKind,
+    /// The model to use for naming (should be cheap, like Haiku)
+    pub model: String,
+    /// Whether to enable session naming
+    pub enabled: bool,
+}
+
+impl Default for SessionNamingConfig {
+    fn default() -> Self {
+        Self {
+            provider: ProviderKind::Claude,
+            model: "haiku".to_string(), // Use cheaper Claude Haiku for naming
+            enabled: true,
+        }
+    }
+}
+
+/// Trait for generating session names
+#[async_trait]
+pub trait SessionNamer: Send + Sync {
+    async fn generate_name(&self, prompts: &[String]) -> Result<String>;
+}
+
+/// Session namer that uses a language model to generate names
+pub struct ModelBasedNamer {
+    config: SessionNamingConfig,
+}
+
+impl ModelBasedNamer {
+    pub fn new(config: SessionNamingConfig) -> Self {
+        Self { config }
+    }
+
+    async fn get_provider_and_auth(&self) -> Result<(Box<dyn ProviderPlugin>, ProviderAuth)> {
+        let detector = AuthDetector::from_env()?;
+        let credentials = detector.detect_all();
+        let reference = credentials
+            .iter()
+            .find(|credential| credential.provider == self.config.provider)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no detected credential for {:?}", self.config.provider)
+            })?;
+
+        let (provider, auth): (Box<dyn ProviderPlugin>, ProviderAuth) = match self.config.provider {
+            ProviderKind::Claude => {
+                let provider = Box::new(ClaudeProvider::new()?);
+                let auth = ProviderAuth::new(
+                    ProviderAuthKind::SessionToken,
+                    SecretString::from(String::new()),
+                );
+                (provider, auth)
+            }
+            ProviderKind::Codex => {
+                let provider = Box::new(CodexProvider::new()?);
+                let auth = RuntimeCredentialLoader::load(reference)?.into_provider_auth();
+                (provider, auth)
+            }
+        };
+
+        Ok((provider, auth))
+    }
+}
+
+#[async_trait]
+impl SessionNamer for ModelBasedNamer {
+    async fn generate_name(&self, prompts: &[String]) -> Result<String> {
+        if !self.config.enabled || prompts.is_empty() {
+            return Ok("New Session".to_string());
+        }
+
+        // Take up to 2 prompts and limit their length to avoid token limits
+        let prompt_content = prompts
+            .iter()
+            .take(2)
+            .map(|p| {
+                // Truncate very long prompts to stay within token limits
+                if p.len() > 2000 {
+                    format!("{}...", &p[..2000])
+                } else {
+                    p.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let naming_prompt = title_prompt(&prompt_content);
+
+        let (provider, auth) = self.get_provider_and_auth().await?;
+
+        let session_id = SessionId::new();
+        let request = TurnRequest {
+            session_id,
+            model: self.config.model.clone(),
+            prompt: naming_prompt,
+            system_prompt: None,
+            messages: Vec::new(),
+            tool_names: Vec::new(),
+            metadata: serde_json::Value::Null,
+            images: Vec::new(),
+        };
+
+        let cancel = CancellationToken::new();
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_rx = provider_core::empty_tool_responses();
+
+        let mut stream = provider
+            .stream_turn(&auth, request, cancel, perm_rx, tool_rx)
+            .await?;
+        let mut response_text = String::new();
+
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if let harness_core::SessionEvent::TextDelta { text, .. } = event {
+                response_text.push_str(&text);
+            } else if let harness_core::SessionEvent::Result { .. } = event {
+                break;
+            }
+        }
+
+        let name = clean_title(&response_text);
+
+        // Fallback if the name is too long or empty
+        if name.is_empty() || name.chars().count() > 50 {
+            Ok("New Session".to_string())
+        } else {
+            Ok(name)
+        }
+    }
+}
+
+fn title_prompt(prompt_content: &str) -> String {
+    format!(
+        "You are a title generator. You output ONLY a thread title. Nothing else.\n\n\
+<task>\n\
+Generate a brief title that would help the user find this conversation later.\n\
+Your output must be a single line, no more than 50 characters, with no explanations or quotes.\n\
+</task>\n\n\
+<rules>\n\
+- Use the same language as the user request.\n\
+- Focus on the main topic or change the user needs.\n\
+- Never include tool names.\n\
+- Keep exact technical terms, numbers, filenames, and HTTP codes.\n\
+- Do not answer questions or mention that you are generating a title.\n\
+- Always output something meaningful, even if the input is minimal.\n\
+</rules>\n\n\
+User request(s):\n{prompt_content}"
+    )
+}
+
+fn clean_title(response: &str) -> String {
+    let line = response
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("New Session")
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches('.')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+
+    line.to_string()
+}
+
+/// Generate a session name based on the first few user prompts
+pub async fn generate_session_name(
+    prompts: &[String],
+    config: Option<SessionNamingConfig>,
+) -> Result<String> {
+    let config = config.unwrap_or_default();
+    let namer = ModelBasedNamer::new(config);
+    namer.generate_name(prompts).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_empty_prompts() {
+        let config = SessionNamingConfig::default();
+        let namer = ModelBasedNamer::new(config);
+        let name = namer.generate_name(&[]).await.unwrap();
+        assert_eq!(name, "New Session");
+    }
+
+    #[tokio::test]
+    async fn test_disabled_config() {
+        let config = SessionNamingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let namer = ModelBasedNamer::new(config);
+        let name = namer
+            .generate_name(&["Test prompt".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(name, "New Session");
+    }
+
+    #[test]
+    fn clean_title_removes_quotes_and_period() {
+        assert_eq!(clean_title("\"Parser bug fix.\"\nextra"), "Parser bug fix");
+    }
+
+    #[test]
+    fn title_prompt_keeps_strict_rules() {
+        let prompt = title_prompt("fix auth refresh");
+
+        assert!(prompt.contains("ONLY a thread title"));
+        assert!(prompt.contains("fix auth refresh"));
+    }
+}

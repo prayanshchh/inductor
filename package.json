@@ -1,0 +1,14 @@
+{
+  "name": "inductor",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "tui": "bun --cwd packages/tui dev",
+    "typecheck": "bun --cwd packages/tui typecheck",
+    "test:tui": "bun --cwd packages/tui test"
+  }
+}

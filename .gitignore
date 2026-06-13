@@ -1,0 +1,36 @@
+/target/
+node_modules/
+**/*.rs.bk
+.DS_Store
+.inductor/
+.claude/
+.conductor/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.p8
+.npmrc
+.yarnrc
+.netrc
+
+# Local runtime data and logs
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.bak
+*.tmp
+
+# Generated frontend/build artifacts
+coverage/
+dist/
+.cache/
+.tmp/
