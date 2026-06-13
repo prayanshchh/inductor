@@ -85,6 +85,7 @@ export type StoredSessionDetail = {
     updated_at: string
   }
   messages: StoredMessage[]
+  events?: SessionEvent[]
 }
 
 const decoder = new TextDecoder()

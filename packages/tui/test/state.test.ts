@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { applyPermissionDecision, applySessionEvent, addUserMessage, createInitialState } from "../src/state"
+import { applyPermissionDecision, applySessionEvent, addUserMessage, createInitialState, loadStoredSession } from "../src/state"
 
 describe("transcript reducer", () => {
   test("streams assistant text into a single row", () => {
@@ -129,17 +129,128 @@ describe("transcript reducer", () => {
     })
   })
 
-  test("renders diagnostics metadata as a status row", () => {
+  test("keeps diagnostics metadata out of the transcript", () => {
     let state = createInitialState()
     state = applySessionEvent(state, {
       type: "diagnostics",
       files: [{ path: "src/main.rs", exists: true, lines: 7, bytes: 120 }],
     })
 
-    expect(state.transcript.at(-1)).toMatchObject({
-      kind: "status",
-      text: "diagnostics: src/main.rs: 7 lines, 120 bytes",
+    expect(state.transcript).toEqual([])
+  })
+
+  test("renders requested tool events as tool rows", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_requested",
+      tool_call_id: "call-read",
+      name: "read_file",
+      input_json: { path: "CONTEXT.md" },
     })
+
+    expect(state.transcript).toHaveLength(1)
+    expect(state.transcript[0]).toMatchObject({
+      kind: "tool",
+      toolCallId: "call-read",
+      name: "read_file",
+      input: '{\n  "path": "CONTEXT.md"\n}',
+      status: "running",
+    })
+  })
+
+  test("does not duplicate requested tool when the start event arrives", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_requested",
+      name: "read_file",
+      input_json: { path: "CONTEXT.md" },
+    })
+    state = applySessionEvent(state, {
+      type: "tool_call_start",
+      tool_call_id: "call-read",
+      name: "read_file",
+      input_json: { path: "CONTEXT.md" },
+    })
+
+    expect(state.transcript).toHaveLength(1)
+    expect(state.transcript[0]).toMatchObject({ kind: "tool", toolCallId: "call-read" })
+  })
+
+  test("parses terminal tool request text as a tool row", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "terminal_output",
+      chunk: 'tool call requested: {"input":{"path":"CONTEXT.md"},"name":"read_file"}\n',
+    })
+
+    expect(state.transcript).toHaveLength(1)
+    expect(state.transcript[0]).toMatchObject({
+      kind: "tool",
+      name: "read_file",
+      input: '{\n  "path": "CONTEXT.md"\n}',
+    })
+  })
+
+  test("loads stored sessions without generic status tool errors", () => {
+    const state = loadStoredSession({
+      session: {
+        id: "s1",
+        provider_id: "claude",
+        model: "sonnet",
+        status: "idle",
+        display_name: null,
+        created_at: "2026-06-13T00:00:00Z",
+        updated_at: "2026-06-13T00:00:00Z",
+      },
+      messages: [
+        { role: "user", content: "read context", ordinal: 0 },
+        { role: "assistant", content: 'tool call requested: {"input":{"path":"CONTEXT.md"},"name":"read_file"}', ordinal: 1 },
+        { role: "tool", content: "Tool: read_file error: tool paths must be workspace-relative", ordinal: 2 },
+        { role: "assistant", content: "Done.", ordinal: 3 },
+      ],
+    })
+
+    expect(state.transcript.map((item) => item.kind)).toEqual(["user", "tool", "assistant"])
+    expect(state.transcript[1]).toMatchObject({ kind: "tool", name: "read_file" })
+  })
+
+  test("loads stored sessions from event order instead of clubbing assistant text", () => {
+    const state = loadStoredSession({
+      session: {
+        id: "s1",
+        provider_id: "claude",
+        model: "sonnet",
+        status: "completed",
+        display_name: null,
+        created_at: "2026-06-13T00:00:00Z",
+        updated_at: "2026-06-13T00:00:00Z",
+      },
+      messages: [
+        { role: "user", content: "do work", ordinal: 0 },
+        { role: "assistant", content: "initial thoughts\nmiddle thoughts\nfinal thoughts", ordinal: 1 },
+      ],
+      events: [
+        { type: "text_delta", text: "initial thoughts" },
+        { type: "tool_call_start", tool_call_id: "call-1", name: "read_file", input_json: { path: "a.rs" } },
+        { type: "tool_call_result", tool_call_id: "call-1", output: "a", exit_code: 0 },
+        { type: "text_delta", text: "middle thoughts" },
+        { type: "tool_call_start", tool_call_id: "call-2", name: "bash", input_json: { command: "cargo test" } },
+        { type: "tool_call_result", tool_call_id: "call-2", output: "ok", exit_code: 0 },
+        { type: "text_delta", text: "final thoughts" },
+        { type: "result", stop_reason: "end_turn" },
+      ],
+    })
+
+    expect(state.transcript.map((item) => item.kind)).toEqual([
+      "assistant",
+      "tool",
+      "assistant",
+      "tool",
+      "assistant",
+    ])
+    expect(state.transcript[0]).toMatchObject({ kind: "assistant", text: "initial thoughts" })
+    expect(state.transcript[2]).toMatchObject({ kind: "assistant", text: "middle thoughts" })
+    expect(state.transcript[4]).toMatchObject({ kind: "assistant", text: "final thoughts" })
   })
 
   test("shows stopped agent for interrupted results", () => {

@@ -77,11 +77,24 @@ export function addUserMessage(state: AppState, text: string): AppState {
 
 export function loadStoredSession(detail: StoredSessionDetail): AppState {
   const title = detail.session.display_name || summarizeTitle(firstUserMessage(detail) ?? "")
-  return {
+  const initial = {
     ...createInitialState(),
     title,
     status: String(detail.session.status ?? "idle").toLowerCase(),
-    transcript: detail.messages.map(storedMessageToTranscriptItem),
+  }
+  if (Array.isArray(detail.events) && detail.events.length > 0) {
+    const firstPrompt = firstUserMessage(detail)
+    const withPrompt = firstPrompt
+      ? { ...initial, transcript: [{ id: nextId("user"), kind: "user" as const, text: firstPrompt }] }
+      : initial
+    return detail.events.reduce((current, event) => applySessionEvent(current, event), withPrompt)
+  }
+  const transcript = detail.messages
+    .map(storedMessageToTranscriptItem)
+    .filter((item): item is TranscriptItem => Boolean(item))
+  return {
+    ...initial,
+    transcript,
   }
 }
 
@@ -94,13 +107,15 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
     case "text_start":
     case "text_end":
     case "reasoning_start":
-    case "reasoning_delta":
     case "reasoning_end":
     case "tool_input_start":
     case "tool_input_delta":
     case "tool_input_end":
-    case "tool_call_requested":
       return state
+    case "reasoning_delta":
+      return appendAssistantText(state, event.text ?? event.delta ?? "")
+    case "tool_call_requested":
+      return appendRequestedTool(state, event.name ?? "tool", event.input_json, event.tool_call_id ? String(event.tool_call_id) : undefined)
     case "permission_resolved":
       return { ...state, pendingPermission: undefined, status: "running_tools" }
     case "context_prepared":
@@ -121,18 +136,7 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
           modifiedFiles: isMutatingTool(event.name ?? "tool")
             ? mergeModifiedFiles(state.modifiedFiles, modifiedFileFromInput(event.input_json))
             : state.modifiedFiles,
-          transcript: [
-            ...state.transcript,
-            {
-              id: nextId("tool"),
-              kind: "tool",
-              toolCallId: String(event.tool_call_id ?? nextId("call")),
-              name: event.name ?? "tool",
-              input,
-              status: "running",
-              approval: approval?.decision,
-            },
-          ],
+          transcript: upsertStartedTool(state.transcript, event.name ?? "tool", input, String(event.tool_call_id ?? nextId("call")), approval?.decision),
         }
       }
     case "tool_call_progress":
@@ -171,7 +175,7 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
         costUsd: Number(event.total_cost_usd ?? state.costUsd),
       }
     case "terminal_output":
-      return appendAssistantText(state, event.chunk ?? "")
+      return appendTerminalOutput(state, event.chunk ?? "")
     case "result":
       if (event.stop_reason === "interrupted") return markAgentStopped(state)
       return { ...state, running: false, status: String(event.stop_reason ?? "completed"), pendingPermission: undefined }
@@ -264,6 +268,65 @@ function appendAssistantText(state: AppState, text: string): AppState {
   return { ...state, transcript }
 }
 
+function appendRequestedTool(state: AppState, name: string, inputJson: unknown, toolCallId?: string): AppState {
+  const input = stringify(inputJson)
+  if (hasMatchingRequestedTool(state.transcript, name, input, toolCallId)) return state
+  return {
+    ...state,
+    transcript: [
+      ...state.transcript,
+      {
+        id: nextId("tool"),
+        kind: "tool",
+        toolCallId: toolCallId ?? nextId("requested"),
+        name,
+        input,
+        status: "running",
+      },
+    ],
+  }
+}
+
+function hasMatchingRequestedTool(transcript: TranscriptItem[], name: string, input: string, toolCallId?: string) {
+  return transcript.some((item) => {
+    if (item.kind !== "tool" || item.status !== "running") return false
+    if (toolCallId && item.toolCallId === toolCallId) return true
+    return item.name === name && item.input === input
+  })
+}
+
+function upsertStartedTool(
+  transcript: TranscriptItem[],
+  name: string,
+  input: string,
+  toolCallId: string,
+  approval?: PermissionDecision,
+): TranscriptItem[] {
+  const index = transcript.findIndex((item) => {
+    if (item.kind !== "tool" || item.status !== "running") return false
+    if (item.toolCallId === toolCallId) return true
+    return item.name === name && item.input === input
+  })
+  if (index < 0) {
+    return [
+      ...transcript,
+      {
+        id: nextId("tool"),
+        kind: "tool",
+        toolCallId,
+        name,
+        input,
+        status: "running",
+        approval,
+      },
+    ]
+  }
+  return transcript.map((item, itemIndex) => {
+    if (itemIndex !== index || item.kind !== "tool") return item
+    return { ...item, toolCallId, name, input, status: "running", approval: approval ?? item.approval }
+  })
+}
+
 function appendToolOutput(state: AppState, toolCallId: string, output: string, status: "running" | "done" | "error"): AppState {
   const transcript = state.transcript.map((item) => {
     if (item.kind !== "tool" || item.toolCallId !== toolCallId) return item
@@ -274,22 +337,32 @@ function appendToolOutput(state: AppState, toolCallId: string, output: string, s
 
 function appendDiagnostics(state: AppState, diagnostics: SessionEvent["files"]): AppState {
   if (!Array.isArray(diagnostics) || diagnostics.length === 0) return state
-  const summary = diagnostics
-    .filter((file) => typeof file?.path === "string")
-    .map((file) => {
-      const path = file.path ?? "unknown"
-      if (file.exists === false) return `${path}: missing`
-      const details = [typeof file.lines === "number" ? `${file.lines} lines` : undefined, typeof file.bytes === "number" ? `${file.bytes} bytes` : undefined]
-        .filter(Boolean)
-        .join(", ")
-      return details ? `${path}: ${details}` : `${path}: present`
-    })
-    .join("; ")
-  if (!summary) return state
-  return {
-    ...state,
-    transcript: [...state.transcript, { id: nextId("status"), kind: "status", text: `diagnostics: ${summary}` }],
+  return state
+}
+
+function appendTerminalOutput(state: AppState, chunk: string): AppState {
+  if (!chunk) return state
+  let next = state
+  const lines = chunk.split(/(\n)/)
+  let buffer = ""
+  for (const part of lines) {
+    if (part === "\n") {
+      const parsed = parseRequestedToolText(buffer.trim())
+      next = parsed
+        ? appendRequestedTool(next, parsed.name, parsed.input, parsed.toolCallId)
+        : appendAssistantText(next, `${buffer}\n`)
+      buffer = ""
+      continue
+    }
+    buffer += part
   }
+  if (buffer) {
+    const parsed = parseRequestedToolText(buffer.trim())
+    next = parsed
+      ? appendRequestedTool(next, parsed.name, parsed.input, parsed.toolCallId)
+      : appendAssistantText(next, buffer)
+  }
+  return next
 }
 
 function stringify(value: unknown): string {
@@ -308,11 +381,57 @@ function firstUserMessage(detail: StoredSessionDetail) {
   return detail.messages.find((message) => message.role.toLowerCase() === "user")?.content
 }
 
-function storedMessageToTranscriptItem(message: StoredSessionDetail["messages"][number]): TranscriptItem {
+function storedMessageToTranscriptItem(message: StoredSessionDetail["messages"][number]): TranscriptItem | undefined {
   const role = message.role.toLowerCase()
+  const requestedTool = parseRequestedToolText(message.content.trim())
+  if (requestedTool) {
+    return {
+      id: nextId("tool"),
+      kind: "tool",
+      toolCallId: requestedTool.toolCallId ?? nextId("stored-requested"),
+      name: requestedTool.name,
+      input: stringify(requestedTool.input),
+      status: "done",
+    }
+  }
   if (role === "user") return { id: nextId("user"), kind: "user", text: message.content }
   if (role === "assistant") return { id: nextId("assistant"), kind: "assistant", text: message.content }
-  return { id: nextId("status"), kind: "status", text: `${message.role}: ${message.content}` }
+  if (role === "tool") return storedToolMessageToTranscriptItem(message.content)
+  return undefined
+}
+
+function storedToolMessageToTranscriptItem(content: string): TranscriptItem | undefined {
+  const text = content.trim()
+  if (!text || text.startsWith("Tool:") || text.startsWith("tool call error")) return undefined
+  const resultMatch = text.match(/^([a-zA-Z0-9_-]+)\s+result:\s*\n?([\s\S]*)$/)
+  if (resultMatch) {
+    return {
+      id: nextId("tool"),
+      kind: "tool",
+      toolCallId: nextId("stored-tool"),
+      name: resultMatch[1],
+      input: "",
+      output: resultMatch[2] ?? "",
+      status: "done",
+    }
+  }
+  return undefined
+}
+
+function parseRequestedToolText(text: string): { name: string; input: unknown; toolCallId?: string } | undefined {
+  const prefix = "tool call requested:"
+  if (!text.toLowerCase().startsWith(prefix)) return undefined
+  const raw = text.slice(prefix.length).trim()
+  if (!raw.startsWith("{")) return undefined
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const name = typeof parsed.name === "string" && parsed.name ? parsed.name : "tool"
+    const input = "input" in parsed ? parsed.input : parsed.input_json
+    const toolCallId = typeof parsed.tool_call_id === "string" ? parsed.tool_call_id : undefined
+    return { name, input, toolCallId }
+  } catch {
+    return undefined
+  }
 }
 
 function permissionPreview(value: unknown): { file?: ModifiedFile; diff?: string } {

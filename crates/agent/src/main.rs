@@ -1030,12 +1030,14 @@ async fn run_db_command(command: DbCommand) -> Result<(), String> {
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| format!("session not found: {session_id}"))?;
             let messages = db.messages(session_id).map_err(|err| err.to_string())?;
+            let events = db.events(session_id).map_err(|err| err.to_string())?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
                         "session": session,
                         "messages": messages,
+                        "events": events,
                     }))
                     .map_err(|err| err.to_string())?
                 );

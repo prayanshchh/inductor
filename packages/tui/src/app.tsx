@@ -253,7 +253,7 @@ export function App(props: AppProps) {
       onStderr(text) {
         const lines = visibleStderr(text)
         if (!lines) return
-        setState("transcript", (items) => [...items, { id: `stderr-${Date.now()}`, kind: "status", text: lines }])
+        setNotice({ text: truncateRight(lines.replace(/\s+/g, " "), 120), tone: "muted" })
       },
       onExit(code) {
         clearForceStopTimer()
@@ -876,7 +876,7 @@ function SessionSidebar(props: {
 }) {
   return (
     <box
-      width={34}
+      width={18}
       height="100%"
       flexShrink={0}
       backgroundColor={theme.panelSoft}
@@ -904,7 +904,6 @@ function SessionSidebar(props: {
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginTop={1} marginBottom={1}>
         <text fg={theme.cyan}>SESSIONS</text>
         <box flexGrow={1} />
-        <text fg={theme.dim} selectable={false} onMouseUp={() => void props.refreshSessions()}>refresh</text>
       </box>
       <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, 28)}</text>}>
         <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
@@ -925,10 +924,10 @@ function SessionSidebar(props: {
                       onMouseUp={() => props.loadSession(session.id)}
                     >
                       <text fg={active() ? theme.text : theme.muted} attributes={active() ? TextAttributes.BOLD : undefined} wrapMode="none">
-                        {truncateRight(sessionTitle(session), 28)}
+                        {truncateRight(sessionTitle(session), 14)}
                       </text>
                       <box flexDirection="row" gap={1}>
-                        <text fg={theme.dim}>{shortProviderModel(session.provider, session.model)}</text>
+                        <text fg={theme.dim}>{truncateRight(shortModel(session.model), 12)}</text>
                         <text fg={session.status === "running" ? theme.green : theme.dim}>{session.status.toLowerCase()}</text>
                       </box>
                     </box>
@@ -1019,14 +1018,12 @@ function Timeline(props: {
 function TimelineItem(props: { item: TranscriptItem; expanded: boolean; toggle: () => void }) {
   if (props.item.kind === "user") {
     return (
-      <TimelineShell marker="●" color={theme.blue} label="user">
-        <text fg={theme.text} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.item.text}</text>
-      </TimelineShell>
+      <UserPrompt text={props.item.text} />
     )
   }
   if (props.item.kind === "assistant") {
     return (
-      <InlineThinking text={props.item.text} />
+      <AssistantText text={props.item.text} />
     )
   }
   if (props.item.kind === "tool") {
@@ -1039,18 +1036,13 @@ function TimelineItem(props: { item: TranscriptItem; expanded: boolean; toggle: 
       </TimelineShell>
     )
   }
-  return (
-    <TimelineShell marker="✓" color={theme.green} label="status">
-      <text fg={theme.text} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.item.text}</text>
-    </TimelineShell>
-  )
+  return null
 }
 
 function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" }>; expanded: boolean; toggle: () => void }) {
   const action = createMemo(() => toolActivity(props.item))
   const diff = createMemo(() => diffFromTool(props.item))
   const isWrite = createMemo(() => isWriteTool(props.item.name) || Boolean(diff()))
-  const isRead = createMemo(() => toolKind(props.item.name) === "read file")
   const isOpen = createMemo(() => isWrite() || props.expanded)
   const output = createMemo(() => props.item.output?.trim() ?? "")
   const color = createMemo(() => toolColor(props.item))
@@ -1058,9 +1050,6 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
     event?.stopPropagation?.()
     if (isWrite()) return
     props.toggle()
-  }
-  if (isRead()) {
-    return <ReadInline item={props.item} />
   }
   return (
     <box width="100%" paddingLeft={1} paddingRight={1}>
@@ -1104,6 +1093,16 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
             paddingTop={1}
             paddingBottom={1}
           >
+            <Show when={props.item.approval}>
+              {(decision) => (
+                <box flexDirection="row" gap={1} marginBottom={1}>
+                  <text fg={decision() === "deny" ? theme.red : theme.green}>{decision() === "deny" ? "✕" : "✓"}</text>
+                  <text fg={decision() === "deny" ? theme.red : theme.green} attributes={TextAttributes.BOLD}>
+                    {permissionDecisionText(decision())}
+                  </text>
+                </box>
+              )}
+            </Show>
             <Show when={diff()} fallback={<ToolDetails item={props.item} />}>
               {(patch) => (
                 <DiffWithHunkReview diff={patch()} path={toolPath(props.item)} />
@@ -1128,12 +1127,10 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
   )
 }
 
-function InlineThinking(props: { text: string }) {
+function AssistantText(props: { text: string }) {
   return (
     <box width="100%" paddingLeft={2} paddingRight={2}>
-      <box width="100%" flexDirection="row" gap={2}>
-        <text width={3} fg={theme.yellow} selectable={false}>✦</text>
-        <text width={12} fg={theme.yellow} attributes={TextAttributes.BOLD} selectable={false}>THINKING</text>
+      <box width="100%" flexDirection="row">
         <box flexGrow={1} minWidth={0}>
           <markdown content={props.text} fg={theme.text} streaming={true} concealCode={false} syntaxStyle={syntaxStyle} tableOptions={{ selectable: true }} />
         </box>
@@ -1142,14 +1139,16 @@ function InlineThinking(props: { text: string }) {
   )
 }
 
-function ReadInline(props: { item: Extract<TranscriptItem, { kind: "tool" }> }) {
-  const path = createMemo(() => toolPath(props.item) ?? toolDescription(props.item) ?? "file")
+function UserPrompt(props: { text: string }) {
   return (
     <box width="100%" paddingLeft={2} paddingRight={2}>
-      <box width="100%" flexDirection="row" gap={1}>
-        <text fg={theme.dim} selectable={false}>•</text>
-        <text fg={theme.dim}>read file</text>
-        <text fg={theme.muted} wrapMode="none">{truncateLeft(path(), 96)}</text>
+      <box
+        width="100%"
+        backgroundColor="#3a3a3a"
+        paddingLeft={1}
+        paddingRight={1}
+      >
+        <text fg={theme.text} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.text}</text>
       </box>
     </box>
   )
@@ -1864,7 +1863,7 @@ function toolActivity(item: Extract<TranscriptItem, { kind: "tool" }>) {
     return `${toolVerb(item.status, "bash")} ${truncateRight(commandPurpose(commandText), 118)}`
   }
   if (kind === "read file") {
-    return `${toolVerb(item.status, "read")} ${truncateLeft(path ?? description ?? "file", 82)} to get context`
+    return `${toolVerb(item.status, "read")} file ${truncateLeft(path ?? description ?? "file", 82)}`
   }
   if (kind === "write file" || kind === "edit file") {
     return `${toolVerb(item.status, "write")} ${truncateLeft(path ?? description ?? "file", 88)}`
@@ -1887,6 +1886,12 @@ function toolVerb(status: string, kind: "bash" | "read" | "write" | "search" | "
   if (kind === "search") return status === "running" ? "searching" : "searched"
   if (kind === "list") return status === "running" ? "listing" : "listed"
   return status === "running" ? "using" : "used"
+}
+
+function permissionDecisionText(decision: PermissionDecision) {
+  if (decision === "allow") return "Allowed once"
+  if (decision === "allow_always") return "Allowed for this session"
+  return "Denied"
 }
 
 function commandPurpose(command: string) {
