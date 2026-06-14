@@ -19,6 +19,7 @@ import {
 import { listWorkspaceSessions, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type PermissionDecision, type StoredSession } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
+import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
   findActiveMention,
@@ -1652,48 +1653,6 @@ function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: Modified
       </Show>
     </box>
   )
-}
-
-function openExternalDiffViewer(workspace: string, file: ModifiedFile) {
-  const dir = path.join(workspace, ".inductor", "diff-viewer")
-  mkdirSync(dir, { recursive: true })
-  const patchPath = path.join(dir, `${safeDiffName(file.file)}.diff`)
-  const patch = file.diff?.trim()
-    ? file.diff
-    : `No captured patch was available for ${file.file}.\n\nShowing live git diff if this file still has worktree changes.\n`
-  writeFileSync(patchPath, patch)
-
-  const command = [
-    `cd ${shellQuote(workspace)}`,
-    `printf '\\033]0;inductor diff viewer\\007'`,
-    `echo ${shellQuote(`INDUCTOR DIFF: ${file.file}`)}`,
-    `{ if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git diff --quiet -- ${shellQuote(file.file)} 2>/dev/null; then git diff --color=always -- ${shellQuote(file.file)}; else cat ${shellQuote(patchPath)}; fi; } | less -R`,
-  ].join("; ")
-
-  const script = [
-    `tell application "Terminal"`,
-    `activate`,
-    `if not (exists window 1) then reopen`,
-    `do script "${appleScriptString(command)}" in front window`,
-    `end tell`,
-  ].join("\n")
-  Bun.spawn(["osascript", "-e", script], {
-    stdout: "ignore",
-    stderr: "ignore",
-  }).unref()
-}
-
-function safeDiffName(file: string) {
-  const safe = file.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "")
-  return (safe || "diff").slice(-140)
-}
-
-function shellQuote(value: string) {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
-function appleScriptString(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")
 }
 
 function defaultModel(provider: string) {
