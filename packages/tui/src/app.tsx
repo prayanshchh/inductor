@@ -19,6 +19,7 @@ import {
 import { listWorkspaceSessions, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type PermissionDecision, type StoredSession } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
+import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
   findActiveMention,
@@ -35,7 +36,10 @@ import {
 } from "./mentions"
 import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
 
-export type AppProps = BackendOptions
+export type AppProps = BackendOptions & {
+  exitApp(): void
+  registerCtrlCHandler(handler: (() => void) | undefined): void
+}
 
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
 type PaletteKind = "commands" | "models" | "agents" | "modes" | "files" | undefined
@@ -51,13 +55,13 @@ type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
 
 const theme = {
-  bg: "#050606",
-  surface: "#070808",
-  surface2: "#101111",
-  surface3: "#101111",
-  panel: "#081012",
-  panelSoft: "#111313",
-  row: "#101415",
+  bg: "transparent",
+  surface: "transparent",
+  surface2: "transparent",
+  surface3: "transparent",
+  panel: "transparent",
+  panelSoft: "transparent",
+  row: "transparent",
   text: "#e8e8e8",
   muted: "#8b9298",
   dim: "#5a6268",
@@ -77,10 +81,10 @@ const theme = {
   addedBg: "#142f25",
   removedBg: "#34191b",
   selectionBg: "#3b4d6c",
-  palette: "#101819",
+  palette: "transparent",
   paletteSelected: "#12303a",
   progress: "#24c8ff",
-  progressTrack: "#343b3f",
+  progressTrack: "transparent",
 }
 
 const SESSION_SIDEBAR_WIDTH = 46
@@ -161,6 +165,7 @@ export function App(props: AppProps) {
   let replacingPrompt = false
   let stoppingRun = false
   let exitAfterStop = false
+  let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
   let forceStopTimer: ReturnType<typeof setTimeout> | undefined
   const startedAt = Date.now()
@@ -208,21 +213,35 @@ export function App(props: AppProps) {
 
   const timer = setInterval(() => setNow(Date.now()), 1000)
   const composerNotice = createMemo(() => notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission))
-  onMount(() => void refreshSessions())
+  onMount(() => {
+    props.registerCtrlCHandler(handleCtrlC)
+    void refreshSessions()
+  })
   onCleanup(() => {
+    props.registerCtrlCHandler(undefined)
     clearInterval(timer)
     clearStopArmTimer()
     clearForceStopTimer()
+    if (currentRun) {
+      const run = currentRun
+      currentRun = undefined
+      run.kill()
+      void run.exited.catch(() => undefined)
+    }
   })
 
   useKeyboard((event) => {
-    if (event.eventType === "release" || event.repeated) return
     if (isCtrlC(event)) {
+      const now = Date.now()
+      if (event.eventType === "release" && now - lastCtrlCAt < 200) return
+      lastCtrlCAt = now
       event.preventDefault()
       event.stopPropagation()
       handleCtrlC()
       return
     }
+    if (event.eventType === "release") return
+    if (event.repeated) return
     if (state.pendingPermission && handlePermissionKey(event)) {
       event.preventDefault()
       event.stopPropagation()
@@ -283,7 +302,10 @@ export function App(props: AppProps) {
       onExit(code) {
         clearForceStopTimer()
         currentRun = undefined
-        if (exitAfterStop) process.exit(0)
+        if (exitAfterStop) {
+          props.exitApp()
+          return
+        }
         if (stoppingRun) {
           stoppingRun = false
           setNotice({ text: "stopped agent", tone: "red" })
@@ -542,7 +564,10 @@ export function App(props: AppProps) {
   }
 
   function runCommand(command: Command) {
-    if (command.action === "exit") process.exit(0)
+    if (command.action === "exit") {
+      props.exitApp()
+      return
+    }
     recordHistory(command.name)
     if (command.action === "new" || command.action === "clear") {
       startNewSession()
@@ -667,7 +692,7 @@ export function App(props: AppProps) {
       if (state.running || currentRun) {
         stopCurrentRun(true)
       } else {
-        process.exit(0)
+        props.exitApp()
       }
       return
     }
@@ -694,7 +719,7 @@ export function App(props: AppProps) {
   function stopCurrentRun(quitAfterStop: boolean) {
     const run = currentRun
     if (!run) {
-      if (quitAfterStop) process.exit(0)
+      if (quitAfterStop) props.exitApp()
       setNotice({ text: "No running agent to stop", tone: "muted" })
       setStopArmed(undefined)
       return
@@ -711,7 +736,11 @@ export function App(props: AppProps) {
     forceStopTimer = setTimeout(() => {
       if (!stoppingRun) return
       run.kill()
-      if (exitAfterStop) process.exit(0)
+      if (exitAfterStop) {
+        void run.exited
+          .catch(() => undefined)
+          .finally(() => props.exitApp())
+      }
     }, 5000)
   }
 
@@ -732,7 +761,7 @@ export function App(props: AppProps) {
   }
 
   return (
-    <box width="100%" height="100%" backgroundColor="#000000" paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
+    <box width="100%" height="100%" backgroundColor={theme.bg} paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
       <box width="100%" height="100%" backgroundColor={theme.bg} flexDirection="column" border borderStyle="rounded" borderColor={theme.border}>
         <TopRail
           mode={mode()}
@@ -1652,48 +1681,6 @@ function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: Modified
       </Show>
     </box>
   )
-}
-
-function openExternalDiffViewer(workspace: string, file: ModifiedFile) {
-  const dir = path.join(workspace, ".inductor", "diff-viewer")
-  mkdirSync(dir, { recursive: true })
-  const patchPath = path.join(dir, `${safeDiffName(file.file)}.diff`)
-  const patch = file.diff?.trim()
-    ? file.diff
-    : `No captured patch was available for ${file.file}.\n\nShowing live git diff if this file still has worktree changes.\n`
-  writeFileSync(patchPath, patch)
-
-  const command = [
-    `cd ${shellQuote(workspace)}`,
-    `printf '\\033]0;inductor diff viewer\\007'`,
-    `echo ${shellQuote(`INDUCTOR DIFF: ${file.file}`)}`,
-    `{ if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git diff --quiet -- ${shellQuote(file.file)} 2>/dev/null; then git diff --color=always -- ${shellQuote(file.file)}; else cat ${shellQuote(patchPath)}; fi; } | less -R`,
-  ].join("; ")
-
-  const script = [
-    `tell application "Terminal"`,
-    `activate`,
-    `if not (exists window 1) then reopen`,
-    `do script "${appleScriptString(command)}" in front window`,
-    `end tell`,
-  ].join("\n")
-  Bun.spawn(["osascript", "-e", script], {
-    stdout: "ignore",
-    stderr: "ignore",
-  }).unref()
-}
-
-function safeDiffName(file: string) {
-  const safe = file.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "")
-  return (safe || "diff").slice(-140)
-}
-
-function shellQuote(value: string) {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
-function appleScriptString(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")
 }
 
 function defaultModel(provider: string) {
