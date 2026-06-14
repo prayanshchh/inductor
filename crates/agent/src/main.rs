@@ -35,8 +35,6 @@ use terminal::{PtyManager, SpawnTerminalRequest, TerminalSize};
 use tokio_util::sync::CancellationToken;
 use tools::{StructuredPatch, TextEdit, ToolRuntime};
 
-mod tui;
-
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
@@ -71,23 +69,6 @@ enum Command {
     Db {
         #[command(subcommand)]
         command: DbCommand,
-    },
-    /// Open the terminal UI vertical slice.
-    Tui {
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
-
-        #[arg(long, value_enum, default_value_t = ProviderArg::Claude)]
-        provider: ProviderArg,
-
-        #[arg(long)]
-        model: Option<String>,
-
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-
-        #[arg(long, default_value = "HEAD")]
-        diff_base: String,
     },
     /// Run the experimental OpenTUI/Solid presentation layer.
     OpenTui {
@@ -613,24 +594,6 @@ async fn main() {
         Some(Command::Diff { command }) => run_diff_command(command).await,
         Some(Command::Context { command }) => run_context_command(command).await,
         Some(Command::Db { command }) => run_db_command(command).await,
-        Some(Command::Tui {
-            workspace,
-            provider,
-            model,
-            state_db,
-            diff_base,
-        }) => {
-            let provider_kind = ProviderKind::from(provider);
-            tui::run(tui::TuiOptions {
-                workspace,
-                provider: provider.to_string(),
-                model: model.unwrap_or_else(|| default_provider_model(provider_kind).to_string()),
-                state_db,
-                diff_base,
-            })
-            .await
-            .map_err(|err| err.to_string())
-        }
         Some(Command::OpenTui {
             workspace,
             provider,
