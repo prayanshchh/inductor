@@ -35,6 +35,21 @@ describe("transcript reducer", () => {
     expect(state.transcript.some((item) => item.kind === "status" && item.text === "Allowed once")).toBe(false)
   })
 
+  test("derives permission request diffs from write file content", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "permission_request",
+      request_id: "req-1",
+      tool_name: "write_file",
+      reason: "mutating tool",
+      input_json: { path: "README.md", content: "# Inductor\n\nOverview\n" },
+    })
+
+    expect(state.pendingPermission?.filepath).toBe("README.md")
+    expect(state.pendingPermission?.diff).toContain("+++ b/README.md")
+    expect(state.pendingPermission?.diff).toContain("+# Inductor")
+  })
+
   test("applies permission coloring to the later tool row when approval resolves first", () => {
     let state = createInitialState()
     state = applySessionEvent(state, {

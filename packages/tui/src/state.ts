@@ -443,8 +443,13 @@ function permissionPreview(value: unknown): { file?: ModifiedFile; diff?: string
     stringField(record, "filepath") ??
     stringField(record, "file_path") ??
     stringField(record, "target")
-  const file = path ? modifiedFileFromDiff(path, diff) : undefined
-  return { file, diff }
+  if (!path) return {}
+  if (diff) {
+    const file = modifiedFileFromDiff(path, diff)
+    return { file, diff: file.diff }
+  }
+  const file = modifiedFileFromInput(value)
+  return { file, diff: file?.diff }
 }
 
 function modifiedFileFromInput(value: unknown): ModifiedFile | undefined {
