@@ -93,6 +93,8 @@ const TELEMETRY_SIDEBAR_WIDTH = 32
 const TELEMETRY_PROGRESS_WIDTH = 24
 const TELEMETRY_FILE_WIDTH = 22
 const TELEMETRY_FOOTER_WIDTH = 24
+const DIFF_VIEWER_MIN_HEIGHT = 8
+const DIFF_VIEWER_MAX_HEIGHT = 28
 
 const commands: Command[] = [
   { name: "/agents", description: "Switch agent", action: "agents" },
@@ -789,6 +791,7 @@ export function App(props: AppProps) {
             height="100%"
             flexDirection="column"
             backgroundColor={theme.panel}
+            overflow="hidden"
             border
             borderStyle="rounded"
             borderColor={theme.border}
@@ -797,9 +800,13 @@ export function App(props: AppProps) {
               <scrollbox
                 flexGrow={1}
                 minHeight={0}
+                overflow="hidden"
                 stickyScroll={true}
                 stickyStart="bottom"
                 scrollAcceleration={scrollAcceleration}
+                viewportCulling={true}
+                viewportOptions={{ overflow: "hidden" }}
+                contentOptions={{ overflow: "hidden" }}
                 verticalScrollbarOptions={{ visible: false }}
               >
                 <Timeline
@@ -1213,29 +1220,53 @@ function UserPrompt(props: { text: string }) {
 }
 
 function DiffWithHunkReview(props: { diff: string; path?: string }) {
+  const viewerHeight = createMemo(() => diffViewerHeight(props.diff))
   return (
-    <diff
-      diff={props.diff}
-      view="split"
-      filetype={filetype(props.path)}
-      width="100%"
-      wrapMode="word"
-      showLineNumbers={true}
-      syntaxStyle={syntaxStyle}
-      fg={theme.text}
-      selectionBg={theme.selectionBg}
-      selectionFg={theme.text}
-      addedBg={theme.addedBg}
-      removedBg={theme.removedBg}
-      contextBg={theme.surface}
-      addedSignColor={theme.green}
-      removedSignColor={theme.red}
-      lineNumberFg={theme.muted}
-      lineNumberBg={theme.surface}
-      addedLineNumberBg={theme.addedBg}
-      removedLineNumberBg={theme.removedBg}
-    />
+    <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
+      <scrollbox
+        width="100%"
+        height="100%"
+        minHeight={0}
+        overflow="hidden"
+        scrollX={true}
+        scrollY={true}
+        stickyScroll={false}
+        scrollAcceleration={scrollAcceleration}
+        viewportCulling={true}
+        viewportOptions={{ overflow: "hidden" }}
+        contentOptions={{ overflow: "hidden" }}
+        verticalScrollbarOptions={{ visible: false }}
+        horizontalScrollbarOptions={{ visible: false }}
+      >
+        <diff
+          diff={props.diff}
+          view="split"
+          filetype={filetype(props.path)}
+          width="100%"
+          wrapMode="word"
+          showLineNumbers={true}
+          syntaxStyle={syntaxStyle}
+          fg={theme.text}
+          selectionBg={theme.selectionBg}
+          selectionFg={theme.text}
+          addedBg={theme.addedBg}
+          removedBg={theme.removedBg}
+          contextBg={theme.surface}
+          addedSignColor={theme.green}
+          removedSignColor={theme.red}
+          lineNumberFg={theme.muted}
+          lineNumberBg={theme.surface}
+          addedLineNumberBg={theme.addedBg}
+          removedLineNumberBg={theme.removedBg}
+        />
+      </scrollbox>
+    </box>
   )
+}
+
+function diffViewerHeight(diff: string) {
+  const lineCount = diff.split("\n").length
+  return Math.min(DIFF_VIEWER_MAX_HEIGHT, Math.max(DIFF_VIEWER_MIN_HEIGHT, lineCount))
 }
 
 function ToolDetails(props: { item: Extract<TranscriptItem, { kind: "tool" }> }) {
