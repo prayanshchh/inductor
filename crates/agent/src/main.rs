@@ -550,6 +550,15 @@ enum WorktreeCommand {
         #[arg(long)]
         repo: PathBuf,
     },
+    /// List the worktrees Inductor manages in the app DB registry, joined with
+    /// their session name/status. Used by the TUI multi-agent dashboard.
+    Registry {
+        #[arg(long)]
+        app_db: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
+    },
     Remove {
         #[arg(long)]
         repo: PathBuf,
@@ -587,6 +596,9 @@ enum WorktreeCommand {
         /// Always create a merge commit, even when a fast-forward is possible.
         #[arg(long)]
         no_ff: bool,
+
+        #[arg(long)]
+        json: bool,
     },
     /// Abort an in-progress (conflicted) merge in a worktree's source repo.
     AbortMerge {
@@ -595,6 +607,18 @@ enum WorktreeCommand {
 
         #[arg(long)]
         app_db: Option<PathBuf>,
+    },
+    /// Archive a worktree: remove its working directory but keep the registry
+    /// record and the session's chats/messages.
+    Archive {
+        #[arg(long)]
+        workspace_id: WorkspaceId,
+
+        #[arg(long)]
+        app_db: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -872,6 +896,10 @@ async fn run_opentui_command(
         .canonicalize()
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or(workspace));
 
+    // The worktree registry lives in the app DB; share its path with the TUI so
+    // the dashboard can list/merge/archive worktrees the backend creates.
+    let app_db = default_app_db_path()?;
+
     let mut command = std::process::Command::new("bun");
     command
         .arg("run")
@@ -885,7 +913,9 @@ async fn run_opentui_command(
         .arg("--approval")
         .arg(approval.to_string())
         .arg("--repo-root")
-        .arg(repo_root);
+        .arg(repo_root)
+        .arg("--app-db")
+        .arg(app_db);
     command.current_dir(&tui_dir);
 
     if let Some(model) = model {
@@ -1092,12 +1122,33 @@ async fn run_harness_command(
     let mut workspace = workspace;
     let mut app_db = app_db;
     let mut forced_workspace_id = requested_workspace_id;
+    let mut forced_state_db: Option<PathBuf> = None;
+    let mut generated_display_name: Option<String> = None;
     if mode == ModeArg::Worktree {
         if app_db.is_none() {
             app_db = Some(default_app_db_path()?);
         }
         let registry = AppDb::open(app_db.as_ref().unwrap()).map_err(|err| err.to_string())?;
-        let binding = resolve_worktree(&registry, &workspace, requested_session_id, slug.as_deref())?;
+
+        // Resuming an existing worktree-bound session reuses its worktree and
+        // name; only a brand-new session needs a fresh worktree + a name.
+        let resuming = requested_session_id
+            .and_then(|sid| registry.get_session(sid).ok().flatten())
+            .and_then(|session| registry.get_worktree(session.workspace_id).ok().flatten())
+            .is_some();
+
+        // For a fresh session, name the worktree after the chat (<=3 words) and
+        // use that as both the branch slug and the session's display name.
+        let mut effective_slug = slug.clone();
+        if !resuming {
+            if let Some(name) = derive_worktree_name(&prompt).await {
+                effective_slug = Some(name.clone());
+                generated_display_name = Some(name);
+            }
+        }
+
+        let binding =
+            resolve_worktree(&registry, &workspace, requested_session_id, effective_slug.as_deref())?;
         eprintln!(
             "worktree: {} (workspace {})",
             binding.worktree_path.display(),
@@ -1105,6 +1156,9 @@ async fn run_harness_command(
         );
         workspace = binding.worktree_path;
         forced_workspace_id = Some(binding.workspace_id);
+        // Keep the session's state.db outside the worktree so merging/archiving
+        // (which delete the worktree dir) preserve the chats.
+        forced_state_db = Some(worktree_state_db_path(binding.workspace_id)?);
     }
 
     // Resolve auth the same way `provider turn` does. Claude auth is handled
@@ -1142,7 +1196,9 @@ async fn run_harness_command(
     }
     .map_err(|err| err.to_string())?;
 
-    let state_db_path = state_db.unwrap_or_else(|| workspace_state_path(&workspace_path));
+    let state_db_path = state_db
+        .or(forced_state_db)
+        .unwrap_or_else(|| workspace_state_path(&workspace_path));
     let workspace_db = WorkspaceDb::open(&state_db_path).map_err(|err| err.to_string())?;
     let model = model.unwrap_or_else(|| default_provider_model(provider).to_string());
     let session_id = requested_session_id.unwrap_or_else(SessionId::new);
@@ -1161,6 +1217,13 @@ async fn run_harness_command(
     session_record.provider_id = provider_id.clone();
     session_record.model = model.clone();
     session_record.status = SessionStatus::Starting;
+    // Apply the chat-derived worktree name as the session display name so the
+    // dashboard shows it immediately (the end-of-turn namer then leaves it be).
+    if session_record.display_name.is_none() {
+        if let Some(name) = generated_display_name.take() {
+            session_record.display_name = Some(name);
+        }
+    }
     session_record.updated_at = now_rfc3339().map_err(|err| err.to_string())?;
     workspace_db
         .upsert_session(&session_record)
@@ -1934,7 +1997,56 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
                 println!();
             }
         }
-
+        WorktreeCommand::Registry {
+            app_db,
+            json: json_output,
+        } => {
+            let registry = open_worktree_registry(app_db)?;
+            let worktrees = registry.list_worktrees().map_err(|err| err.to_string())?;
+            if json_output {
+                let rows = worktrees
+                    .iter()
+                    .map(|worktree| {
+                        // Newest session in this workspace gives the display name
+                        // and live status for the dashboard.
+                        let session = registry
+                            .list_sessions(worktree.id)
+                            .ok()
+                            .and_then(|sessions| sessions.into_iter().next());
+                        json!({
+                            "workspace_id": worktree.id,
+                            "source_repo": worktree.source_repo.display().to_string(),
+                            "worktree_path": worktree.worktree_path.display().to_string(),
+                            "state_db": worktree_state_db_path(worktree.id)
+                                .ok()
+                                .map(|path| path.display().to_string()),
+                            "branch_name": worktree.branch_name,
+                            "base_branch": worktree.base_branch,
+                            "status": worktree.status.as_str(),
+                            "exists": worktree.worktree_path.exists(),
+                            "display_name": session.as_ref().and_then(|s| s.display_name.clone()),
+                            "session_id": session.as_ref().map(|s| s.id.to_string()),
+                            "session_status": session.as_ref().map(|s| format!("{:?}", s.status).to_lowercase()),
+                            "provider": session.as_ref().map(|s| s.provider_id.0.clone()),
+                            "model": session.as_ref().map(|s| s.model.clone()),
+                            "updated_at": worktree.updated_at,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&rows).map_err(|err| err.to_string())?
+                );
+            } else {
+                for worktree in worktrees {
+                    println!("workspace_id: {}", worktree.id);
+                    println!("branch: {}", worktree.branch_name);
+                    println!("status: {}", worktree.status.as_str());
+                    println!("path: {}", worktree.worktree_path.display());
+                    println!();
+                }
+            }
+        }
         WorktreeCommand::Remove { repo, path, force } => {
             let manager = WorktreeManager::new(default_managed_root()?);
             manager
@@ -1967,6 +2079,7 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
             app_db,
             target,
             no_ff,
+            json: json_output,
         } => {
             let registry = open_worktree_registry(app_db)?;
             let worktree = lookup_worktree(&registry, workspace_id)?;
@@ -1983,12 +2096,16 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
                 })
                 .map_err(|err| err.to_string())?;
 
-            match outcome {
+            // Report the result. On a clean merge the working directory is no
+            // longer needed, so remove it; the registry record and the
+            // session's chats (state.db lives outside the worktree) are kept.
+            let result = match outcome {
                 MergeOutcome::UpToDate => {
                     registry
                         .set_worktree_status(workspace_id, WorktreeStatus::Merged)
                         .map_err(|err| err.to_string())?;
-                    println!("merge: up-to-date ({target_branch} already contains the branch)");
+                    cleanup_worktree_dir(&worktree)?;
+                    json!({ "result": "up_to_date", "target": target_branch })
                 }
                 MergeOutcome::Merged {
                     merged_commit,
@@ -1997,19 +2114,52 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
                     registry
                         .set_worktree_status(workspace_id, WorktreeStatus::Merged)
                         .map_err(|err| err.to_string())?;
-                    println!(
-                        "merge: ok commit={merged_commit} fast_forward={fast_forward} target={target_branch}"
-                    );
+                    cleanup_worktree_dir(&worktree)?;
+                    json!({
+                        "result": "merged",
+                        "commit": merged_commit,
+                        "fast_forward": fast_forward,
+                        "target": target_branch,
+                    })
                 }
                 MergeOutcome::Conflict { files } => {
-                    println!("merge: conflict in {} file(s):", files.len());
-                    for file in files {
-                        println!("  {}", file.display());
+                    json!({
+                        "result": "conflict",
+                        "target": target_branch,
+                        "source_repo": worktree.source_repo.display().to_string(),
+                        "files": files
+                            .iter()
+                            .map(|file| file.display().to_string())
+                            .collect::<Vec<_>>(),
+                    })
+                }
+            };
+
+            if json_output {
+                println!("{}", serde_json::to_string(&result).map_err(|err| err.to_string())?);
+            } else {
+                match result["result"].as_str() {
+                    Some("up_to_date") => {
+                        println!("merge: up-to-date ({target_branch} already contains the branch)")
                     }
-                    println!(
-                        "resolve in {} then commit, or run `worktree abort-merge --workspace-id {workspace_id}`",
-                        worktree.source_repo.display()
-                    );
+                    Some("merged") => println!(
+                        "merge: ok commit={} fast_forward={} target={target_branch}",
+                        result["commit"].as_str().unwrap_or_default(),
+                        result["fast_forward"].as_bool().unwrap_or_default()
+                    ),
+                    _ => {
+                        let files = result["files"].as_array().map(Vec::len).unwrap_or_default();
+                        println!("merge: conflict in {files} file(s):");
+                        if let Some(items) = result["files"].as_array() {
+                            for file in items {
+                                println!("  {}", file.as_str().unwrap_or_default());
+                            }
+                        }
+                        println!(
+                            "resolve in {} then commit, or run `worktree abort-merge --workspace-id {workspace_id}`",
+                            worktree.source_repo.display()
+                        );
+                    }
                 }
             }
         }
@@ -2027,9 +2177,50 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
 
             println!("merge aborted in {}", worktree.source_repo.display());
         }
+        WorktreeCommand::Archive {
+            workspace_id,
+            app_db,
+            json: json_output,
+        } => {
+            let registry = open_worktree_registry(app_db)?;
+            let worktree = lookup_worktree(&registry, workspace_id)?;
+
+            // Remove the working directory but keep the registry record and the
+            // session's chats (the state.db lives outside the worktree dir).
+            cleanup_worktree_dir(&worktree)?;
+            registry
+                .set_worktree_status(workspace_id, WorktreeStatus::Archived)
+                .map_err(|err| err.to_string())?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "result": "archived",
+                        "workspace_id": workspace_id.to_string(),
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+            } else {
+                println!("archived worktree {workspace_id} (chats kept)");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Remove a managed worktree's working directory (and prune git's metadata),
+/// leaving the registry record and the session's chats intact. No-op if the
+/// directory is already gone.
+fn cleanup_worktree_dir(worktree: &WorktreeRecord) -> Result<(), String> {
+    if !worktree.worktree_path.exists() {
+        return Ok(());
+    }
+    let manager = WorktreeManager::new(default_managed_root()?);
+    manager
+        .remove_worktree(&worktree.source_repo, &worktree.worktree_path, true)
+        .map_err(|err| err.to_string())
 }
 
 fn open_worktree_registry(app_db: Option<PathBuf>) -> Result<AppDb, String> {
@@ -2111,6 +2302,39 @@ fn default_app_db_path() -> Result<PathBuf, String> {
         .join("app.db"))
 }
 
+/// Stable, app-managed location for a worktree-mode session's `state.db`,
+/// keyed by workspace id. Kept OUTSIDE the worktree directory so merging or
+/// archiving (which delete the worktree dir) never destroy the chats/messages.
+fn worktree_state_db_path(workspace_id: WorkspaceId) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Inductor")
+        .join("state")
+        .join(format!("{workspace_id}.db")))
+}
+
+/// Generate a short (<=3 word) name for a fresh worktree-mode session from its
+/// first prompt, reusing the session-naming model. Returns `None` on any
+/// failure (missing creds, model error) so worktree creation falls back to a
+/// generic slug rather than blocking.
+async fn derive_worktree_name(prompt: &str) -> Option<String> {
+    // The prompt may be wrapped for multimodal payloads; pull the text back out
+    // so the namer sees the user's words, not a JSON blob.
+    let text = prompt
+        .strip_prefix("__MULTIMODAL_MESSAGE__:")
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|value| value["text"].as_str().map(str::to_string))
+        .unwrap_or_else(|| prompt.to_string());
+
+    match generate_session_name(&[text], Some(SessionNamingConfig::default())).await {
+        Ok(name) if name != "New Session" && !name.trim().is_empty() => Some(name),
+        _ => None,
+    }
+}
+
 /// Where a worktree-mode session should run and the workspace id that ties it
 /// to the worktree registry.
 struct WorktreeBinding {
@@ -2142,13 +2366,16 @@ fn resolve_worktree(
         }
     }
 
-    // Fresh worktree off the source repo's current branch.
+    // Fresh worktree off the source repo's current branch. Allow a dirty repo:
+    // a new worktree checks out HEAD and never touches the source checkout, so
+    // the user's uncommitted changes stay put rather than blocking session
+    // creation (worktree mode is the default for new sessions).
     let manager = WorktreeManager::new(default_managed_root()?);
     let created = manager
         .create_worktree(CreateWorktreeRequest {
             source_repo: source_repo.to_path_buf(),
             slug: slug.unwrap_or("session").to_string(),
-            allow_dirty: false,
+            allow_dirty: true,
         })
         .map_err(|err| err.to_string())?;
 

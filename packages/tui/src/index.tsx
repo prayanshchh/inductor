@@ -10,6 +10,7 @@ type Args = {
   model?: string
   approval: string
   repoRoot: string
+  appDb?: string
 }
 
 const args = parseArgs(process.argv.slice(2))
@@ -68,5 +69,6 @@ function parseArgs(raw: string[]): Args {
     model: values.get("model") || undefined,
     approval: values.get("approval") ?? "mutating",
     repoRoot: values.get("repo-root") ?? process.cwd(),
+    appDb: values.get("app-db") || undefined,
   }
 }

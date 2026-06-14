@@ -238,25 +238,32 @@ pub struct SessionRecord {
 pub enum WorktreeStatus {
     /// Worktree exists and an agent may still be working in it.
     Active,
-    /// Worktree branch has been merged back into its base branch.
+    /// Worktree branch has been merged back into its base branch. The working
+    /// directory is removed after a successful merge; the record (and the
+    /// session's chats) are kept.
     Merged,
     /// Worktree was discarded without merging.
     Abandoned,
+    /// Worktree was archived by the user: the working directory is removed but
+    /// the session's chats/messages are preserved.
+    Archived,
 }
 
 impl WorktreeStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             WorktreeStatus::Active => "active",
             WorktreeStatus::Merged => "merged",
             WorktreeStatus::Abandoned => "abandoned",
+            WorktreeStatus::Archived => "archived",
         }
     }
 
-    fn from_str(value: &str) -> Self {
+    pub fn from_str(value: &str) -> Self {
         match value {
             "merged" => WorktreeStatus::Merged,
             "abandoned" => WorktreeStatus::Abandoned,
+            "archived" => WorktreeStatus::Archived,
             _ => WorktreeStatus::Active,
         }
     }
