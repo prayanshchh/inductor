@@ -876,12 +876,7 @@ async fn run_opentui_command(
     model: Option<String>,
     approval: ApprovalArg,
 ) -> Result<(), String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .ok_or_else(|| "could not resolve repository root from Cargo manifest path".to_string())?
-        .to_path_buf();
+    let repo_root = resolve_repo_root()?;
     let tui_dir = repo_root.join("packages").join("tui");
     if !tui_dir.join("src").join("index.tsx").exists() {
         return Err(format!(
@@ -931,6 +926,46 @@ async fn run_opentui_command(
     } else {
         Err(format!("OpenTUI frontend exited with {status}"))
     }
+}
+
+/// Locate the inductor repository root that ships the OpenTUI frontend.
+///
+/// The binary is typically `cargo install`ed globally, so the compile-time
+/// `CARGO_MANIFEST_DIR` points at whatever workspace happened to build it and
+/// goes stale the moment you run from a different checkout. Instead we resolve
+/// the root dynamically, preferring the workspace the user is actually running
+/// in:
+///   1. an explicit `INDUCTOR_REPO_ROOT` override,
+///   2. the nearest ancestor of the current directory that contains
+///      `packages/tui/src/index.tsx`,
+///   3. the compile-time manifest dir as a last-resort fallback.
+fn resolve_repo_root() -> Result<PathBuf, String> {
+    fn has_tui(root: &Path) -> bool {
+        root.join("packages")
+            .join("tui")
+            .join("src")
+            .join("index.tsx")
+            .exists()
+    }
+
+    if let Some(root) = std::env::var_os("INDUCTOR_REPO_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            if has_tui(ancestor) {
+                return Ok(ancestor.to_path_buf());
+            }
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "could not resolve repository root from Cargo manifest path".to_string())
 }
 
 async fn run_context_command(command: ContextCommand) -> Result<(), String> {

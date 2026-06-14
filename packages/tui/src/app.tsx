@@ -19,7 +19,6 @@ import {
 import { archiveWorktree, listWorktrees, mergeWorktree, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
-import { createReviewedHunks, hunkReviewSummary, setHunkStatus, type HunkReviewStatus, type ReviewedHunk } from "./hunk_review"
 import {
   appendPromptToken,
   findActiveMention,
@@ -1495,58 +1494,28 @@ function UserPrompt(props: { text: string }) {
 }
 
 function DiffWithHunkReview(props: { diff: string; path?: string }) {
-  const [hunks, setHunks] = createSignal<ReviewedHunk[]>(createReviewedHunks(props.diff))
-  const summary = createMemo(() => hunkReviewSummary(hunks()))
-  const updateHunk = (id: string, status: HunkReviewStatus) => setHunks((current) => setHunkStatus(current, id, status))
   return (
-    <box flexDirection="column" gap={1}>
-      <diff
-        diff={props.diff}
-        view="split"
-        filetype={filetype(props.path)}
-        width="100%"
-        wrapMode="word"
-        showLineNumbers={true}
-        syntaxStyle={syntaxStyle}
-        fg={theme.text}
-        selectionBg={theme.selectionBg}
-        selectionFg={theme.text}
-        addedBg={theme.addedBg}
-        removedBg={theme.removedBg}
-        contextBg={theme.surface}
-        addedSignColor={theme.green}
-        removedSignColor={theme.red}
-        lineNumberFg={theme.muted}
-        lineNumberBg={theme.surface}
-        addedLineNumberBg={theme.addedBg}
-        removedLineNumberBg={theme.removedBg}
-      />
-      <Show when={hunks().length > 0}>
-        <box flexDirection="column" gap={1} border={["top"]} borderColor={theme.borderSoft} paddingTop={1}>
-          <box flexDirection="row" gap={2}>
-            <text fg={theme.cyan} attributes={TextAttributes.BOLD}>HUNK REVIEW</text>
-            <text fg={theme.muted}>{summary().accepted}/{summary().total} accepted</text>
-            <Show when={summary().rejected > 0}><text fg={theme.red}>{summary().rejected} rejected</text></Show>
-            <Show when={summary().pending > 0}><text fg={theme.yellow}>{summary().pending} pending</text></Show>
-          </box>
-          <For each={hunks()}>
-            {(hunk) => (
-              <box flexDirection="column" gap={0} paddingLeft={1} border={["left"]} borderColor={hunk.status === "accepted" ? theme.green : hunk.status === "rejected" ? theme.red : theme.border}>
-                <box flexDirection="row" gap={2}>
-                  <text fg={theme.text}>{hunk.header}</text>
-                  <text fg={theme.green}>+{hunk.additions}</text>
-                  <text fg={theme.red}>-{hunk.deletions}</text>
-                  <box flexGrow={1} />
-                  <text fg={hunk.status === "accepted" ? theme.green : theme.blue} selectable={false} onMouseUp={() => updateHunk(hunk.id, "accepted")}>accept</text>
-                  <text fg={hunk.status === "rejected" ? theme.red : theme.muted} selectable={false} onMouseUp={() => updateHunk(hunk.id, "rejected")}>reject</text>
-                </box>
-                <text fg={theme.dim}>{hunk.status}</text>
-              </box>
-            )}
-          </For>
-        </box>
-      </Show>
-    </box>
+    <diff
+      diff={props.diff}
+      view="split"
+      filetype={filetype(props.path)}
+      width="100%"
+      wrapMode="word"
+      showLineNumbers={true}
+      syntaxStyle={syntaxStyle}
+      fg={theme.text}
+      selectionBg={theme.selectionBg}
+      selectionFg={theme.text}
+      addedBg={theme.addedBg}
+      removedBg={theme.removedBg}
+      contextBg={theme.surface}
+      addedSignColor={theme.green}
+      removedSignColor={theme.red}
+      lineNumberFg={theme.muted}
+      lineNumberBg={theme.surface}
+      addedLineNumberBg={theme.addedBg}
+      removedLineNumberBg={theme.removedBg}
+    />
   )
 }
 
@@ -1633,27 +1602,7 @@ function PermissionTimelineItem(props: {
         >
           {(patch) => (
             <box backgroundColor={theme.panelSoft} border borderStyle="rounded" borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
-              <diff
-                diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())}
-                view="split"
-                filetype={filetype(props.request.filepath)}
-                width="100%"
-                wrapMode="word"
-                showLineNumbers={true}
-                syntaxStyle={syntaxStyle}
-                fg={theme.text}
-                selectionBg={theme.selectionBg}
-                selectionFg={theme.text}
-                addedBg={theme.addedBg}
-                removedBg={theme.removedBg}
-                contextBg={theme.surface}
-                addedSignColor={theme.green}
-                removedSignColor={theme.red}
-                lineNumberFg={theme.muted}
-                lineNumberBg={theme.surface}
-                addedLineNumberBg={theme.addedBg}
-                removedLineNumberBg={theme.removedBg}
-              />
+              <DiffWithHunkReview diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())} path={props.request.filepath} />
             </box>
           )}
         </Show>
