@@ -52,6 +52,7 @@ export type BackendCallbacks = {
 }
 
 export type BackendRun = {
+  exited: Promise<number | null>
   respond(requestId: string, decision: PermissionDecision, message?: string): void
   interrupt(): void
   kill(): void
@@ -124,9 +125,13 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
 
   void readJsonLines(proc.stdout, callbacks)
   void readStderr(proc.stderr, callbacks.onStderr)
-  void proc.exited.then((code) => callbacks.onExit(code))
+  const exited = proc.exited.then((code) => {
+    callbacks.onExit(code)
+    return code
+  })
 
   return {
+    exited,
     respond(requestId, decision, message) {
       const line = JSON.stringify({
         type: "permission_decision",
@@ -140,7 +145,7 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
       proc.kill("SIGINT")
     },
     kill() {
-      proc.kill()
+      proc.kill("SIGKILL")
     },
   }
 }
