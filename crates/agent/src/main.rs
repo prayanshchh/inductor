@@ -1259,22 +1259,28 @@ async fn run_harness_command(
         .upsert_session(&session_record)
         .map_err(|err| err.to_string())?;
 
-    if let Some(ref app_db_path) = app_db {
-        let app_db = AppDb::open(app_db_path).map_err(|err| err.to_string())?;
-        app_db
-            .upsert_workspace(
-                workspace_id,
-                &workspace_path,
-                workspace_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("workspace"),
-            )
-            .map_err(|err| err.to_string())?;
-        app_db
-            .upsert_session(&session_record)
-            .map_err(|err| err.to_string())?;
-    }
+    // Held open across the run so live status transitions (below) can be written
+    // back to the dashboard database without reopening the connection each time.
+    let live_app_db = match app_db {
+        Some(ref app_db_path) => {
+            let app_db = AppDb::open(app_db_path).map_err(|err| err.to_string())?;
+            app_db
+                .upsert_workspace(
+                    workspace_id,
+                    &workspace_path,
+                    workspace_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("workspace"),
+                )
+                .map_err(|err| err.to_string())?;
+            app_db
+                .upsert_session(&session_record)
+                .map_err(|err| err.to_string())?;
+            Some(app_db)
+        }
+        None => None,
+    };
 
     let loaded_messages = workspace_db
         .messages(session_id)
@@ -1405,6 +1411,21 @@ async fn run_harness_command(
         ) {
             final_status = SessionStatus::Idle;
         }
+        // Mirror live status transitions onto the session record. The dashboard
+        // reads `sessions.status`, which is otherwise only written at start
+        // (`starting`) and after the stream fully ends. Without this, an active
+        // run shows `starting` the whole time, and a run whose process is killed
+        // mid-stream is stranded at `starting` forever, looking permanently hung.
+        if let SessionEvent::Status { status, .. } = &event {
+            if let Err(err) = workspace_db.set_session_status(session_id, *status) {
+                dlog(&format!("set_session_status (workspace) failed: {err}"));
+            }
+            if let Some(ref db) = live_app_db {
+                if let Err(err) = db.set_session_status(session_id, *status) {
+                    dlog(&format!("set_session_status (app) failed: {err}"));
+                }
+            }
+        }
         persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
         let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
         println!("{line}");
@@ -1452,9 +1473,9 @@ async fn run_harness_command(
         .upsert_session(&session_record)
         .map_err(|err| err.to_string())?;
 
-    // Update app database if it exists
-    if let Some(ref app_db_path) = app_db {
-        let app_db_conn = AppDb::open(app_db_path).map_err(|err| err.to_string())?;
+    // Update app database if it exists, reusing the connection held open across
+    // the run for live status updates.
+    if let Some(ref app_db_conn) = live_app_db {
         app_db_conn
             .upsert_session(&session_record)
             .map_err(|err| err.to_string())?;
