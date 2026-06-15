@@ -9,7 +9,7 @@ use context::{
 };
 use diff::{DiffRequest, diff_worktree};
 use futures_util::StreamExt;
-use git::{CreateWorktreeRequest, WorktreeManager, branch_name_for};
+use git::{CreateWorktreeRequest, WorktreeManager};
 use harness_core::{
     ApprovalPolicy, ImageAttachment, PermissionDecision, PermissionRequestId, PermissionResponse,
     ProviderId, SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId, TurnRequest,
@@ -1156,22 +1156,17 @@ async fn run_harness_command(
             });
 
         let binding = if let Some(worktree) = bound_worktree {
-            // Reuse the existing worktree. If it still carries the placeholder
-            // branch from eager creation, relabel it from the first prompt so
-            // the branch name reflects the work being done.
-            if worktree.branch_name.starts_with("inductor/session-") {
-                if let Some(name) = derive_worktree_name(&prompt).await {
-                    rename_worktree_branch(&registry, &worktree, &name)?;
-                    generated_display_name = Some(name);
-                }
-            }
+            // Resuming a session that already owns a worktree — reuse it as-is.
             WorktreeBinding {
                 workspace_id: worktree.id,
                 worktree_path: worktree.worktree_path,
             }
         } else {
-            // Fresh session: name the worktree after the chat (<=3 words) and
-            // use that as both the branch slug and the session's display name.
+            // Fresh session: name the worktree (branch + directory) after the
+            // work the first prompt describes, e.g. `inductor/terminal-bug-fix`,
+            // and reuse that as the session's display name. The worktree is
+            // created here — on the first prompt — so its name reflects the work
+            // rather than a placeholder.
             let mut effective_slug = slug.clone();
             if let Some(name) = derive_worktree_name(&prompt).await {
                 effective_slug = Some(name.clone());
@@ -1179,11 +1174,6 @@ async fn run_harness_command(
             }
             create_worktree_binding(&registry, &workspace, effective_slug.as_deref())?
         };
-        eprintln!(
-            "worktree: {} (workspace {})",
-            binding.worktree_path.display(),
-            binding.workspace_id
-        );
         workspace = binding.worktree_path;
         forced_workspace_id = Some(binding.workspace_id);
         // Keep the session's state.db outside the worktree so archiving
@@ -2100,7 +2090,7 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
         } => {
             let managed_root = match managed_root {
                 Some(root) => root,
-                None => managed_root_for_repo(&repo)?,
+                None => default_managed_root()?,
             };
             let manager = WorktreeManager::new(managed_root);
             let worktree = manager
@@ -2377,29 +2367,6 @@ fn default_managed_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join("inductor").join("workspaces"))
 }
 
-/// Where managed worktrees for a given repo live. They sit next to the repo in
-/// the user's work area (e.g. `~/work/inductor` -> `~/work/inductor-worktrees`)
-/// so the worktree path is convenient to open and reason about, rather than
-/// buried under Application Support. Falls back to the global managed root when
-/// the repo has no parent directory.
-fn managed_root_for_repo(repo: &Path) -> Result<PathBuf, String> {
-    let manager = WorktreeManager::new(default_managed_root()?);
-    // Resolve to the git toplevel so a subdirectory of the repo still maps to
-    // the same sibling worktrees directory.
-    let root = manager
-        .inspect_repo(repo)
-        .map(|info| info.root)
-        .unwrap_or_else(|_| repo.to_path_buf());
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("repo");
-    match root.parent() {
-        Some(parent) => Ok(parent.join(format!("{name}-worktrees"))),
-        None => default_managed_root(),
-    }
-}
-
 fn default_app_db_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
 
@@ -2544,7 +2511,7 @@ fn create_worktree_binding(
     // a new worktree checks out HEAD and never touches the source checkout, so
     // the user's uncommitted changes stay put rather than blocking session
     // creation (worktree mode is the default for new sessions).
-    let manager = WorktreeManager::new(managed_root_for_repo(source_repo)?);
+    let manager = WorktreeManager::new(default_managed_root()?);
     let created = manager
         .create_worktree(CreateWorktreeRequest {
             source_repo: source_repo.to_path_buf(),
@@ -2559,32 +2526,6 @@ fn create_worktree_binding(
         workspace_id: created.workspace_id,
         worktree_path: created.worktree_path,
     })
-}
-
-/// Relabel a worktree's branch (and its registry record) to reflect what the
-/// session turned out to be about. Used when a worktree was created eagerly
-/// with a placeholder branch before the first prompt was known.
-fn rename_worktree_branch(
-    registry: &AppDb,
-    worktree: &WorktreeRecord,
-    name: &str,
-) -> Result<(), String> {
-    let new_branch = branch_name_for(name, worktree.id);
-    if new_branch == worktree.branch_name {
-        return Ok(());
-    }
-    let manager = WorktreeManager::new(managed_root_for_repo(&worktree.source_repo)?);
-    manager
-        .rename_branch(&worktree.source_repo, &worktree.branch_name, &new_branch)
-        .map_err(|err| err.to_string())?;
-
-    let mut updated = worktree.clone();
-    updated.branch_name = new_branch;
-    updated.updated_at = now_rfc3339().map_err(|err| err.to_string())?;
-    registry
-        .upsert_worktree(&updated)
-        .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 /// Record a freshly created worktree (and its workspace) in the app DB so it

@@ -93,26 +93,20 @@ impl WorktreeManager {
 
         // Lay worktrees out as `<managed_root>/<repo>/<branch-leaf>` so the
         // on-disk path mirrors the repository and branch it belongs to, e.g.
-        // `~/inductor/workspaces/inductor/fix-login-ab12cd34`.
+        // `~/inductor/workspaces/inductor/fix-login`. The leaf is the work the
+        // session is about (the slug) — no ids or other noise. A numeric suffix
+        // is only appended when a directory or branch of the same name already
+        // exists, so repeated work names stay readable (`fix-login-2`).
         let repo_name = repo_dir_name(&repo.root);
-        let branch_leaf = format!(
-            "{}-{}",
-            sanitize_slug(&request.slug),
-            short_workspace_id(workspace_id)
-        );
+        let parent = self.managed_root.join(&repo_name);
+        fs::create_dir_all(&parent).map_err(|source| GitError::Io {
+            path: parent.clone(),
+            source: source.to_string(),
+        })?;
+
+        let branch_leaf = unique_branch_leaf(&repo.root, &parent, &request.slug)?;
         let branch_name = format!("inductor/{branch_leaf}");
-        let worktree_path = self.managed_root.join(&repo_name).join(&branch_leaf);
-
-        if let Some(parent) = worktree_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| GitError::Io {
-                path: parent.to_path_buf(),
-                source: source.to_string(),
-            })?;
-        }
-
-        if worktree_path.exists() {
-            return Err(GitError::NonEmptyTarget(worktree_path));
-        }
+        let worktree_path = parent.join(&branch_leaf);
 
         git_stdout(
             &repo.root,
@@ -305,6 +299,44 @@ pub fn branch_name_for(slug: &str, workspace_id: WorkspaceId) -> String {
     )
 }
 
+/// Pick a worktree directory leaf (and matching branch leaf) from the work
+/// `slug`. Reuses the slug verbatim when it's free, otherwise appends the
+/// smallest numeric suffix that avoids colliding with an existing worktree
+/// directory or branch (archiving removes a worktree's directory but leaves its
+/// branch behind, so both must be checked).
+fn unique_branch_leaf(repo_root: &Path, parent: &Path, slug: &str) -> Result<String, GitError> {
+    let base = sanitize_slug(slug);
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    loop {
+        let path = parent.join(&candidate);
+        let branch = format!("inductor/{candidate}");
+        if !path.exists() && !branch_exists(repo_root, &branch)? {
+            return Ok(candidate);
+        }
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+}
+
+/// Whether a local branch already exists in the repo. Uses `show-ref --verify`,
+/// which exits non-zero (without failing the spawn) when the ref is absent.
+fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, GitError> {
+    let refname = format!("refs/heads/{branch}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--verify", "--quiet", &refname])
+        .output()
+        .map_err(|source| GitError::CommandFailed {
+            program: "git".to_string(),
+            args: vec!["show-ref".to_string(), "--verify".to_string(), refname],
+            status: None,
+            stderr: source.to_string(),
+        })?;
+    Ok(output.status.success())
+}
+
 fn sanitize_slug(slug: &str) -> String {
     let sanitized: String = slug
         .chars()
@@ -423,7 +455,8 @@ mod tests {
         assert_eq!(worktree.source_repo, fs::canonicalize(&repo).unwrap());
         assert!(worktree.worktree_path.starts_with(&managed));
         assert!(worktree.worktree_path.exists());
-        assert!(worktree.branch_name.starts_with("inductor/fix-login-"));
+        // Branch/leaf is the work name with no id or other suffix.
+        assert_eq!(worktree.branch_name, "inductor/fix-login");
 
         // Layout is `<managed>/<repo>/<branch-leaf>`.
         let repo_name = fs::canonicalize(&repo)
@@ -457,6 +490,34 @@ mod tests {
             .unwrap();
 
         assert!(!worktree.worktree_path.exists());
+    }
+
+    #[test]
+    fn create_worktree_appends_suffix_on_name_collision() {
+        let temp = TempDir::new("collision");
+        let repo = temp.path().join("repo");
+        let managed = temp.path().join("managed");
+        init_repo(&repo);
+
+        let manager = WorktreeManager::new(managed.clone());
+        let first = manager
+            .create_worktree(CreateWorktreeRequest {
+                source_repo: repo.clone(),
+                slug: "fix terminal".to_string(),
+                allow_dirty: true,
+            })
+            .unwrap();
+        let second = manager
+            .create_worktree(CreateWorktreeRequest {
+                source_repo: repo.clone(),
+                slug: "fix terminal".to_string(),
+                allow_dirty: true,
+            })
+            .unwrap();
+
+        assert_eq!(first.branch_name, "inductor/fix-terminal");
+        assert_eq!(second.branch_name, "inductor/fix-terminal-2");
+        assert_ne!(first.worktree_path, second.worktree_path);
     }
 
     #[test]

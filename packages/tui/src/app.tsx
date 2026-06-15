@@ -16,7 +16,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, createWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
+import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -274,7 +274,18 @@ export function App(props: AppProps) {
   const agent = () => focusedAgent().role
   const setAgent = (value: string) => patchFocused({ role: value })
   const sessionId = () => focusedAgent().sessionId
-  const activeBranch = () => focusedAgent().branch
+  // The worktree (and its branch) is created on the first prompt, so derive the
+  // branch from the matched worktree once it exists; until then the session has
+  // no worktree of its own yet.
+  const activeBranch = () => {
+    const agent = focusedAgent()
+    const worktree = worktrees().find((w) =>
+      (agent.sessionId && agent.sessionId === w.session_id) ||
+      (agent.workspaceId && agent.workspaceId === w.workspace_id)
+    )
+    if (worktree) return worktree.branch_name
+    return agent.sessionId ? agent.branch : "new worktree"
+  }
 
   const [draft, setDraft] = createSignal("")
   const [stopArmed, setStopArmed] = createSignal<StopIntent>()
@@ -313,16 +324,27 @@ export function App(props: AppProps) {
   const TERMINAL_COLS = SESSION_SIDEBAR_TEXT_WIDTH
   const terminalRows = createMemo(() => Math.max(6, Math.floor((dimensions().height - 16) / 2)))
   const [terminalSnapshot, setTerminalSnapshot] = createSignal<TerminalSnapshot>()
+  const [terminalError, setTerminalError] = createSignal<string>()
   let terminalSession: TerminalSession | undefined
   let terminalCwd: string | undefined
   function startTerminal(cwd: string) {
     terminalSession?.kill()
     setTerminalSnapshot(undefined)
+    setTerminalError(undefined)
     terminalCwd = cwd
+    let gotSnapshot = false
     terminalSession = spawnTerminalSession(props, cwd, { rows: terminalRows(), cols: TERMINAL_COLS }, {
-      onSnapshot: (snapshot) => setTerminalSnapshot(snapshot),
+      onSnapshot: (snapshot) => {
+        gotSnapshot = true
+        setTerminalSnapshot(snapshot)
+      },
       onExit: () => {
-        if (terminalCwd === cwd) terminalSession = undefined
+        if (terminalCwd !== cwd) return
+        terminalSession = undefined
+        // Exiting before emitting any screen means the shell never started
+        // (e.g. an outdated backend binary) — say so instead of hanging on
+        // "starting shell…".
+        if (!gotSnapshot) setTerminalError("shell unavailable — update the inductor backend")
       },
     })
   }
@@ -365,8 +387,6 @@ export function App(props: AppProps) {
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
     void refreshWorktrees()
-    // The session that opens with the app gets its worktree eagerly too.
-    void ensureWorktreeForSlot(initialAgent.key)
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
@@ -393,6 +413,12 @@ export function App(props: AppProps) {
     }
     if (event.eventType === "release") return
     if (event.repeated) return
+    if (isNewSessionShortcut(event)) {
+      event.preventDefault()
+      event.stopPropagation()
+      startNewSession()
+      return
+    }
     if (fstate().pendingPermission && handlePermissionKey(event)) {
       event.preventDefault()
       event.stopPropagation()
@@ -445,14 +471,18 @@ export function App(props: AppProps) {
       effort: backendEffort(mode()),
       mode: devMode(),
       appDb: props.appDb,
-      // Bind to the worktree pre-created when this slot was opened so the
-      // first turn reuses it (and its out-of-worktree state.db) instead of
-      // spawning a second one.
+      // Reuse the worktree once the session owns one; the backend creates it on
+      // the first prompt (named after the work) when these are absent.
       workspaceId: focusedAgent().workspaceId,
       stateDb: focusedAgent().stateDb,
     }, {
       onEvent(event) {
-        if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) patchAgent(key, { sessionId: event.session_id })
+        if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) {
+          patchAgent(key, { sessionId: event.session_id })
+          // First turn just created this session's worktree — surface it (and
+          // its work-derived branch) in the sidebar without waiting for exit.
+          void refreshWorktrees()
+        }
         if (event.type === "permission_request" && store.focusedKey === key) setPermissionSelected(0)
         if (flags.stopping) {
           if (event.type === "result" || event.type === "error") {
@@ -796,13 +826,15 @@ export function App(props: AppProps) {
     return store.agents.find((a) => (a.sessionId && a.sessionId === worktree.session_id) || (a.workspaceId && a.workspaceId === worktree.workspace_id))
   }
 
+  // Open a new session. The worktree itself is created lazily on the first
+  // prompt so it can be named after the work (the backend derives the branch,
+  // e.g. `inductor/terminal-bug-fix`). Until then the slot shows as a draft.
   function startNewSession() {
     const base = focusedAgent()
     // Reuse a pristine focused slot rather than piling up empty agents.
     if (base.state.transcript.length === 0 && !base.state.running && !base.sessionId) {
       setExpanded(new Set<string>())
       setNotice(undefined)
-      void ensureWorktreeForSlot(base.key)
       queueMicrotask(() => input?.focus())
       return
     }
@@ -811,30 +843,7 @@ export function App(props: AppProps) {
     setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
     setNotice(undefined)
-    void ensureWorktreeForSlot(slot.key)
     queueMicrotask(() => input?.focus())
-  }
-
-  // Eagerly create an isolated worktree the moment a worktree-mode session is
-  // opened, so the user sees it in the sidebar and works in it immediately
-  // rather than waiting for the first prompt. The branch carries a placeholder
-  // `session` slug that the backend relabels from the first prompt.
-  async function ensureWorktreeForSlot(key: string) {
-    const idx = agentIndex(key)
-    if (idx < 0) return
-    const slot = store.agents[idx]
-    if (slot.devMode !== "worktree" || slot.workspaceId || slot.sessionId) return
-    try {
-      const created = await createWorktree(props)
-      patchAgent(key, {
-        workspaceId: created.workspace_id,
-        stateDb: created.state_db,
-        branch: created.branch_name,
-      })
-      await refreshWorktrees()
-    } catch (error) {
-      setNotice({ text: error instanceof Error ? error.message : "Could not create worktree", tone: "red" })
-    }
   }
 
   function toggleDevMode() {
@@ -848,7 +857,8 @@ export function App(props: AppProps) {
   }
 
   async function archiveWorktreeAction(worktree: Worktree) {
-    if (agentForWorktree(worktree)?.state.running) {
+    const open = agentForWorktree(worktree)
+    if (open?.state.running) {
       setNotice({ text: "Stop this worktree's agent before archiving", tone: "cyan" })
       return
     }
@@ -856,6 +866,9 @@ export function App(props: AppProps) {
     setNotice({ text: `archiving ${worktree.branch_name}...`, tone: "cyan" })
     try {
       await archiveWorktree(props, worktree.workspace_id)
+      // Drop the live slot too, otherwise the now-worktree-less agent would
+      // resurface as a draft row — archived sessions should leave the sidebar.
+      if (open) closeAgentSlot(open.key)
       setNotice({ text: "worktree archived (chats kept)", tone: "muted" })
       await refreshWorktrees()
     } catch (error) {
@@ -865,10 +878,32 @@ export function App(props: AppProps) {
     }
   }
 
+  // Remove an agent slot from the sidebar, tearing down any lingering run. If it
+  // was the last slot (or the focused one), fall back to a fresh session so the
+  // composer always has a slot to write into.
+  function closeAgentSlot(key: string) {
+    runs.get(key)?.kill()
+    runs.delete(key)
+    runFlags.delete(key)
+    const remaining = store.agents.filter((a) => a.key !== key)
+    if (remaining.length === 0) {
+      const base = store.agents.find((a) => a.key === key) ?? store.agents[0]
+      const fresh = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+      setStore({ agents: [fresh], focusedKey: fresh.key })
+      setExpanded(new Set<string>())
+      queueMicrotask(() => input?.focus())
+      return
+    }
+    setStore("agents", (agents) => agents.filter((a) => a.key !== key))
+    if (store.focusedKey === key) focusAgent(remaining[0].key)
+  }
+
   async function refreshWorktrees() {
     try {
       const next = await listWorktrees(props)
-      setWorktrees(next)
+      // Archived worktrees keep their chats but no longer have a working
+      // directory — hide them from the sidebar so it only lists live worktrees.
+      setWorktrees(next.filter((w) => w.status !== "archived"))
       setSessionListStatus("")
     } catch (error) {
       setSessionListStatus(error instanceof Error ? error.message : "Could not load worktrees")
@@ -1067,6 +1102,7 @@ export function App(props: AppProps) {
             loadWorktree={loadWorktree}
             archiveWorktree={archiveWorktreeAction}
             terminalSnapshot={terminalSnapshot}
+            terminalError={terminalError}
             terminalWrite={terminalWrite}
             terminalCwd={focusedWorktreePath()}
           />
@@ -1233,6 +1269,7 @@ function SessionSidebar(props: {
   loadWorktree: (worktree: Worktree) => void
   archiveWorktree: (worktree: Worktree) => void
   terminalSnapshot: () => TerminalSnapshot | undefined
+  terminalError: () => string | undefined
   terminalWrite: (data: string) => void
   terminalCwd: string
 }) {
@@ -1304,6 +1341,7 @@ function SessionSidebar(props: {
       <box width="100%" height={1} border={["top"]} borderColor={theme.borderSoft} marginTop={1} marginBottom={1} />
       <TerminalPanel
         snapshot={props.terminalSnapshot}
+        error={props.terminalError}
         write={props.terminalWrite}
         cwd={props.terminalCwd}
       />
@@ -1313,6 +1351,7 @@ function SessionSidebar(props: {
 
 function TerminalPanel(props: {
   snapshot: () => TerminalSnapshot | undefined
+  error: () => string | undefined
   write: (data: string) => void
   cwd: string
 }) {
@@ -1324,7 +1363,8 @@ function TerminalPanel(props: {
     if (!snapshot) return []
     return snapshot.contents.replace(/\s+$/g, "").split("\n")
   }
-  const running = () => props.snapshot()?.is_running !== false
+  const running = () => !props.error() && props.snapshot()?.is_running !== false
+  const status = () => (props.error() ? "unavailable" : running() ? "live" : "exited")
   const submit = () => {
     props.write(`${input.plainText}\n`)
     input.setText("")
@@ -1334,7 +1374,7 @@ function TerminalPanel(props: {
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
         <text fg={theme.cyan}>TERMINAL</text>
         <box flexGrow={1} />
-        <text fg={running() ? theme.green : theme.dim}>{running() ? "live" : "exited"}</text>
+        <text fg={props.error() ? theme.red : running() ? theme.green : theme.dim}>{status()}</text>
       </box>
       <scrollbox
         flexGrow={1}
@@ -1345,7 +1385,7 @@ function TerminalPanel(props: {
         verticalScrollbarOptions={{ visible: false }}
       >
         <box flexDirection="column">
-          <Show when={lines().length > 0} fallback={<text fg={theme.dim}>starting shell…</text>}>
+          <Show when={lines().length > 0} fallback={<text fg={props.error() ? theme.red : theme.dim}>{props.error() ?? "starting shell…"}</text>}>
             <For each={lines()}>
               {(line) => <text fg={theme.muted} wrapMode="none" selectable={true}>{line.length ? line : " "}</text>}
             </For>
@@ -1508,6 +1548,11 @@ function isCtrlC(event: KeyEvent) {
   return (event.ctrl && event.name.toLowerCase() === "c") || event.sequence === "\x03"
 }
 
+// Ctrl+N opens a new worktree/session — mirrors the /new command.
+function isNewSessionShortcut(event: KeyEvent) {
+  return Boolean(event.ctrl) && event.name?.toLowerCase() === "n"
+}
+
 function permissionKey(event: KeyEvent) {
   return (event.name || event.sequence || "").toLowerCase()
 }
@@ -1525,6 +1570,9 @@ function StartScreen(_props: { height: number }) {
         />
         <box marginTop={2}>
           <text fg={theme.muted} selectable={false}>- ask, edit, review, or run commands</text>
+        </box>
+        <box marginTop={1}>
+          <text fg={theme.dim} selectable={false}>Ctrl+N or /new starts a new worktree</text>
         </box>
       </box>
     </box>
