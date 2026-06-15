@@ -95,17 +95,25 @@ fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
 }
 
 fn codex_message(message: &ModelMessage) -> Value {
-    let content = message.parts.iter().map(codex_part).collect::<Vec<_>>();
+    // The Responses API types content by author: assistant-authored turns use
+    // `output_text`, while user/system/developer turns use `input_text`. Sending
+    // `input_text` on an assistant message is rejected with HTTP 400.
+    let is_assistant = message.role.eq_ignore_ascii_case("assistant");
+    let content = message
+        .parts
+        .iter()
+        .map(|part| codex_part(part, is_assistant))
+        .collect::<Vec<_>>();
     json!({
         "role": message.role,
         "content": content,
     })
 }
 
-fn codex_part(part: &MessagePart) -> Value {
+fn codex_part(part: &MessagePart, is_assistant: bool) -> Value {
     match part {
         MessagePart::Text { text } => json!({
-            "type": "input_text",
+            "type": if is_assistant { "output_text" } else { "input_text" },
             "text": text,
         }),
         MessagePart::Image { image } => json!({
@@ -598,6 +606,25 @@ mod tests {
         assert_eq!(body["instructions"], "custom instructions");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["text"], "typed hello");
+    }
+
+    #[test]
+    fn assistant_history_uses_output_text() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        let mut request = text_request("legacy prompt");
+        request.messages = vec![
+            ModelMessage::text("user", "hello"),
+            ModelMessage::text("assistant", "hi there"),
+        ];
+
+        let body = provider.request_body(&request);
+
+        // User-authored content stays `input_text`; assistant turns must be
+        // `output_text` or the Responses API rejects the request with HTTP 400.
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][1]["content"][0]["text"], "hi there");
     }
 
     #[test]
