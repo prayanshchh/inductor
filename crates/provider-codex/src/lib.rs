@@ -95,11 +95,43 @@ fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
 }
 
 fn codex_message(message: &ModelMessage) -> Value {
-    let content = message.parts.iter().map(codex_part).collect::<Vec<_>>();
+    let (role, parts) = codex_message_role_and_parts(message);
+    let content = parts.iter().map(codex_part).collect::<Vec<_>>();
     json!({
-        "role": message.role,
+        "role": role,
         "content": content,
     })
+}
+
+fn codex_message_role_and_parts(message: &ModelMessage) -> (&'static str, Vec<MessagePart>) {
+    match message.role.to_ascii_lowercase().as_str() {
+        "assistant" => ("assistant", message.parts.clone()),
+        "system" => ("system", message.parts.clone()),
+        "developer" => ("developer", message.parts.clone()),
+        "user" => ("user", message.parts.clone()),
+        "tool" => ("user", prefix_text_parts("Tool", &message.parts)),
+        _ => ("user", prefix_text_parts(&message.role, &message.parts)),
+    }
+}
+
+fn prefix_text_parts(label: &str, parts: &[MessagePart]) -> Vec<MessagePart> {
+    let prefix = format!("{label}:\n");
+    let mut prefixed = Vec::with_capacity(parts.len().max(1));
+    match parts.split_first() {
+        Some((MessagePart::Text { text }, rest)) => {
+            prefixed.push(MessagePart::Text {
+                text: format!("{prefix}{text}"),
+            });
+            prefixed.extend(rest.iter().cloned());
+        }
+        Some((first, rest)) => {
+            prefixed.push(MessagePart::Text { text: prefix });
+            prefixed.push(first.clone());
+            prefixed.extend(rest.iter().cloned());
+        }
+        None => prefixed.push(MessagePart::Text { text: prefix }),
+    }
+    prefixed
 }
 
 fn codex_part(part: &MessagePart) -> Value {
@@ -598,6 +630,54 @@ mod tests {
         assert_eq!(body["instructions"], "custom instructions");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["text"], "typed hello");
+    }
+
+    #[test]
+    fn request_body_converts_tool_messages_to_valid_codex_input() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        let mut request = text_request("legacy prompt");
+        request.messages = vec![
+            ModelMessage::text("assistant", "tool call requested"),
+            ModelMessage::text("tool", "read_file result:\nhello"),
+        ];
+
+        let body = provider.request_body(&request);
+
+        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "Tool:\nread_file result:\nhello"
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["role"] != "tool")
+        );
+    }
+
+    #[test]
+    fn request_body_preserves_supported_codex_roles() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        let mut request = text_request("legacy prompt");
+        request.messages = vec![
+            ModelMessage::text("system", "system context"),
+            ModelMessage::text("developer", "developer context"),
+            ModelMessage::text("user", "user prompt"),
+            ModelMessage::text("assistant", "assistant answer"),
+        ];
+
+        let body = provider.request_body(&request);
+        let roles = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roles, vec!["system", "developer", "user", "assistant"]);
     }
 
     #[test]
