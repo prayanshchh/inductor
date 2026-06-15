@@ -9,7 +9,7 @@ use context::{
 };
 use diff::{DiffRequest, diff_worktree};
 use futures_util::StreamExt;
-use git::{CreateWorktreeRequest, WorktreeManager};
+use git::{CreateWorktreeRequest, WorktreeManager, branch_name_for};
 use harness_core::{
     ApprovalPolicy, ImageAttachment, PermissionDecision, PermissionRequestId, PermissionResponse,
     ProviderId, SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId, TurnRequest,
@@ -536,6 +536,9 @@ enum WorktreeCommand {
         /// Record the worktree in this app DB so it can be listed and archived.
         #[arg(long)]
         app_db: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
     List {
         #[arg(long)]
@@ -1124,29 +1127,42 @@ async fn run_harness_command(
         }
         let registry = AppDb::open(app_db.as_ref().unwrap()).map_err(|err| err.to_string())?;
 
-        // Resuming an existing worktree-bound session reuses its worktree and
-        // name; only a brand-new session needs a fresh worktree + a name.
-        let resuming = requested_session_id
+        // A worktree may already exist for this turn: either the resumed
+        // session is bound to one, or the TUI pre-created one the moment the
+        // user opened the session (passed via --workspace-id). Otherwise this
+        // is a brand-new session that needs a fresh worktree.
+        let bound_worktree = requested_session_id
             .and_then(|sid| registry.get_session(sid).ok().flatten())
             .and_then(|session| registry.get_worktree(session.workspace_id).ok().flatten())
-            .is_some();
+            .or_else(|| {
+                requested_workspace_id
+                    .and_then(|wid| registry.get_worktree(wid).ok().flatten())
+            });
 
-        // For a fresh session, name the worktree after the chat (<=3 words) and
-        // use that as both the branch slug and the session's display name.
-        let mut effective_slug = slug.clone();
-        if !resuming {
+        let binding = if let Some(worktree) = bound_worktree {
+            // Reuse the existing worktree. If it still carries the placeholder
+            // branch from eager creation, relabel it from the first prompt so
+            // the branch name reflects the work being done.
+            if worktree.branch_name.starts_with("inductor/session-") {
+                if let Some(name) = derive_worktree_name(&prompt).await {
+                    rename_worktree_branch(&registry, &worktree, &name)?;
+                    generated_display_name = Some(name);
+                }
+            }
+            WorktreeBinding {
+                workspace_id: worktree.id,
+                worktree_path: worktree.worktree_path,
+            }
+        } else {
+            // Fresh session: name the worktree after the chat (<=3 words) and
+            // use that as both the branch slug and the session's display name.
+            let mut effective_slug = slug.clone();
             if let Some(name) = derive_worktree_name(&prompt).await {
                 effective_slug = Some(name.clone());
                 generated_display_name = Some(name);
             }
-        }
-
-        let binding = resolve_worktree(
-            &registry,
-            &workspace,
-            requested_session_id,
-            effective_slug.as_deref(),
-        )?;
+            create_worktree_binding(&registry, &workspace, effective_slug.as_deref())?
+        };
         eprintln!(
             "worktree: {} (workspace {})",
             binding.worktree_path.display(),
@@ -1962,8 +1978,13 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
             managed_root,
             allow_dirty,
             app_db,
+            json,
         } => {
-            let manager = WorktreeManager::new(managed_root.unwrap_or(default_managed_root()?));
+            let managed_root = match managed_root {
+                Some(root) => root,
+                None => managed_root_for_repo(&repo)?,
+            };
+            let manager = WorktreeManager::new(managed_root);
             let worktree = manager
                 .create_worktree(CreateWorktreeRequest {
                     source_repo: repo,
@@ -1977,12 +1998,26 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
                 register_worktree(&registry, &worktree)?;
             }
 
-            println!("workspace_id: {}", worktree.workspace_id);
-            println!("source_repo: {}", worktree.source_repo.display());
-            println!("worktree_path: {}", worktree.worktree_path.display());
-            println!("branch_name: {}", worktree.branch_name);
-            println!("base_branch: {}", worktree.base_branch);
-            println!("base_commit: {}", worktree.base_commit);
+            if json {
+                let state_db = worktree_state_db_path(worktree.workspace_id)?;
+                let payload = json!({
+                    "workspace_id": worktree.workspace_id,
+                    "source_repo": worktree.source_repo.display().to_string(),
+                    "worktree_path": worktree.worktree_path.display().to_string(),
+                    "state_db": state_db.display().to_string(),
+                    "branch_name": worktree.branch_name,
+                    "base_branch": worktree.base_branch,
+                    "base_commit": worktree.base_commit,
+                });
+                println!("{}", serde_json::to_string(&payload).map_err(|err| err.to_string())?);
+            } else {
+                println!("workspace_id: {}", worktree.workspace_id);
+                println!("source_repo: {}", worktree.source_repo.display());
+                println!("worktree_path: {}", worktree.worktree_path.display());
+                println!("branch_name: {}", worktree.branch_name);
+                println!("base_branch: {}", worktree.base_branch);
+                println!("base_commit: {}", worktree.base_commit);
+            }
         }
         WorktreeCommand::List { repo } => {
             let manager = WorktreeManager::new(default_managed_root()?);
@@ -2225,6 +2260,29 @@ fn default_managed_root() -> Result<PathBuf, String> {
         .join("worktrees"))
 }
 
+/// Where managed worktrees for a given repo live. They sit next to the repo in
+/// the user's work area (e.g. `~/work/inductor` -> `~/work/inductor-worktrees`)
+/// so the worktree path is convenient to open and reason about, rather than
+/// buried under Application Support. Falls back to the global managed root when
+/// the repo has no parent directory.
+fn managed_root_for_repo(repo: &Path) -> Result<PathBuf, String> {
+    let manager = WorktreeManager::new(default_managed_root()?);
+    // Resolve to the git toplevel so a subdirectory of the repo still maps to
+    // the same sibling worktrees directory.
+    let root = manager
+        .inspect_repo(repo)
+        .map(|info| info.root)
+        .unwrap_or_else(|_| repo.to_path_buf());
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo");
+    match root.parent() {
+        Some(parent) => Ok(parent.join(format!("{name}-worktrees"))),
+        None => default_managed_root(),
+    }
+}
+
 fn default_app_db_path() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
 
@@ -2360,35 +2418,16 @@ struct WorktreeBinding {
 /// Resolve the worktree a worktree-mode `run` should execute in: reuse the one
 /// bound to the resumed session, otherwise create a fresh isolated worktree off
 /// `source_repo` and record it (and its workspace) in the app DB.
-fn resolve_worktree(
+fn create_worktree_binding(
     registry: &AppDb,
     source_repo: &Path,
-    requested_session_id: Option<SessionId>,
     slug: Option<&str>,
 ) -> Result<WorktreeBinding, String> {
-    // Resume: if the session already lives in a managed worktree, reuse it.
-    if let Some(session_id) = requested_session_id {
-        if let Some(session) = registry
-            .get_session(session_id)
-            .map_err(|err| err.to_string())?
-        {
-            if let Some(worktree) = registry
-                .get_worktree(session.workspace_id)
-                .map_err(|err| err.to_string())?
-            {
-                return Ok(WorktreeBinding {
-                    workspace_id: worktree.id,
-                    worktree_path: worktree.worktree_path,
-                });
-            }
-        }
-    }
-
     // Fresh worktree off the source repo's current branch. Allow a dirty repo:
     // a new worktree checks out HEAD and never touches the source checkout, so
     // the user's uncommitted changes stay put rather than blocking session
     // creation (worktree mode is the default for new sessions).
-    let manager = WorktreeManager::new(default_managed_root()?);
+    let manager = WorktreeManager::new(managed_root_for_repo(source_repo)?);
     let created = manager
         .create_worktree(CreateWorktreeRequest {
             source_repo: source_repo.to_path_buf(),
@@ -2403,6 +2442,32 @@ fn resolve_worktree(
         workspace_id: created.workspace_id,
         worktree_path: created.worktree_path,
     })
+}
+
+/// Relabel a worktree's branch (and its registry record) to reflect what the
+/// session turned out to be about. Used when a worktree was created eagerly
+/// with a placeholder branch before the first prompt was known.
+fn rename_worktree_branch(
+    registry: &AppDb,
+    worktree: &WorktreeRecord,
+    name: &str,
+) -> Result<(), String> {
+    let new_branch = branch_name_for(name, worktree.id);
+    if new_branch == worktree.branch_name {
+        return Ok(());
+    }
+    let manager = WorktreeManager::new(managed_root_for_repo(&worktree.source_repo)?);
+    manager
+        .rename_branch(&worktree.source_repo, &worktree.branch_name, &new_branch)
+        .map_err(|err| err.to_string())?;
+
+    let mut updated = worktree.clone();
+    updated.branch_name = new_branch;
+    updated.updated_at = now_rfc3339().map_err(|err| err.to_string())?;
+    registry
+        .upsert_worktree(&updated)
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// Record a freshly created worktree (and its workspace) in the app DB so it

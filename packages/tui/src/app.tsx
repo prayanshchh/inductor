@@ -16,7 +16,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
+import { archiveWorktree, createWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -331,6 +331,8 @@ export function App(props: AppProps) {
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
     void refreshWorktrees()
+    // The session that opens with the app gets its worktree eagerly too.
+    void ensureWorktreeForSlot(initialAgent.key)
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
@@ -408,6 +410,11 @@ export function App(props: AppProps) {
       effort: backendEffort(mode()),
       mode: devMode(),
       appDb: props.appDb,
+      // Bind to the worktree pre-created when this slot was opened so the
+      // first turn reuses it (and its out-of-worktree state.db) instead of
+      // spawning a second one.
+      workspaceId: focusedAgent().workspaceId,
+      stateDb: focusedAgent().stateDb,
     }, {
       onEvent(event) {
         if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) patchAgent(key, { sessionId: event.session_id })
@@ -760,6 +767,7 @@ export function App(props: AppProps) {
     if (base.state.transcript.length === 0 && !base.state.running && !base.sessionId) {
       setExpanded(new Set<string>())
       setNotice(undefined)
+      void ensureWorktreeForSlot(base.key)
       queueMicrotask(() => input?.focus())
       return
     }
@@ -768,7 +776,30 @@ export function App(props: AppProps) {
     setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
     setNotice(undefined)
+    void ensureWorktreeForSlot(slot.key)
     queueMicrotask(() => input?.focus())
+  }
+
+  // Eagerly create an isolated worktree the moment a worktree-mode session is
+  // opened, so the user sees it in the sidebar and works in it immediately
+  // rather than waiting for the first prompt. The branch carries a placeholder
+  // `session` slug that the backend relabels from the first prompt.
+  async function ensureWorktreeForSlot(key: string) {
+    const idx = agentIndex(key)
+    if (idx < 0) return
+    const slot = store.agents[idx]
+    if (slot.devMode !== "worktree" || slot.workspaceId || slot.sessionId) return
+    try {
+      const created = await createWorktree(props)
+      patchAgent(key, {
+        workspaceId: created.workspace_id,
+        stateDb: created.state_db,
+        branch: created.branch_name,
+      })
+      await refreshWorktrees()
+    } catch (error) {
+      setNotice({ text: error instanceof Error ? error.message : "Could not create worktree", tone: "red" })
+    }
   }
 
   function toggleDevMode() {

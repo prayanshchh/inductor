@@ -101,11 +101,7 @@ impl WorktreeManager {
             return Err(GitError::NonEmptyTarget(worktree_path));
         }
 
-        let branch_name = format!(
-            "inductor/{}-{}",
-            sanitize_slug(&request.slug),
-            short_workspace_id(workspace_id)
-        );
+        let branch_name = branch_name_for(&request.slug, workspace_id);
 
         git_stdout(
             &repo.root,
@@ -127,6 +123,23 @@ impl WorktreeManager {
             base_branch: repo.current_branch,
             base_commit: repo.head_commit,
         })
+    }
+
+    /// Rename a branch in the source repo. Used to relabel a worktree's
+    /// placeholder branch once the session's first prompt reveals what it is
+    /// about. Safe to run while the branch is checked out in a worktree.
+    pub fn rename_branch(
+        &self,
+        source_repo: &Path,
+        old_branch: &str,
+        new_branch: &str,
+    ) -> Result<(), GitError> {
+        if old_branch == new_branch {
+            return Ok(());
+        }
+        let repo = self.inspect_repo(source_repo)?;
+        git_stdout(&repo.root, ["branch", "-m", old_branch, new_branch])?;
+        Ok(())
     }
 
     pub fn list_worktrees(&self, source_repo: &Path) -> Result<Vec<GitWorktree>, GitError> {
@@ -269,6 +282,16 @@ where
     args.iter()
         .map(|arg| arg.as_ref().to_string_lossy().into_owned())
         .collect()
+}
+
+/// Branch name Inductor assigns a managed worktree: `inductor/<slug>-<id8>`.
+/// Exposed so the harness can recompute it when renaming a placeholder branch.
+pub fn branch_name_for(slug: &str, workspace_id: WorkspaceId) -> String {
+    format!(
+        "inductor/{}-{}",
+        sanitize_slug(slug),
+        short_workspace_id(workspace_id)
+    )
 }
 
 fn sanitize_slug(slug: &str) -> String {
