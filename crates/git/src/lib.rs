@@ -89,23 +89,30 @@ impl WorktreeManager {
             return Err(GitError::DirtyRepository(repo.root));
         }
 
-        fs::create_dir_all(&self.managed_root).map_err(|source| GitError::Io {
-            path: self.managed_root.clone(),
-            source: source.to_string(),
-        })?;
-
         let workspace_id = WorkspaceId::new();
-        let worktree_path = self.managed_root.join(workspace_id.to_string());
+
+        // Lay worktrees out as `<managed_root>/<repo>/<branch-leaf>` so the
+        // on-disk path mirrors the repository and branch it belongs to, e.g.
+        // `~/inductor/workspaces/inductor/fix-login-ab12cd34`.
+        let repo_name = repo_dir_name(&repo.root);
+        let branch_leaf = format!(
+            "{}-{}",
+            sanitize_slug(&request.slug),
+            short_workspace_id(workspace_id)
+        );
+        let branch_name = format!("inductor/{branch_leaf}");
+        let worktree_path = self.managed_root.join(&repo_name).join(&branch_leaf);
+
+        if let Some(parent) = worktree_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| GitError::Io {
+                path: parent.to_path_buf(),
+                source: source.to_string(),
+            })?;
+        }
 
         if worktree_path.exists() {
             return Err(GitError::NonEmptyTarget(worktree_path));
         }
-
-        let branch_name = format!(
-            "inductor/{}-{}",
-            sanitize_slug(&request.slug),
-            short_workspace_id(workspace_id)
-        );
 
         git_stdout(
             &repo.root,
@@ -300,6 +307,18 @@ fn short_workspace_id(workspace_id: WorkspaceId) -> String {
     workspace_id.to_string()[..8].to_ascii_lowercase()
 }
 
+/// Directory component for the repository a worktree belongs to, derived from
+/// the repo root's folder name. Falls back to `repo` for unnamable roots (e.g.
+/// filesystem root) so the worktree layout always has a stable repo segment.
+fn repo_dir_name(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
 fn parse_worktree_list(output: &str) -> Result<Vec<GitWorktree>, GitError> {
     let mut worktrees = Vec::new();
     let mut current_path: Option<PathBuf> = None;
@@ -378,6 +397,26 @@ mod tests {
         assert!(worktree.worktree_path.starts_with(&managed));
         assert!(worktree.worktree_path.exists());
         assert!(worktree.branch_name.starts_with("inductor/fix-login-"));
+
+        // Layout is `<managed>/<repo>/<branch-leaf>`.
+        let repo_name = fs::canonicalize(&repo)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            worktree.worktree_path.parent().unwrap(),
+            managed.join(&repo_name)
+        );
+        let leaf = worktree
+            .worktree_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(leaf, worktree.branch_name.strip_prefix("inductor/").unwrap());
 
         let list = manager.list_worktrees(&worktree.source_repo).unwrap();
         let created_path = fs::canonicalize(&worktree.worktree_path).unwrap();
