@@ -2218,11 +2218,10 @@ mod tests {
 fn default_managed_root() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
 
-    Ok(PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Inductor")
-        .join("worktrees"))
+    // Worktrees live under `~/inductor/workspaces/<repo>/<branch>`. The repo and
+    // branch segments are appended by the worktree manager when each worktree is
+    // created; this is just the shared root.
+    Ok(PathBuf::from(home).join("inductor").join("workspaces"))
 }
 
 fn default_app_db_path() -> Result<PathBuf, String> {

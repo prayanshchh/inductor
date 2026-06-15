@@ -1472,7 +1472,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border={["top", "bottom"]}
+            border={["top"]}
             borderColor={isWrite() ? theme.borderStrong : theme.border}
             paddingLeft={1}
             paddingRight={1}
