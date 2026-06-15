@@ -294,6 +294,16 @@ export function App(props: AppProps) {
   const dimensions = useTerminalDimensions()
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
   const hasTranscript = createMemo(() => fstate().transcript.length > 0)
+  // Full filesystem path the focused agent runs in: its managed worktree when
+  // one exists, otherwise the workspace Inductor was opened in.
+  const focusedWorktreePath = createMemo(() => {
+    const agent = focusedAgent()
+    const worktree = worktrees().find((w) =>
+      (agent.sessionId && agent.sessionId === w.session_id) ||
+      (agent.workspaceId && agent.workspaceId === w.workspace_id)
+    )
+    return worktree?.worktree_path ?? props.workspace
+  })
   const commandItems = createMemo(() => {
     const query = draft().trim()
     if (!query.startsWith("/")) return commands
@@ -1033,6 +1043,7 @@ export function App(props: AppProps) {
             provider={provider()}
             model={model()}
             workspace={props.workspace}
+            worktreePath={focusedWorktreePath()}
             contextPercent={contextPercent()}
             mode={mode()}
             branch={activeBranch()}
@@ -1927,6 +1938,7 @@ function TelemetrySidebar(props: {
   provider: string
   model: string
   workspace: string
+  worktreePath: string
   contextPercent: number
   mode: EffortValue
   branch: string
@@ -1959,6 +1971,8 @@ function TelemetrySidebar(props: {
             <text fg={theme.muted}>{money.format(props.state.costUsd)} spent</text>
           </box>
           <SectionDivider />
+          <WorktreePathSection path={props.worktreePath} />
+          <SectionDivider />
           <ModifiedFiles files={props.state.modifiedFiles} openFile={props.openModifiedFile} />
         </box>
       </scrollbox>
@@ -1976,6 +1990,17 @@ function TelemetrySidebar(props: {
 
 function SectionDivider() {
   return <box width="100%" height={1} border={["top"]} borderColor={theme.borderSoft} />
+}
+
+function WorktreePathSection(props: { path: string }) {
+  // Show the worktree's full path. It must never be truncated, so we wrap it
+  // across as many lines as needed (no "..." ellipsis even for long paths).
+  return (
+    <box flexDirection="column" gap={1}>
+      <text fg={theme.cyan}>WORKTREE PATH</text>
+      <text fg={theme.muted} wrapMode="char" selectable={true}>{props.path}</text>
+    </box>
+  )
 }
 
 function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: ModifiedFile) => void }) {

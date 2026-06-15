@@ -66,7 +66,11 @@ impl CodexProvider {
             "store": false
         });
         if let Some(effort) = req.metadata.get("model_effort").and_then(Value::as_str) {
-            body["reasoning_effort"] = json!(if effort == "minimal" { "none" } else { effort });
+            // The Responses API nests effort under `reasoning`; a top-level
+            // `reasoning_effort` is rejected as an unsupported parameter.
+            body["reasoning"] = json!({
+                "effort": if effort == "minimal" { "none" } else { effort }
+            });
         }
         body
     }
@@ -552,7 +556,7 @@ mod tests {
         request.metadata = json!({ "model_effort": "xhigh" });
         let body = provider.request_body(&request);
 
-        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[test]
