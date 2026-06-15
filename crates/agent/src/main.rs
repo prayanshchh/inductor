@@ -547,6 +547,12 @@ enum WorktreeCommand {
         #[arg(long)]
         app_db: Option<PathBuf>,
 
+        /// Only list worktrees created from this repo. The path is resolved to
+        /// its git toplevel, so a subdirectory of the repo works too. Omit to
+        /// list every managed worktree across all repos.
+        #[arg(long)]
+        source_repo: Option<PathBuf>,
+
         #[arg(long)]
         json: bool,
     },
@@ -1995,10 +2001,22 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
         }
         WorktreeCommand::Registry {
             app_db,
+            source_repo,
             json: json_output,
         } => {
             let registry = open_worktree_registry(app_db)?;
-            let worktrees = registry.list_worktrees().map_err(|err| err.to_string())?;
+            let mut worktrees = registry.list_worktrees().map_err(|err| err.to_string())?;
+            // Scope the listing to the repo Inductor was opened in: resolve the
+            // git toplevel of `source_repo` (worktree records store the
+            // canonical toplevel) and keep only worktrees created from it. If
+            // the path isn't a git repo, keep the unfiltered list rather than
+            // hiding everything.
+            if let Some(source_repo) = source_repo {
+                let manager = WorktreeManager::new(default_managed_root()?);
+                if let Ok(repo) = manager.inspect_repo(&source_repo) {
+                    worktrees.retain(|worktree| worktree.source_repo == repo.root);
+                }
+            }
             if json_output {
                 let rows = worktrees
                     .iter()

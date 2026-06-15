@@ -213,9 +213,12 @@ export async function showWorkspaceSession(options: Pick<BackendOptions, "backen
   return output as StoredSessionDetail
 }
 
-export async function listWorktrees(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">): Promise<Worktree[]> {
+export async function listWorktrees(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb" | "workspace">): Promise<Worktree[]> {
   const args = ["worktree", "registry", "--json"]
   if (options.appDb) args.push("--app-db", options.appDb)
+  // Scope to the repo Inductor was opened in so the sidebar only shows this
+  // directory's worktrees (none if it has none).
+  if (options.workspace) args.push("--source-repo", options.workspace)
   const output = await runBackendJson(options, args)
   return Array.isArray(output) ? (output as Worktree[]) : []
 }
