@@ -302,7 +302,7 @@ fn model_display(provider: &str, model: &str) -> String {
 }
 
 /// Approval policies offered by `/permissions` (passed to `--approval`).
-const PERMISSION_MODES: [&str; 5] = ["mutating", "on-request", "never", "on-failure", "always"];
+const PERMISSION_MODES: [&str; 5] = ["never", "mutating", "on-request", "on-failure", "always"];
 
 /// Whether a provider reports a limit as "% used" or "% left". We display it
 /// the way the provider gives it, with no conversion. Future providers can pick
@@ -713,7 +713,7 @@ impl App {
             effort: Effort::Medium,
             fast: false,
             saved_effort: Effort::Medium,
-            approval: "mutating".to_string(),
+            approval: "never".to_string(),
             session_id: None,
             show_usage: false,
             provider_usage: None,

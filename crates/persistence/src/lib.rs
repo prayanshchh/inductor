@@ -231,18 +231,15 @@ pub struct SessionRecord {
 }
 
 /// Lifecycle state of a managed worktree, tracked so a multi-agent view can
-/// tell which parallel sessions are still in progress, ready to merge, or
-/// already merged back.
+/// tell which parallel sessions are active or archived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeStatus {
     /// Worktree exists and an agent may still be working in it.
     Active,
-    /// Worktree branch has been merged back into its base branch. The working
-    /// directory is removed after a successful merge; the record (and the
-    /// session's chats) are kept.
+    /// Legacy status retained for older databases that recorded local merges.
     Merged,
-    /// Worktree was discarded without merging.
+    /// Worktree was discarded.
     Abandoned,
     /// Worktree was archived by the user: the working directory is removed but
     /// the session's chats/messages are preserved.

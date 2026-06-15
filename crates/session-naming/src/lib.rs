@@ -231,7 +231,10 @@ mod tests {
 
     #[test]
     fn limit_words_caps_at_three_words() {
-        assert_eq!(limit_words("Fix login refresh bug now", 3), "Fix login refresh");
+        assert_eq!(
+            limit_words("Fix login refresh bug now", 3),
+            "Fix login refresh"
+        );
         assert_eq!(limit_words("Parser bug", 3), "Parser bug");
         assert_eq!(limit_words("Add  retry,", 3), "Add retry");
         assert_eq!(limit_words("", 3), "");

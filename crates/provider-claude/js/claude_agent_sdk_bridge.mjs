@@ -108,7 +108,8 @@ function handleStreamEvent(event) {
 }
 
 // Read-only built-in tools auto-run without prompting the user (like Claude
-// Code's defaults). Everything else (Write/Edit/Bash/…) goes through the host.
+// Code's defaults). Everything else (Write/Edit/Bash/...) goes through the host
+// unless the host selected yolo mode.
 const READ_ONLY_TOOLS = new Set([
   "Read", "Glob", "Grep", "NotebookRead", "TodoWrite", "WebFetch", "WebSearch",
 ]);
@@ -127,8 +128,12 @@ function hostToolResultTimeoutMs() {
 // Permission handler: the model uses the SDK's native tools; we approve reads
 // automatically and route mutating tools to the host (Inductor TUI) for a
 // grant/deny/allow-for-session decision.
-async function requestPermission(toolName, toolInput, opts) {
+async function requestPermission(toolName, toolInput, opts, approvalPolicy = "on_request") {
   if (toolName === "Skill" || toolName.startsWith("mcp__inductor__")) {
+    return { behavior: "allow", updatedInput: toolInput };
+  }
+
+  if (approvalPolicy === "never") {
     return { behavior: "allow", updatedInput: toolInput };
   }
 
@@ -427,6 +432,8 @@ async function run(request) {
 
   const toolDefinitions = Array.isArray(request.tool_definitions) ? request.tool_definitions : [];
   const inductorMcp = createInductorMcpServer(toolDefinitions);
+  const approvalPolicy =
+    typeof request.approval_policy === "string" ? request.approval_policy : "never";
 
   // Claude still gets the Claude Code agent prompt, but local workspace tools
   // are Inductor MCP tools. Rust owns execution, permission gating, patches,
@@ -439,12 +446,14 @@ async function run(request) {
       append: typeof request.system_prompt === "string" ? request.system_prompt : undefined,
     },
     includePartialMessages: true,
-    permissionMode: "default",
+    permissionMode: approvalPolicy === "never" ? "bypassPermissions" : "default",
+    allowDangerouslySkipPermissions: approvalPolicy === "never",
     tools: [],
     mcpServers: { inductor: inductorMcp },
     toolAliases: toolAliases(toolDefinitions),
     settingSources: [],
-    canUseTool: requestPermission,
+    canUseTool: (toolName, toolInput, opts) =>
+      requestPermission(toolName, toolInput, opts, approvalPolicy),
     abortController,
   };
 

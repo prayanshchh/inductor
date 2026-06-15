@@ -46,6 +46,7 @@ export type BackendOptions = {
   approval: string
   repoRoot: string
   appDb?: string
+  workspaceOnly?: boolean
   /** Development mode: edit in place, or run inside an isolated git worktree. */
   mode?: DevMode
   /** Override the path the run reads/writes session state from (state.db). */
@@ -68,11 +69,6 @@ export type Worktree = {
   model?: string | null
   updated_at: string
 }
-
-export type MergeResult =
-  | { result: "up_to_date"; target: string }
-  | { result: "merged"; commit: string; fast_forward: boolean; target: string }
-  | { result: "conflict"; target: string; source_repo: string; files: string[] }
 
 export type BackendCallbacks = {
   onEvent(event: SessionEvent): void
@@ -152,6 +148,9 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
   if (options.stateDb) {
     cmd.push("--state-db", options.stateDb)
   }
+  if (options.workspaceOnly) {
+    cmd.push("--workspace-only")
+  }
 
   const proc = Bun.spawn(cmd, {
     cwd: options.repoRoot,
@@ -216,15 +215,6 @@ export async function listWorktrees(options: Pick<BackendOptions, "backendBin" |
   return Array.isArray(output) ? (output as Worktree[]) : []
 }
 
-export async function mergeWorktree(
-  options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">,
-  workspaceId: string,
-): Promise<MergeResult> {
-  const args = ["worktree", "merge", "--workspace-id", workspaceId, "--json"]
-  if (options.appDb) args.push("--app-db", options.appDb)
-  return (await runBackendJson(options, args)) as MergeResult
-}
-
 export async function archiveWorktree(
   options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">,
   workspaceId: string,
@@ -232,33 +222,6 @@ export async function archiveWorktree(
   const args = ["worktree", "archive", "--workspace-id", workspaceId, "--json"]
   if (options.appDb) args.push("--app-db", options.appDb)
   await runBackendJson(options, args)
-}
-
-export async function abortWorktreeMerge(
-  options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">,
-  workspaceId: string,
-): Promise<void> {
-  const args = ["worktree", "abort-merge", "--workspace-id", workspaceId]
-  if (options.appDb) args.push("--app-db", options.appDb)
-  // abort-merge prints a human line, not JSON; just run it.
-  await runBackendText(options, args)
-}
-
-async function runBackendText(options: Pick<BackendOptions, "backendBin" | "repoRoot">, args: string[]): Promise<string> {
-  const proc = Bun.spawn([options.backendBin, ...args], {
-    cwd: options.repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (code !== 0) {
-    throw new Error(stderr.trim() || `backend exited ${code}`)
-  }
-  return stdout
 }
 
 async function runBackendJson(options: Pick<BackendOptions, "backendBin" | "repoRoot">, args: string[]): Promise<unknown> {

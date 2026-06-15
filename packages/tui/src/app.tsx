@@ -16,7 +16,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listWorktrees, mergeWorktree, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
+import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
 import {
@@ -49,6 +49,8 @@ type AgentSlot = {
   model: string
   effort: EffortValue
   devMode: DevMode
+  approval: string
+  workspaceOnly: boolean
   role: string
   stateDb?: string
   state: AppState
@@ -56,13 +58,14 @@ type AgentSlot = {
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
-type PaletteKind = "commands" | "models" | "agents" | "modes" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "review" | "sessions"
+type PaletteKind = "commands" | "models" | "agents" | "modes" | "permissions" | "files" | undefined
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "review" | "sessions"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
 type EffortChoice = { name: string; label: string; description: string; value: EffortValue }
 type AgentChoice = { name: string; description: string }
-type PaletteItem = Command | ModelChoice | EffortChoice | AgentChoice | FileChoice
+type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
+type PaletteItem = Command | ModelChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
 type StopIntent = "interrupt" | "exit"
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
@@ -116,6 +119,7 @@ const commands: Command[] = [
   { name: "/help", description: "Show shortcuts", action: "help" },
   { name: "/model", description: "Switch model", action: "model" },
   { name: "/new", description: "New session", action: "new" },
+  { name: "/permissions", description: "Switch agent permissions", action: "permissions" },
   { name: "/review", description: "Review changes", action: "review" },
   { name: "/sessions", description: "Open sessions", action: "sessions" },
   { name: "/clear", description: "Clear transcript", action: "clear" },
@@ -136,6 +140,14 @@ const agentChoices: AgentChoice[] = [
   { name: "Build", description: "Implement and verify changes" },
   { name: "Review", description: "Inspect code and risks first" },
   { name: "Plan", description: "Outline before editing" },
+]
+
+const permissionChoices: PermissionChoice[] = [
+  { name: "yolo", label: "Yolo", description: "Run reads, edits, and bash without prompts", approval: "never", workspaceOnly: false },
+  { name: "workspace", label: "Workspace Only", description: "No prompts, but file/bash access stays in workspace", approval: "never", workspaceOnly: true },
+  { name: "mutating", label: "Ask Mutating", description: "Ask before file edits, writes, patches, and bash", approval: "mutating", workspaceOnly: false },
+  { name: "risky", label: "Ask Risky", description: "Ask only for risk-flagged actions", approval: "on-request", workspaceOnly: false },
+  { name: "always", label: "Ask Every Tool", description: "Ask before every tool call", approval: "always", workspaceOnly: false },
 ]
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
@@ -195,6 +207,8 @@ export function App(props: AppProps) {
       model: init.model ?? props.model ?? defaultModel(props.provider),
       effort: init.effort ?? "medium",
       devMode: init.devMode ?? "worktree",
+      approval: init.approval ?? props.approval,
+      workspaceOnly: init.workspaceOnly ?? Boolean(props.workspaceOnly),
       role: init.role ?? "Build",
       stateDb: init.stateDb,
       state: init.state ?? createInitialState(),
@@ -210,7 +224,6 @@ export function App(props: AppProps) {
 
   const focusedAgent = createMemo(() => store.agents.find((a) => a.key === store.focusedKey) ?? store.agents[0])
   const fstate = createMemo(() => focusedAgent().state)
-  const runningCount = createMemo(() => store.agents.filter((a) => a.state.running).length)
   function agentIndex(key: string) {
     return store.agents.findIndex((a) => a.key === key)
   }
@@ -246,6 +259,10 @@ export function App(props: AppProps) {
   const setMode = (value: EffortValue) => patchFocused({ effort: value })
   const devMode = () => focusedAgent().devMode
   const setDevMode = (value: DevMode) => patchFocused({ devMode: value })
+  const approval = () => focusedAgent().approval
+  const setApproval = (value: string) => patchFocused({ approval: value })
+  const workspaceOnly = () => focusedAgent().workspaceOnly
+  const setWorkspaceOnly = (value: boolean) => patchFocused({ workspaceOnly: value })
   const agent = () => focusedAgent().role
   const setAgent = (value: string) => patchFocused({ role: value })
   const sessionId = () => focusedAgent().sessionId
@@ -285,6 +302,7 @@ export function App(props: AppProps) {
     if (palette() === "models") return modelChoices
     if (palette() === "agents") return agentChoices
     if (palette() === "modes") return effortChoices(selectedModelChoice(provider(), model()))
+    if (palette() === "permissions") return permissionChoices
     return commandItems()
   })
 
@@ -351,6 +369,8 @@ export function App(props: AppProps) {
       ...props,
       provider: provider(),
       model: model(),
+      approval: approval(),
+      workspaceOnly: workspaceOnly(),
       sessionId: sessionId(),
       effort: backendEffort(mode()),
       mode: devMode(),
@@ -490,6 +510,14 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "permissions") {
+      const choice = item as PermissionChoice
+      setApproval(choice.approval)
+      setWorkspaceOnly(choice.workspaceOnly)
+      setNotice({ text: `permissions set to ${choice.label.toLowerCase()}`, tone: "muted" })
+      closePalette()
+      return
+    }
     runCommand(item as Command)
   }
 
@@ -518,6 +546,14 @@ export function App(props: AppProps) {
     if (palette() === "modes") {
       const choice = item as EffortChoice
       setMode(choice.value)
+      closePalette()
+      return
+    }
+    if (palette() === "permissions") {
+      const choice = item as PermissionChoice
+      setApproval(choice.approval)
+      setWorkspaceOnly(choice.workspaceOnly)
+      setNotice({ text: `permissions set to ${choice.label.toLowerCase()}`, tone: "muted" })
       closePalette()
       return
     }
@@ -661,6 +697,10 @@ export function App(props: AppProps) {
       openPalette("modes")
       return
     }
+    if (command.action === "permissions") {
+      openPalette("permissions")
+      return
+    }
     if (command.action === "review") {
       input.setText("review current changes")
       setDraft("review current changes")
@@ -684,7 +724,7 @@ export function App(props: AppProps) {
       queueMicrotask(() => input?.focus())
       return
     }
-    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, role: base.role })
+    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
     setStore("agents", (agents) => [...agents, slot])
     setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
@@ -700,30 +740,6 @@ export function App(props: AppProps) {
     const next = devMode() === "worktree" ? "in-place" : "worktree"
     setDevMode(next)
     setNotice({ text: next === "worktree" ? "new sessions run in an isolated worktree" : "new sessions edit the workspace in place", tone: "muted" })
-  }
-
-  async function mergeWorktreeAction(worktree: Worktree) {
-    if (agentForWorktree(worktree)?.state.running) {
-      setNotice({ text: "Stop this worktree's agent before merging", tone: "cyan" })
-      return
-    }
-    setWorktreeBusy(worktree.workspace_id)
-    setNotice({ text: `merging ${worktree.branch_name}...`, tone: "cyan" })
-    try {
-      const result = await mergeWorktree(props, worktree.workspace_id)
-      if (result.result === "conflict") {
-        setNotice({ text: `merge conflict in ${result.files.length} file(s) — resolve in ${shortWorkspace(result.source_repo)}`, tone: "red" })
-      } else if (result.result === "up_to_date") {
-        setNotice({ text: `already merged into ${result.target}`, tone: "muted" })
-      } else {
-        setNotice({ text: `merged into ${result.target}${result.fast_forward ? " (fast-forward)" : ""}`, tone: "cyan" })
-      }
-      await refreshWorktrees()
-    } catch (error) {
-      setNotice({ text: error instanceof Error ? error.message : "merge failed", tone: "red" })
-    } finally {
-      setWorktreeBusy(undefined)
-    }
   }
 
   async function archiveWorktreeAction(worktree: Worktree) {
@@ -927,7 +943,6 @@ export function App(props: AppProps) {
           title={fstate().title}
           workspace={props.workspace}
           running={fstate().running}
-          runningCount={runningCount()}
           elapsed={formatElapsed(now() - startedAt)}
           devMode={devMode()}
           branch={activeBranch()}
@@ -946,7 +961,6 @@ export function App(props: AppProps) {
             newSession={startNewSession}
             focusAgent={focusAgent}
             loadWorktree={loadWorktree}
-            mergeWorktree={mergeWorktreeAction}
             archiveWorktree={archiveWorktreeAction}
           />
           <box
@@ -1027,7 +1041,6 @@ function TopRail(props: {
   title: string
   workspace: string
   running: boolean
-  runningCount: number
   elapsed: string
   devMode: DevMode
   branch: string
@@ -1045,12 +1058,11 @@ function TopRail(props: {
       borderColor={theme.border}
     >
       <TopBrand />
-      <TopMetric width={20} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
-      <TopMetric width={30} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 18)} color={theme.blue} onClick={() => props.openPalette("models")} />
-      <TopMetric width={24} label="session" value={truncateRight(props.title, 14)} color={theme.cyan} />
-      <TopMetric width={18} label="dev" value={props.devMode === "worktree" ? "worktree" : "in-place"} color={props.devMode === "worktree" ? theme.green : theme.yellow} onClick={props.toggleDevMode} />
-      <TopMetric width={22} label="branch" value={truncateRight(props.branch, 16)} color={theme.cyan} />
-      <TopMetric width={16} label="running" value={`${props.runningCount} agent${props.runningCount === 1 ? "" : "s"}`} color={props.runningCount > 0 ? theme.green : theme.dim} />
+      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
+      <TopMetric width={34} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 20)} color={theme.blue} onClick={() => props.openPalette("models")} />
+      <TopMetric width={32} label="session" value={truncateRight(props.title, 18)} color={theme.cyan} />
+      <TopMetric width={22} label="dev" value={props.devMode === "worktree" ? "worktree" : "in-place"} color={props.devMode === "worktree" ? theme.green : theme.yellow} onClick={props.toggleDevMode} />
+      <TopMetric width={28} label="branch" value={truncateRight(props.branch, 18)} color={theme.cyan} />
       <box flexGrow={1} height="100%" />
       <box width={18} height="100%" flexDirection="row" alignItems="center" justifyContent="center">
         <text fg={props.running ? theme.green : theme.text} attributes={TextAttributes.BOLD}>◴ {clockElapsed(props.elapsed)}</text>
@@ -1090,8 +1102,8 @@ function TopMetric(props: { width: number; label: string; value: string; color: 
       borderColor={theme.border}
       onMouseUp={props.onClick}
     >
-      <text fg={theme.dim}>{props.label}</text>
-      <text fg={props.color} attributes={TextAttributes.BOLD}>{props.value}</text>
+      <text fg={theme.dim} wrapMode="none">{props.label}</text>
+      <text fg={props.color} attributes={TextAttributes.BOLD} wrapMode="none">{props.value}</text>
     </box>
   )
 }
@@ -1107,14 +1119,17 @@ function SessionSidebar(props: {
   newSession: () => void
   focusAgent: (key: string) => void
   loadWorktree: (worktree: Worktree) => void
-  mergeWorktree: (worktree: Worktree) => void
   archiveWorktree: (worktree: Worktree) => void
 }) {
-  // Worktrees not currently open as a live agent are listed below so they can
-  // be reopened / merged / archived; open ones render as live agent rows.
-  const openSessionIds = () => new Set(props.agents.map((a) => a.sessionId).filter(Boolean) as string[])
-  const otherWorktrees = () => props.worktrees.filter((w) => !w.session_id || !openSessionIds().has(w.session_id))
-  const worktreeForAgent = (a: AgentSlot) => props.worktrees.find((w) => w.session_id && w.session_id === a.sessionId)
+  const agentForWorktree = (worktree: Worktree) =>
+    props.agents.find((a) => (a.sessionId && a.sessionId === worktree.session_id) || (a.workspaceId && a.workspaceId === worktree.workspace_id))
+  const draftAgents = () => props.agents.filter((agent) =>
+    !props.worktrees.some((worktree) =>
+      (agent.sessionId && agent.sessionId === worktree.session_id) ||
+      (agent.workspaceId && agent.workspaceId === worktree.workspace_id)
+    )
+  )
+  const sessionCount = () => props.worktrees.length + draftAgents().length
   return (
     <box
       width={SESSION_SIDEBAR_WIDTH}
@@ -1140,51 +1155,44 @@ function SessionSidebar(props: {
         onMouseUp={props.newSession}
       >
         <text fg={theme.cyan} attributes={TextAttributes.BOLD}>+</text>
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>New {props.devMode === "worktree" ? "worktree agent" : "session"}</text>
+        <text fg={theme.text} attributes={TextAttributes.BOLD}>New {props.devMode === "worktree" ? "worktree" : "session"}</text>
       </box>
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginTop={1} marginBottom={1}>
-        <text fg={theme.cyan}>AGENTS</text>
+        <text fg={theme.cyan}>WORKTREES</text>
         <box flexGrow={1} />
-        <text fg={theme.dim}>{props.agents.length}</text>
+        <text fg={theme.dim}>{sessionCount()}</text>
       </box>
       <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, SESSION_SIDEBAR_TEXT_WIDTH)}</text>}>
         <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
           <box flexDirection="column" gap={1}>
-            <For each={props.agents}>
-              {(slot) => {
-                const wt = () => worktreeForAgent(slot)
+            <For each={draftAgents()}>
+              {(slot) => (
+                <DraftSessionRow
+                  slot={slot}
+                  focused={props.focusedKey === slot.key}
+                  focus={() => props.focusAgent(slot.key)}
+                />
+              )}
+            </For>
+            <For each={props.worktrees}>
+              {(worktree) => {
+                const agent = () => agentForWorktree(worktree)
                 return (
-                  <AgentRow
-                    slot={slot}
-                    worktree={wt()}
-                    focused={props.focusedKey === slot.key}
-                    busy={Boolean(wt() && props.busyId === wt()!.workspace_id)}
-                    focus={() => props.focusAgent(slot.key)}
-                    merge={() => { const w = wt(); if (w) props.mergeWorktree(w) }}
-                    archive={() => { const w = wt(); if (w) props.archiveWorktree(w) }}
+                  <WorktreeRow
+                    worktree={worktree}
+                    agent={agent()}
+                    active={props.currentSessionId === worktree.session_id || agent()?.key === props.focusedKey}
+                    busy={props.busyId === worktree.workspace_id}
+                    load={() => {
+                      const open = agent()
+                      if (open) props.focusAgent(open.key)
+                      else props.loadWorktree(worktree)
+                    }}
+                    archive={() => props.archiveWorktree(worktree)}
                   />
                 )
               }}
             </For>
-            <Show when={otherWorktrees().length > 0}>
-              <box flexDirection="row" gap={1} paddingLeft={1} marginTop={1}>
-                <text fg={theme.dim}>WORKTREES</text>
-                <box flexGrow={1} />
-                <text fg={theme.dim}>{otherWorktrees().length}</text>
-              </box>
-              <For each={otherWorktrees()}>
-                {(worktree) => (
-                  <WorktreeRow
-                    worktree={worktree}
-                    active={props.currentSessionId === worktree.session_id}
-                    busy={props.busyId === worktree.workspace_id}
-                    load={() => props.loadWorktree(worktree)}
-                    merge={() => props.mergeWorktree(worktree)}
-                    archive={() => props.archiveWorktree(worktree)}
-                  />
-                )}
-              </For>
-            </Show>
           </box>
         </scrollbox>
       </Show>
@@ -1192,25 +1200,13 @@ function SessionSidebar(props: {
   )
 }
 
-function AgentRow(props: {
+function DraftSessionRow(props: {
   slot: AgentSlot
-  worktree?: Worktree
   focused: boolean
-  busy: boolean
   focus: () => void
-  merge: () => void
-  archive: () => void
 }) {
   const s = () => props.slot.state
-  const statusText = () => props.busy ? "working…" : s().running ? "running" : s().pendingPermission ? "needs approval" : (s().status || "idle")
   const statusColor = () => s().pendingPermission ? theme.orange : s().running ? theme.green : theme.dim
-  const title = () => {
-    const t = s().title
-    if (t && t !== "New session") return t
-    if (props.slot.branch !== "HEAD") return props.slot.branch.replace(/^inductor\//, "")
-    return "New session"
-  }
-  const canManage = () => Boolean(props.worktree && props.worktree.exists && props.worktree.status === "active" && !s().running)
   return (
     <box
       width="100%"
@@ -1224,36 +1220,44 @@ function AgentRow(props: {
       <box flexDirection="row" gap={1} onMouseUp={props.focus}>
         <text fg={s().running ? theme.green : theme.dim} selectable={false}>{s().running ? "●" : s().pendingPermission ? "?" : "○"}</text>
         <text fg={props.focused ? theme.text : theme.muted} attributes={props.focused ? TextAttributes.BOLD : undefined} wrapMode="none">
-          {truncateRight(title(), SESSION_SIDEBAR_TEXT_WIDTH - 6)}
+          {truncateRight(s().title || "New session", SESSION_SIDEBAR_TEXT_WIDTH - 6)}
         </text>
       </box>
       <box flexDirection="row" gap={1} onMouseUp={props.focus}>
         <text fg={theme.dim}>{providerLabel(props.slot.provider)} {truncateRight(shortModel(props.slot.model), 8)}</text>
         <box flexGrow={1} />
-        <text fg={statusColor()}>{statusText()}</text>
+        <text fg={statusColor()}>{s().running ? "running" : s().pendingPermission ? "needs approval" : (s().status || "idle")}</text>
       </box>
-      <Show when={canManage()}>
-        <box flexDirection="row" gap={1}>
-          <box flexGrow={1} />
-          <text fg={theme.green} selectable={false} onMouseUp={props.merge}>merge</text>
-          <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
-        </box>
-      </Show>
     </box>
   )
 }
 
 function WorktreeRow(props: {
   worktree: Worktree
+  agent?: AgentSlot
   active: boolean
   busy: boolean
   load: () => void
-  merge: () => void
   archive: () => void
 }) {
   const wt = props.worktree
   const title = wt.display_name || wt.branch_name.replace(/^inductor\//, "") || "session"
-  const statusColor = wt.status === "active" ? (wt.session_status === "running" ? theme.green : theme.cyan) : wt.status === "merged" ? theme.purple : theme.dim
+  const live = () => props.agent?.state
+  const isRunning = () => Boolean(live()?.running)
+  const needsApproval = () => Boolean(live()?.pendingPermission)
+  const rowStatus = () => {
+    if (props.busy) return "working..."
+    if (isRunning()) return "running"
+    if (needsApproval()) return "needs approval"
+    return wt.status
+  }
+  const statusColor = () => {
+    if (needsApproval()) return theme.orange
+    if (isRunning()) return theme.green
+    if (wt.status === "active") return theme.cyan
+    if (wt.status === "merged") return theme.purple
+    return theme.dim
+  }
   return (
     <box
       width="100%"
@@ -1262,18 +1266,18 @@ function WorktreeRow(props: {
       paddingRight={1}
       backgroundColor={props.active ? theme.paletteSelected : theme.panelSoft}
       border={["left"]}
-      borderColor={props.active ? theme.cyan : theme.borderSoft}
+      borderColor={props.active ? theme.cyan : isRunning() ? theme.green : theme.borderSoft}
     >
       <box flexDirection="row" gap={1} onMouseUp={props.load}>
+        <text fg={isRunning() ? theme.green : needsApproval() ? theme.orange : theme.dim} selectable={false}>{isRunning() ? "●" : needsApproval() ? "?" : "○"}</text>
         <text fg={props.active ? theme.text : theme.muted} attributes={props.active ? TextAttributes.BOLD : undefined} wrapMode="none">
-          {truncateRight(title, SESSION_SIDEBAR_TEXT_WIDTH - 4)}
+          {truncateRight(title, SESSION_SIDEBAR_TEXT_WIDTH - 6)}
         </text>
       </box>
       <box flexDirection="row" gap={1}>
-        <text fg={statusColor}>{props.busy ? "working…" : wt.status}</text>
+        <text fg={statusColor()}>{rowStatus()}</text>
         <box flexGrow={1} />
-        <Show when={wt.status === "active" && wt.exists}>
-          <text fg={theme.green} selectable={false} onMouseUp={props.merge}>merge</text>
+        <Show when={wt.status === "active" && wt.exists && !isRunning()}>
           <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
         </Show>
       </box>
