@@ -505,6 +505,19 @@ ON CONFLICT(id) DO UPDATE SET
         Ok(())
     }
 
+    /// Update only the lifecycle status of an existing session. Used to reflect
+    /// live status transitions (streaming, running tools, …) in the dashboard
+    /// without rewriting the whole record, so a session is never stranded at
+    /// `starting` while it is actually working.
+    pub fn set_session_status(&self, id: SessionId, status: SessionStatus) -> Result<()> {
+        let now = now_rfc3339()?;
+        self.conn.execute(
+            "UPDATE sessions SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.to_string(), session_status_to_str(status), now],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, session_id: SessionId) -> Result<Option<SessionRecord>> {
         let row = self
             .conn
@@ -807,6 +820,18 @@ WHERE id = ?1
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Update only the lifecycle status of an existing session. Mirrors
+    /// [`AppDb::set_session_status`] so live status transitions are recorded in
+    /// the workspace transcript database as well.
+    pub fn set_session_status(&self, id: SessionId, status: SessionStatus) -> Result<()> {
+        let now = now_rfc3339()?;
+        self.conn.execute(
+            "UPDATE sessions SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.to_string(), session_status_to_str(status), now],
+        )?;
+        Ok(())
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
@@ -1266,6 +1291,36 @@ mod tests {
         let sessions = db.list_sessions(workspace_id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_id);
+    }
+
+    #[test]
+    fn set_session_status_updates_only_the_status_column() {
+        let db = AppDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        db.upsert_workspace(workspace_id, "/tmp/project", "project")
+            .unwrap();
+        let record = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("claude".to_string()),
+            "sonnet",
+        )
+        .unwrap();
+        db.upsert_session(&record).unwrap();
+        assert_eq!(
+            db.get_session(session_id).unwrap().unwrap().status,
+            SessionStatus::Starting
+        );
+
+        // A live transition mid-run must move the persisted status off `Starting`
+        // so the dashboard never shows a working session as hung.
+        db.set_session_status(session_id, SessionStatus::RunningTools)
+            .unwrap();
+        let loaded = db.get_session(session_id).unwrap().unwrap();
+        assert_eq!(loaded.status, SessionStatus::RunningTools);
+        assert_eq!(loaded.model, "sonnet");
+        assert_eq!(loaded.display_name, record.display_name);
     }
 
     #[test]

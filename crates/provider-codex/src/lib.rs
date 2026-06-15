@@ -96,7 +96,11 @@ fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
 
 fn codex_message(message: &ModelMessage) -> Value {
     let (role, parts) = codex_message_role_and_parts(message);
-    let content = parts.iter().map(codex_part).collect::<Vec<_>>();
+    let is_assistant = role == "assistant";
+    let content = parts
+        .iter()
+        .map(|part| codex_part(part, is_assistant))
+        .collect::<Vec<_>>();
     json!({
         "role": role,
         "content": content,
@@ -134,10 +138,10 @@ fn prefix_text_parts(label: &str, parts: &[MessagePart]) -> Vec<MessagePart> {
     prefixed
 }
 
-fn codex_part(part: &MessagePart) -> Value {
+fn codex_part(part: &MessagePart, is_assistant: bool) -> Value {
     match part {
         MessagePart::Text { text } => json!({
-            "type": "input_text",
+            "type": if is_assistant { "output_text" } else { "input_text" },
             "text": text,
         }),
         MessagePart::Image { image } => json!({
