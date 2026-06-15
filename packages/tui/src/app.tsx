@@ -16,7 +16,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { listWorkspaceSessions, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type PermissionDecision, type StoredSession } from "./backend"
+import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -42,13 +42,34 @@ export type AppProps = BackendOptions & {
 }
 
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
-type PaletteKind = "commands" | "models" | "agents" | "modes" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "review" | "sessions"
+
+/** One concurrent agent: its session, worktree, provider/model and transcript. */
+type AgentSlot = {
+  key: string
+  sessionId?: string
+  workspaceId?: string
+  branch: string
+  provider: string
+  model: string
+  effort: EffortValue
+  devMode: DevMode
+  approval: string
+  workspaceOnly: boolean
+  role: string
+  stateDb?: string
+  state: AppState
+}
+
+/** Ephemeral per-run bookkeeping for a slot's live subprocess. */
+type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
+type PaletteKind = "commands" | "models" | "agents" | "modes" | "permissions" | "files" | undefined
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "review" | "sessions"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
 type EffortChoice = { name: string; label: string; description: string; value: EffortValue }
 type AgentChoice = { name: string; description: string }
-type PaletteItem = Command | ModelChoice | EffortChoice | AgentChoice | FileChoice
+type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
+type PaletteItem = Command | ModelChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
 type StopIntent = "interrupt" | "exit"
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
@@ -104,6 +125,7 @@ const commands: Command[] = [
   { name: "/help", description: "Show shortcuts", action: "help" },
   { name: "/model", description: "Switch model", action: "model" },
   { name: "/new", description: "New session", action: "new" },
+  { name: "/permissions", description: "Switch agent permissions", action: "permissions" },
   { name: "/review", description: "Review changes", action: "review" },
   { name: "/sessions", description: "Open sessions", action: "sessions" },
   { name: "/clear", description: "Clear transcript", action: "clear" },
@@ -124,6 +146,14 @@ const agentChoices: AgentChoice[] = [
   { name: "Build", description: "Implement and verify changes" },
   { name: "Review", description: "Inspect code and risks first" },
   { name: "Plan", description: "Outline before editing" },
+]
+
+const permissionChoices: PermissionChoice[] = [
+  { name: "yolo", label: "Yolo", description: "Run reads, edits, and bash without prompts", approval: "never", workspaceOnly: false },
+  { name: "workspace", label: "Workspace Only", description: "No prompts, but file/bash access stays in workspace", approval: "never", workspaceOnly: true },
+  { name: "mutating", label: "Ask Mutating", description: "Ask before file edits, writes, patches, and bash", approval: "mutating", workspaceOnly: false },
+  { name: "risky", label: "Ask Risky", description: "Ask only for risk-flagged actions", approval: "on-request", workspaceOnly: false },
+  { name: "always", label: "Ask Every Tool", description: "Ask before every tool call", approval: "always", workspaceOnly: false },
 ]
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
@@ -163,15 +193,88 @@ function savePromptHistoryFile(filePath: string, entries: string[]) {
 
 export function App(props: AppProps) {
   let input!: TextareaRenderable
-  let currentRun: BackendRun | undefined
   let replacingPrompt = false
-  let stoppingRun = false
-  let exitAfterStop = false
   let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
-  let forceStopTimer: ReturnType<typeof setTimeout> | undefined
   const startedAt = Date.now()
-  const [state, setState] = createStore(createInitialState())
+
+  // Each concurrent agent is a slot: its own session id, worktree, provider/
+  // model, and AppState transcript. `runs`/`runFlags` hold the live subprocess
+  // handles (non-reactive) keyed by slot. N agents run at once because each
+  // backend turn's event callbacks are closed over its slot key.
+  let agentSeq = 0
+  function makeAgentSlot(init: Partial<AgentSlot> = {}): AgentSlot {
+    agentSeq += 1
+    return {
+      key: `agent-${agentSeq}`,
+      sessionId: init.sessionId,
+      workspaceId: init.workspaceId,
+      branch: init.branch ?? "HEAD",
+      provider: init.provider ?? props.provider,
+      model: init.model ?? props.model ?? defaultModel(props.provider),
+      effort: init.effort ?? "medium",
+      devMode: init.devMode ?? "worktree",
+      approval: init.approval ?? props.approval,
+      workspaceOnly: init.workspaceOnly ?? Boolean(props.workspaceOnly),
+      role: init.role ?? "Build",
+      stateDb: init.stateDb,
+      state: init.state ?? createInitialState(),
+    }
+  }
+  const initialAgent = makeAgentSlot()
+  const [store, setStore] = createStore<{ agents: AgentSlot[]; focusedKey: string }>({
+    agents: [initialAgent],
+    focusedKey: initialAgent.key,
+  })
+  const runs = new Map<string, BackendRun>()
+  const runFlags = new Map<string, RunFlags>()
+
+  const focusedAgent = createMemo(() => store.agents.find((a) => a.key === store.focusedKey) ?? store.agents[0])
+  const fstate = createMemo(() => focusedAgent().state)
+  function agentIndex(key: string) {
+    return store.agents.findIndex((a) => a.key === key)
+  }
+  function patchAgent(key: string, patch: Partial<AgentSlot>) {
+    const idx = agentIndex(key)
+    if (idx < 0) return
+    setStore("agents", idx, patch)
+  }
+  function patchFocused(patch: Partial<AgentSlot>) {
+    patchAgent(store.focusedKey, patch)
+  }
+  function updateAgentState(key: string, fn: (s: AppState) => AppState) {
+    const idx = agentIndex(key)
+    if (idx < 0) return
+    setStore("agents", idx, "state", produce((s: AppState) => { Object.assign(s, fn(s)) }))
+  }
+  function runFlagsFor(key: string): RunFlags {
+    let flags = runFlags.get(key)
+    if (!flags) {
+      flags = { stopping: false, exitAfter: false }
+      runFlags.set(key, flags)
+    }
+    return flags
+  }
+
+  // Composer settings are views of the focused slot, so existing call sites
+  // (provider(), setModel(x), ...) keep working while each agent owns its own.
+  const provider = () => focusedAgent().provider
+  const setProvider = (value: string) => patchFocused({ provider: value })
+  const model = () => focusedAgent().model
+  const setModel = (value: string) => patchFocused({ model: value })
+  const mode = () => focusedAgent().effort
+  const setMode = (value: EffortValue) => patchFocused({ effort: value })
+  const devMode = () => focusedAgent().devMode
+  const setDevMode = (value: DevMode) => patchFocused({ devMode: value })
+  const approval = () => focusedAgent().approval
+  const setApproval = (value: string) => patchFocused({ approval: value })
+  const workspaceOnly = () => focusedAgent().workspaceOnly
+  const setWorkspaceOnly = (value: boolean) => patchFocused({ workspaceOnly: value })
+  const agent = () => focusedAgent().role
+  const setAgent = (value: string) => patchFocused({ role: value })
+  const sessionId = () => focusedAgent().sessionId
+  const activeBranch = () => focusedAgent().branch
+
   const [draft, setDraft] = createSignal("")
   const [stopArmed, setStopArmed] = createSignal<StopIntent>()
   const [notice, setNotice] = createSignal<ComposerNotice>()
@@ -183,18 +286,14 @@ export function App(props: AppProps) {
   const [mention, setMention] = createSignal<MentionState>()
   const [pasteCount, setPasteCount] = createSignal(0)
   const [promptImages, setPromptImages] = createSignal<PromptImageAttachment[]>([])
-  const [mode, setMode] = createSignal<EffortValue>("medium")
-  const [agent, setAgent] = createSignal("Build")
-  const [model, setModel] = createSignal(props.model ?? defaultModel(props.provider))
-  const [provider, setProvider] = createSignal(props.provider)
-  const [sessionId, setSessionId] = createSignal<string>()
-  const [sessions, setSessions] = createSignal<StoredSession[]>([])
+  const [worktrees, setWorktrees] = createSignal<Worktree[]>([])
+  const [worktreeBusy, setWorktreeBusy] = createSignal<string>()
   const [sessionListStatus, setSessionListStatus] = createSignal("")
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
   const [now, setNow] = createSignal(Date.now())
   const dimensions = useTerminalDimensions()
-  const contextPercent = createMemo(() => Math.min(99, Math.round((state.tokens / 200_000) * 100)))
-  const hasTranscript = createMemo(() => state.transcript.length > 0)
+  const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
+  const hasTranscript = createMemo(() => fstate().transcript.length > 0)
   const commandItems = createMemo(() => {
     const query = draft().trim()
     if (!query.startsWith("/")) return commands
@@ -210,26 +309,29 @@ export function App(props: AppProps) {
     if (palette() === "models") return modelChoices
     if (palette() === "agents") return agentChoices
     if (palette() === "modes") return effortChoices(selectedModelChoice(provider(), model()))
+    if (palette() === "permissions") return permissionChoices
     return commandItems()
   })
 
   const timer = setInterval(() => setNow(Date.now()), 1000)
-  const composerNotice = createMemo(() => notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission))
+  const composerNotice = createMemo(() => {
+    const state = fstate()
+    return notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission)
+  })
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
-    void refreshSessions()
+    void refreshWorktrees()
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
     clearInterval(timer)
     clearStopArmTimer()
-    clearForceStopTimer()
-    if (currentRun) {
-      const run = currentRun
-      currentRun = undefined
-      run.kill()
-      void run.exited.catch(() => undefined)
+    for (const flags of runFlags.values()) {
+      if (flags.forceTimer) clearTimeout(flags.forceTimer)
     }
+    for (const run of runs.values()) run.kill()
+    runs.clear()
+    runFlags.clear()
   })
 
   useKeyboard((event) => {
@@ -244,12 +346,12 @@ export function App(props: AppProps) {
     }
     if (event.eventType === "release") return
     if (event.repeated) return
-    if (state.pendingPermission && handlePermissionKey(event)) {
+    if (fstate().pendingPermission && handlePermissionKey(event)) {
       event.preventDefault()
       event.stopPropagation()
       return
     }
-    if (isEscape(event) && (state.running || currentRun)) {
+    if (isEscape(event) && (fstate().running || runs.has(store.focusedKey))) {
       event.preventDefault()
       event.stopPropagation()
       handleEsc()
@@ -261,10 +363,21 @@ export function App(props: AppProps) {
   function submit() {
     const visiblePrompt = input.plainText.trim()
     const prompt = promptForSubmit(visiblePrompt, promptImages()).trim()
-    if (!visiblePrompt || state.running) return
+    if (!visiblePrompt || fstate().running) return
     if (palette()) {
       acceptPalette()
       return
+    }
+
+    // Pin the turn to the currently focused slot so its events route here even
+    // after the user switches focus to another running agent.
+    const key = store.focusedKey
+    const flags = runFlagsFor(key)
+    flags.stopping = false
+    flags.exitAfter = false
+    if (flags.forceTimer) {
+      clearTimeout(flags.forceTimer)
+      flags.forceTimer = undefined
     }
 
     input.setText("")
@@ -272,54 +385,63 @@ export function App(props: AppProps) {
     recordHistory(visiblePrompt)
     setPromptImages([])
     setPalette(undefined)
-    stoppingRun = false
-    exitAfterStop = false
-    clearForceStopTimer()
     disarmStopWarning()
     setNotice(undefined)
-    setState(produce((next) => Object.assign(next, addUserMessage(next, visiblePrompt))))
-    currentRun = startBackendTurn(prompt, {
+    updateAgentState(key, (next) => addUserMessage(next, visiblePrompt))
+    const run = startBackendTurn(prompt, {
       ...props,
       provider: provider(),
       model: model(),
+      approval: approval(),
+      workspaceOnly: workspaceOnly(),
       sessionId: sessionId(),
       effort: backendEffort(mode()),
+      mode: devMode(),
+      appDb: props.appDb,
     }, {
       onEvent(event) {
-        if (event.session_id) setSessionId(event.session_id)
-        if (event.type === "permission_request") setPermissionSelected(0)
-        if (stoppingRun) {
+        if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) patchAgent(key, { sessionId: event.session_id })
+        if (event.type === "permission_request" && store.focusedKey === key) setPermissionSelected(0)
+        if (flags.stopping) {
           if (event.type === "result" || event.type === "error") {
-            setState(produce((next) => Object.assign(next, markAgentStopped(next))))
+            updateAgentState(key, (next) => markAgentStopped(next))
           }
           return
         }
-        setState(produce((next) => Object.assign(next, applySessionEvent(next, event))))
+        updateAgentState(key, (next) => applySessionEvent(next, event))
       },
       onStderr(text) {
         const lines = visibleStderr(text)
-        if (!lines) return
+        if (!lines || store.focusedKey !== key) return
         setNotice({ text: truncateRight(lines.replace(/\s+/g, " "), 120), tone: "muted" })
       },
       onExit(code) {
-        clearForceStopTimer()
-        currentRun = undefined
-        if (exitAfterStop) {
+        if (flags.forceTimer) {
+          clearTimeout(flags.forceTimer)
+          flags.forceTimer = undefined
+        }
+        runs.delete(key)
+        if (flags.exitAfter) {
           props.exitApp()
           return
         }
-        if (stoppingRun) {
-          stoppingRun = false
+        if (flags.stopping) {
+          flags.stopping = false
           setNotice({ text: "stopped agent", tone: "red" })
-          setState(produce((next) => Object.assign(next, markAgentStopped(next))))
-          void refreshSessions()
+          updateAgentState(key, (next) => markAgentStopped(next))
+          void refreshWorktrees()
           return
         }
-        setState("running", false)
-        setState("status", code === 0 ? "idle" : `exited ${code ?? "unknown"}`)
-        void refreshSessions()
+        updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
+        void refreshWorktrees()
       },
     })
+    runs.set(key, run)
+  }
+
+  function focusedAgentSessionMatches(key: string, sessionId: string) {
+    const idx = agentIndex(key)
+    return idx >= 0 && store.agents[idx].sessionId === sessionId
   }
 
   function updateDraft(value: string) {
@@ -414,6 +536,14 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "permissions") {
+      const choice = item as PermissionChoice
+      setApproval(choice.approval)
+      setWorkspaceOnly(choice.workspaceOnly)
+      setNotice({ text: `permissions set to ${choice.label.toLowerCase()}`, tone: "muted" })
+      closePalette()
+      return
+    }
     runCommand(item as Command)
   }
 
@@ -442,6 +572,14 @@ export function App(props: AppProps) {
     if (palette() === "modes") {
       const choice = item as EffortChoice
       setMode(choice.value)
+      closePalette()
+      return
+    }
+    if (palette() === "permissions") {
+      const choice = item as PermissionChoice
+      setApproval(choice.approval)
+      setWorkspaceOnly(choice.workspaceOnly)
+      setNotice({ text: `permissions set to ${choice.label.toLowerCase()}`, tone: "muted" })
       closePalette()
       return
     }
@@ -588,6 +726,10 @@ export function App(props: AppProps) {
       openPalette("modes")
       return
     }
+    if (command.action === "permissions") {
+      openPalette("permissions")
+      return
+    }
     if (command.action === "review") {
       input.setText("review current changes")
       setDraft("review current changes")
@@ -598,37 +740,99 @@ export function App(props: AppProps) {
     closePalette()
   }
 
+  function agentForWorktree(worktree: Worktree) {
+    return store.agents.find((a) => (a.sessionId && a.sessionId === worktree.session_id) || (a.workspaceId && a.workspaceId === worktree.workspace_id))
+  }
+
   function startNewSession() {
-    setSessionId(undefined)
-    setState(createInitialState())
+    const base = focusedAgent()
+    // Reuse a pristine focused slot rather than piling up empty agents.
+    if (base.state.transcript.length === 0 && !base.state.running && !base.sessionId) {
+      setExpanded(new Set<string>())
+      setNotice(undefined)
+      queueMicrotask(() => input?.focus())
+      return
+    }
+    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+    setStore("agents", (agents) => [...agents, slot])
+    setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
     setNotice(undefined)
     queueMicrotask(() => input?.focus())
   }
 
-  async function refreshSessions() {
+  function toggleDevMode() {
+    if (sessionId()) {
+      setNotice({ text: "Dev mode applies to new sessions — start one with /new", tone: "cyan" })
+      return
+    }
+    const next = devMode() === "worktree" ? "in-place" : "worktree"
+    setDevMode(next)
+    setNotice({ text: next === "worktree" ? "new sessions run in an isolated worktree" : "new sessions edit the workspace in place", tone: "muted" })
+  }
+
+  async function archiveWorktreeAction(worktree: Worktree) {
+    if (agentForWorktree(worktree)?.state.running) {
+      setNotice({ text: "Stop this worktree's agent before archiving", tone: "cyan" })
+      return
+    }
+    setWorktreeBusy(worktree.workspace_id)
+    setNotice({ text: `archiving ${worktree.branch_name}...`, tone: "cyan" })
     try {
-      const next = await listWorkspaceSessions(props)
-      setSessions(next)
-      setSessionListStatus("")
+      await archiveWorktree(props, worktree.workspace_id)
+      setNotice({ text: "worktree archived (chats kept)", tone: "muted" })
+      await refreshWorktrees()
     } catch (error) {
-      setSessionListStatus(error instanceof Error ? error.message : "Could not load sessions")
+      setNotice({ text: error instanceof Error ? error.message : "archive failed", tone: "red" })
+    } finally {
+      setWorktreeBusy(undefined)
     }
   }
 
-  async function loadSession(id: string) {
-    if (state.running || currentRun) {
-      setNotice({ text: "Stop the running agent before switching sessions", tone: "cyan" })
+  async function refreshWorktrees() {
+    try {
+      const next = await listWorktrees(props)
+      setWorktrees(next)
+      setSessionListStatus("")
+    } catch (error) {
+      setSessionListStatus(error instanceof Error ? error.message : "Could not load worktrees")
+    }
+  }
+
+  function focusAgent(key: string) {
+    setStore("focusedKey", key)
+    setExpanded(new Set<string>())
+    setNotice(undefined)
+    queueMicrotask(() => input?.focus())
+  }
+
+  async function loadWorktree(worktree: Worktree) {
+    if (!worktree.session_id) {
+      setNotice({ text: "This worktree has no session yet", tone: "muted" })
+      return
+    }
+    // Already open as a live agent — just focus it (keeps it running).
+    const existing = store.agents.find((a) => a.sessionId === worktree.session_id)
+    if (existing) {
+      focusAgent(existing.key)
       return
     }
     try {
-      const detail = await showWorkspaceSession(props, id)
-      setSessionId(id)
-      setProvider(sessionProvider(detail.session.provider_id) ?? provider())
-      setModel(detail.session.model || model())
-      setState(loadStoredSession(detail))
+      const detail = await showWorkspaceSession(props, worktree.session_id, worktree.state_db ?? undefined)
+      const slot = makeAgentSlot({
+        sessionId: worktree.session_id,
+        workspaceId: worktree.workspace_id,
+        branch: worktree.branch_name,
+        provider: sessionProvider(detail.session.provider_id) ?? props.provider,
+        model: detail.session.model || (props.model ?? defaultModel(props.provider)),
+        devMode: "worktree",
+        stateDb: worktree.state_db ?? undefined,
+        state: loadStoredSession(detail),
+      })
+      setStore("agents", (agents) => [...agents, slot])
+      setStore("focusedKey", slot.key)
       setExpanded(new Set<string>())
-      setNotice({ text: "session loaded", tone: "muted" })
+      setNotice({ text: worktree.exists ? "session loaded" : "session loaded (worktree archived — read-only)", tone: "muted" })
       queueMicrotask(() => input?.focus())
     } catch (error) {
       setNotice({ text: error instanceof Error ? error.message : "Could not load session", tone: "red" })
@@ -636,11 +840,13 @@ export function App(props: AppProps) {
   }
 
   function decide(decision: PermissionDecision) {
-    const request = state.pendingPermission
-    if (!request || !currentRun) return
-    currentRun.respond(request.requestId, decision)
+    const key = store.focusedKey
+    const request = fstate().pendingPermission
+    const run = runs.get(key)
+    if (!request || !run) return
+    run.respond(request.requestId, decision)
     setPermissionSelected(0)
-    setState(produce((next) => Object.assign(next, applyPermissionDecision(next, decision))))
+    updateAgentState(key, (next) => applyPermissionDecision(next, decision))
   }
 
   function handlePermissionKey(event: KeyEvent) {
@@ -690,15 +896,16 @@ export function App(props: AppProps) {
   }
 
   function handleCtrlC() {
+    const focusedRunning = fstate().running || runs.has(store.focusedKey)
     if (stopArmed() === "exit") {
-      if (state.running || currentRun) {
+      if (focusedRunning) {
         stopCurrentRun(true)
       } else {
         props.exitApp()
       }
       return
     }
-    armStop("exit", state.running || currentRun ? "Press Ctrl+C again to stop the agent and quit" : "Press Ctrl+C again to quit Inductor")
+    armStop("exit", focusedRunning ? "Press Ctrl+C again to stop the agent and quit" : "Press Ctrl+C again to quit Inductor")
   }
 
   function armStop(intent: StopIntent, text: string) {
@@ -719,7 +926,8 @@ export function App(props: AppProps) {
   }
 
   function stopCurrentRun(quitAfterStop: boolean) {
-    const run = currentRun
+    const key = store.focusedKey
+    const run = runs.get(key)
     if (!run) {
       if (quitAfterStop) props.exitApp()
       setNotice({ text: "No running agent to stop", tone: "muted" })
@@ -727,22 +935,19 @@ export function App(props: AppProps) {
       return
     }
 
-    stoppingRun = true
-    exitAfterStop = quitAfterStop
+    const flags = runFlagsFor(key)
+    flags.stopping = true
+    flags.exitAfter = quitAfterStop
     setStopArmed(undefined)
     clearStopArmTimer()
     setNotice({ text: quitAfterStop ? "Stopping agent, then quitting Inductor..." : "Stopping agent...", tone: "cyan" })
-    setState(produce((next) => Object.assign(next, markAgentStopped(next))))
+    updateAgentState(key, (next) => markAgentStopped(next))
     run.interrupt()
-    clearForceStopTimer()
-    forceStopTimer = setTimeout(() => {
-      if (!stoppingRun) return
+    if (flags.forceTimer) clearTimeout(flags.forceTimer)
+    flags.forceTimer = setTimeout(() => {
+      if (!flags.stopping) return
       run.kill()
-      if (exitAfterStop) {
-        void run.exited
-          .catch(() => undefined)
-          .finally(() => props.exitApp())
-      }
+      if (flags.exitAfter) props.exitApp()
     }, 5000)
   }
 
@@ -750,12 +955,6 @@ export function App(props: AppProps) {
     if (!stopArmTimer) return
     clearTimeout(stopArmTimer)
     stopArmTimer = undefined
-  }
-
-  function clearForceStopTimer() {
-    if (!forceStopTimer) return
-    clearTimeout(forceStopTimer)
-    forceStopTimer = undefined
   }
 
   function openModifiedFile(file: ModifiedFile) {
@@ -770,20 +969,28 @@ export function App(props: AppProps) {
           agent={agent()}
           provider={provider()}
           model={model()}
-          title={state.title}
+          title={fstate().title}
           workspace={props.workspace}
-          running={state.running}
+          running={fstate().running}
           elapsed={formatElapsed(now() - startedAt)}
+          devMode={devMode()}
+          branch={activeBranch()}
+          toggleDevMode={toggleDevMode}
           openPalette={openPalette}
         />
-        <box flexGrow={1} minHeight={0} flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+        <box flexGrow={1} minHeight={0} overflow="hidden" flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
           <SessionSidebar
-            sessions={sessions()}
+            agents={store.agents}
+            worktrees={worktrees()}
+            focusedKey={store.focusedKey}
             currentSessionId={sessionId()}
             status={sessionListStatus()}
+            devMode={devMode()}
+            busyId={worktreeBusy()}
             newSession={startNewSession}
-            loadSession={loadSession}
-            refreshSessions={refreshSessions}
+            focusAgent={focusAgent}
+            loadWorktree={loadWorktree}
+            archiveWorktree={archiveWorktreeAction}
           />
           <box
             flexGrow={1}
@@ -810,8 +1017,8 @@ export function App(props: AppProps) {
                 verticalScrollbarOptions={{ visible: false }}
               >
                 <Timeline
-                  items={state.transcript}
-                  pendingPermission={state.pendingPermission}
+                  items={fstate().transcript}
+                  pendingPermission={fstate().pendingPermission}
                   permissionSelected={permissionSelected()}
                   selectPermission={setPermissionSelected}
                   expanded={expanded()}
@@ -822,18 +1029,18 @@ export function App(props: AppProps) {
             </Show>
           </box>
           <TelemetrySidebar
-            state={state}
+            state={fstate()}
             provider={provider()}
             model={model()}
             workspace={props.workspace}
             contextPercent={contextPercent()}
             mode={mode()}
-            branch="HEAD"
+            branch={activeBranch()}
             openModifiedFile={openModifiedFile}
           />
         </box>
         <Composer
-          state={state}
+          state={fstate()}
           provider={provider()}
           model={model()}
           mode={mode()}
@@ -869,6 +1076,9 @@ function TopRail(props: {
   workspace: string
   running: boolean
   elapsed: string
+  devMode: DevMode
+  branch: string
+  toggleDevMode: () => void
   openPalette: (kind: PaletteKind) => void
 }) {
   return (
@@ -882,10 +1092,11 @@ function TopRail(props: {
       borderColor={theme.border}
     >
       <TopBrand />
-      <TopMetric width={25} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
-      <TopMetric width={40} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 26)} color={theme.blue} onClick={() => props.openPalette("models")} />
-      <TopMetric width={40} label="session" value={truncateRight(props.title, 24)} color={theme.cyan} />
-      <TopMetric width={25} label="branch" value="HEAD" color={theme.cyan} />
+      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
+      <TopMetric width={34} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 20)} color={theme.blue} onClick={() => props.openPalette("models")} />
+      <TopMetric width={32} label="session" value={truncateRight(props.title, 18)} color={theme.cyan} />
+      <TopMetric width={22} label="dev" value={props.devMode === "worktree" ? "worktree" : "in-place"} color={props.devMode === "worktree" ? theme.green : theme.yellow} onClick={props.toggleDevMode} />
+      <TopMetric width={28} label="branch" value={truncateRight(props.branch, 18)} color={theme.cyan} />
       <box flexGrow={1} height="100%" />
       <box width={18} height="100%" flexDirection="row" alignItems="center" justifyContent="center">
         <text fg={props.running ? theme.green : theme.text} attributes={TextAttributes.BOLD}>◴ {clockElapsed(props.elapsed)}</text>
@@ -925,20 +1136,34 @@ function TopMetric(props: { width: number; label: string; value: string; color: 
       borderColor={theme.border}
       onMouseUp={props.onClick}
     >
-      <text fg={theme.dim}>{props.label}</text>
-      <text fg={props.color} attributes={TextAttributes.BOLD}>{props.value}</text>
+      <text fg={theme.dim} wrapMode="none">{props.label}</text>
+      <text fg={props.color} attributes={TextAttributes.BOLD} wrapMode="none">{props.value}</text>
     </box>
   )
 }
 
 function SessionSidebar(props: {
-  sessions: StoredSession[]
+  agents: AgentSlot[]
+  worktrees: Worktree[]
+  focusedKey: string
   currentSessionId?: string
   status: string
+  devMode: DevMode
+  busyId?: string
   newSession: () => void
-  loadSession: (id: string) => void
-  refreshSessions: () => Promise<void>
+  focusAgent: (key: string) => void
+  loadWorktree: (worktree: Worktree) => void
+  archiveWorktree: (worktree: Worktree) => void
 }) {
+  const agentForWorktree = (worktree: Worktree) =>
+    props.agents.find((a) => (a.sessionId && a.sessionId === worktree.session_id) || (a.workspaceId && a.workspaceId === worktree.workspace_id))
+  const draftAgents = () => props.agents.filter((agent) =>
+    !props.worktrees.some((worktree) =>
+      (agent.sessionId && agent.sessionId === worktree.session_id) ||
+      (agent.workspaceId && agent.workspaceId === worktree.workspace_id)
+    )
+  )
+  const sessionCount = () => props.worktrees.length + draftAgents().length
   return (
     <box
       width={SESSION_SIDEBAR_WIDTH}
@@ -960,49 +1185,136 @@ function SessionSidebar(props: {
         gap={1}
         paddingLeft={1}
         paddingRight={1}
-        backgroundColor={!props.currentSessionId ? theme.paletteSelected : theme.panelSoft}
+        backgroundColor={theme.panelSoft}
         onMouseUp={props.newSession}
       >
         <text fg={theme.cyan} attributes={TextAttributes.BOLD}>+</text>
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>New session</text>
+        <text fg={theme.text} attributes={TextAttributes.BOLD}>New {props.devMode === "worktree" ? "worktree" : "session"}</text>
       </box>
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginTop={1} marginBottom={1}>
-        <text fg={theme.cyan}>SESSIONS</text>
+        <text fg={theme.cyan}>WORKTREES</text>
         <box flexGrow={1} />
+        <text fg={theme.dim}>{sessionCount()}</text>
       </box>
       <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, SESSION_SIDEBAR_TEXT_WIDTH)}</text>}>
         <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
           <box flexDirection="column" gap={1}>
-            <Show when={props.sessions.length > 0} fallback={<text fg={theme.dim}>No previous sessions</text>}>
-              <For each={props.sessions}>
-                {(session) => {
-                  const active = () => props.currentSessionId === session.id
-                  return (
-                    <box
-                      width="100%"
-                      flexDirection="column"
-                      paddingLeft={1}
-                      paddingRight={1}
-                      backgroundColor={active() ? theme.paletteSelected : theme.panelSoft}
-                      border={["left"]}
-                      borderColor={active() ? theme.cyan : theme.borderSoft}
-                      onMouseUp={() => props.loadSession(session.id)}
-                    >
-                      <text fg={active() ? theme.text : theme.muted} attributes={active() ? TextAttributes.BOLD : undefined} wrapMode="none">
-                        {truncateRight(sessionTitle(session), SESSION_SIDEBAR_TEXT_WIDTH)}
-                      </text>
-                      <box flexDirection="row" gap={1}>
-                        <text fg={theme.dim}>{truncateRight(shortModel(session.model), 12)}</text>
-                        <text fg={session.status === "running" ? theme.green : theme.dim}>{session.status.toLowerCase()}</text>
-                      </box>
-                    </box>
-                  )
-                }}
-              </For>
-            </Show>
+            <For each={draftAgents()}>
+              {(slot) => (
+                <DraftSessionRow
+                  slot={slot}
+                  focused={props.focusedKey === slot.key}
+                  focus={() => props.focusAgent(slot.key)}
+                />
+              )}
+            </For>
+            <For each={props.worktrees}>
+              {(worktree) => {
+                const agent = () => agentForWorktree(worktree)
+                return (
+                  <WorktreeRow
+                    worktree={worktree}
+                    agent={agent()}
+                    active={props.currentSessionId === worktree.session_id || agent()?.key === props.focusedKey}
+                    busy={props.busyId === worktree.workspace_id}
+                    load={() => {
+                      const open = agent()
+                      if (open) props.focusAgent(open.key)
+                      else props.loadWorktree(worktree)
+                    }}
+                    archive={() => props.archiveWorktree(worktree)}
+                  />
+                )
+              }}
+            </For>
           </box>
         </scrollbox>
       </Show>
+    </box>
+  )
+}
+
+function DraftSessionRow(props: {
+  slot: AgentSlot
+  focused: boolean
+  focus: () => void
+}) {
+  const s = () => props.slot.state
+  const statusColor = () => s().pendingPermission ? theme.orange : s().running ? theme.green : theme.dim
+  return (
+    <box
+      width="100%"
+      flexDirection="column"
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={props.focused ? theme.paletteSelected : theme.panelSoft}
+      border={["left"]}
+      borderColor={props.focused ? theme.cyan : s().running ? theme.green : theme.borderSoft}
+    >
+      <box flexDirection="row" gap={1} onMouseUp={props.focus}>
+        <text fg={s().running ? theme.green : theme.dim} selectable={false}>{s().running ? "●" : s().pendingPermission ? "?" : "○"}</text>
+        <text fg={props.focused ? theme.text : theme.muted} attributes={props.focused ? TextAttributes.BOLD : undefined} wrapMode="none">
+          {truncateRight(s().title || "New session", SESSION_SIDEBAR_TEXT_WIDTH - 6)}
+        </text>
+      </box>
+      <box flexDirection="row" gap={1} onMouseUp={props.focus}>
+        <text fg={theme.dim}>{providerLabel(props.slot.provider)} {truncateRight(shortModel(props.slot.model), 8)}</text>
+        <box flexGrow={1} />
+        <text fg={statusColor()}>{s().running ? "running" : s().pendingPermission ? "needs approval" : (s().status || "idle")}</text>
+      </box>
+    </box>
+  )
+}
+
+function WorktreeRow(props: {
+  worktree: Worktree
+  agent?: AgentSlot
+  active: boolean
+  busy: boolean
+  load: () => void
+  archive: () => void
+}) {
+  const wt = props.worktree
+  const title = wt.display_name || wt.branch_name.replace(/^inductor\//, "") || "session"
+  const live = () => props.agent?.state
+  const isRunning = () => Boolean(live()?.running)
+  const needsApproval = () => Boolean(live()?.pendingPermission)
+  const rowStatus = () => {
+    if (props.busy) return "working..."
+    if (isRunning()) return "running"
+    if (needsApproval()) return "needs approval"
+    return wt.status
+  }
+  const statusColor = () => {
+    if (needsApproval()) return theme.orange
+    if (isRunning()) return theme.green
+    if (wt.status === "active") return theme.cyan
+    if (wt.status === "merged") return theme.purple
+    return theme.dim
+  }
+  return (
+    <box
+      width="100%"
+      flexDirection="column"
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={props.active ? theme.paletteSelected : theme.panelSoft}
+      border={["left"]}
+      borderColor={props.active ? theme.cyan : isRunning() ? theme.green : theme.borderSoft}
+    >
+      <box flexDirection="row" gap={1} onMouseUp={props.load}>
+        <text fg={isRunning() ? theme.green : needsApproval() ? theme.orange : theme.dim} selectable={false}>{isRunning() ? "●" : needsApproval() ? "?" : "○"}</text>
+        <text fg={props.active ? theme.text : theme.muted} attributes={props.active ? TextAttributes.BOLD : undefined} wrapMode="none">
+          {truncateRight(title, SESSION_SIDEBAR_TEXT_WIDTH - 6)}
+        </text>
+      </box>
+      <box flexDirection="row" gap={1}>
+        <text fg={statusColor()}>{rowStatus()}</text>
+        <box flexGrow={1} />
+        <Show when={wt.status === "active" && wt.exists && !isRunning()}>
+          <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
+        </Show>
+      </box>
     </box>
   )
 }
@@ -1122,8 +1434,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
         width="100%"
         flexDirection="column"
         backgroundColor={theme.row}
-        border
-        borderStyle="rounded"
+        border={["top", "bottom"]}
         borderColor={isOpen() ? theme.borderStrong : theme.borderSoft}
       >
         <box
@@ -1150,8 +1461,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border
-            borderStyle="rounded"
+            border={["top", "bottom"]}
             borderColor={isWrite() ? theme.borderStrong : theme.border}
             paddingLeft={1}
             paddingRight={1}
@@ -1223,43 +1533,31 @@ function DiffWithHunkReview(props: { diff: string; path?: string }) {
   const viewerHeight = createMemo(() => diffViewerHeight(props.diff))
   return (
     <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
-      <scrollbox
+      <diff
+        diff={props.diff}
+        view="split"
+        syncScroll={true}
+        filetype={filetype(props.path)}
         width="100%"
         height="100%"
         minHeight={0}
         overflow="hidden"
-        scrollX={true}
-        scrollY={true}
-        stickyScroll={false}
-        scrollAcceleration={scrollAcceleration}
-        viewportCulling={true}
-        viewportOptions={{ overflow: "hidden" }}
-        contentOptions={{ overflow: "hidden" }}
-        verticalScrollbarOptions={{ visible: false }}
-        horizontalScrollbarOptions={{ visible: false }}
-      >
-        <diff
-          diff={props.diff}
-          view="split"
-          filetype={filetype(props.path)}
-          width="100%"
-          wrapMode="word"
-          showLineNumbers={true}
-          syntaxStyle={syntaxStyle}
-          fg={theme.text}
-          selectionBg={theme.selectionBg}
-          selectionFg={theme.text}
-          addedBg={theme.addedBg}
-          removedBg={theme.removedBg}
-          contextBg={theme.surface}
-          addedSignColor={theme.green}
-          removedSignColor={theme.red}
-          lineNumberFg={theme.muted}
-          lineNumberBg={theme.surface}
-          addedLineNumberBg={theme.addedBg}
-          removedLineNumberBg={theme.removedBg}
-        />
-      </scrollbox>
+        wrapMode="word"
+        showLineNumbers={true}
+        syntaxStyle={syntaxStyle}
+        fg={theme.text}
+        selectionBg={theme.selectionBg}
+        selectionFg={theme.text}
+        addedBg={theme.addedBg}
+        removedBg={theme.removedBg}
+        contextBg={theme.surface}
+        addedSignColor={theme.green}
+        removedSignColor={theme.red}
+        lineNumberFg={theme.muted}
+        lineNumberBg={theme.surface}
+        addedLineNumberBg={theme.addedBg}
+        removedLineNumberBg={theme.removedBg}
+      />
     </box>
   )
 }
@@ -1309,8 +1607,7 @@ function TimelineShell(props: { marker: string; color: string; label: string; ch
         flexDirection="row"
         gap={2}
         backgroundColor={theme.row}
-        border
-        borderStyle="rounded"
+        border={["top", "bottom"]}
         borderColor={theme.borderSoft}
         paddingLeft={1}
         paddingRight={1}
@@ -1351,7 +1648,7 @@ function PermissionTimelineItem(props: {
           fallback={<code content={props.request.input} filetype="json" syntaxStyle={syntaxStyle} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text} />}
         >
           {(patch) => (
-            <box backgroundColor={theme.panelSoft} border borderStyle="rounded" borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+            <box backgroundColor={theme.panelSoft} border={["top", "bottom"]} borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
               <DiffWithHunkReview diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())} path={props.request.filepath} />
             </box>
           )}
@@ -1785,14 +2082,6 @@ function sessionProvider(value: unknown) {
     return typeof tuple[0] === "string" ? tuple[0] : undefined
   }
   return undefined
-}
-
-function sessionTitle(session: StoredSession) {
-  return session.display_name || summarizeSessionPreview(session.preview) || "New session"
-}
-
-function summarizeSessionPreview(value: string) {
-  return value.replace(/\s+/g, " ").trim()
 }
 
 function shortProviderModel(provider: string, model: string) {

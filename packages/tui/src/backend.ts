@@ -34,6 +34,8 @@ export type SessionEvent = {
   decision?: PermissionDecision
 }
 
+export type DevMode = "in-place" | "worktree"
+
 export type BackendOptions = {
   backendBin: string
   workspace: string
@@ -43,6 +45,29 @@ export type BackendOptions = {
   effort?: string
   approval: string
   repoRoot: string
+  appDb?: string
+  workspaceOnly?: boolean
+  /** Development mode: edit in place, or run inside an isolated git worktree. */
+  mode?: DevMode
+  /** Override the path the run reads/writes session state from (state.db). */
+  stateDb?: string
+}
+
+export type Worktree = {
+  workspace_id: string
+  source_repo: string
+  worktree_path: string
+  state_db?: string | null
+  branch_name: string
+  base_branch: string
+  status: "active" | "merged" | "abandoned" | "archived"
+  exists: boolean
+  display_name?: string | null
+  session_id?: string | null
+  session_status?: string | null
+  provider?: string | null
+  model?: string | null
+  updated_at: string
 }
 
 export type BackendCallbacks = {
@@ -115,6 +140,18 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
   if (options.effort) {
     cmd.push("--effort", options.effort)
   }
+  if (options.mode) {
+    cmd.push("--mode", options.mode)
+  }
+  if (options.appDb) {
+    cmd.push("--app-db", options.appDb)
+  }
+  if (options.stateDb) {
+    cmd.push("--state-db", options.stateDb)
+  }
+  if (options.workspaceOnly) {
+    cmd.push("--workspace-only")
+  }
 
   const proc = Bun.spawn(cmd, {
     cwd: options.repoRoot,
@@ -161,8 +198,8 @@ export async function listWorkspaceSessions(options: Pick<BackendOptions, "backe
   return Array.isArray(output) ? output as StoredSession[] : []
 }
 
-export async function showWorkspaceSession(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "workspace">, sessionId: string): Promise<StoredSessionDetail> {
-  const output = await runBackendJson(options, [
+export async function showWorkspaceSession(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "workspace">, sessionId: string, stateDb?: string): Promise<StoredSessionDetail> {
+  const args = [
     "db",
     "show-session",
     "--workspace",
@@ -170,8 +207,26 @@ export async function showWorkspaceSession(options: Pick<BackendOptions, "backen
     "--session-id",
     sessionId,
     "--json",
-  ])
+  ]
+  if (stateDb) args.push("--state-db", stateDb)
+  const output = await runBackendJson(options, args)
   return output as StoredSessionDetail
+}
+
+export async function listWorktrees(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">): Promise<Worktree[]> {
+  const args = ["worktree", "registry", "--json"]
+  if (options.appDb) args.push("--app-db", options.appDb)
+  const output = await runBackendJson(options, args)
+  return Array.isArray(output) ? (output as Worktree[]) : []
+}
+
+export async function archiveWorktree(
+  options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">,
+  workspaceId: string,
+): Promise<void> {
+  const args = ["worktree", "archive", "--workspace-id", workspaceId, "--json"]
+  if (options.appDb) args.push("--app-db", options.appDb)
+  await runBackendJson(options, args)
 }
 
 async function runBackendJson(options: Pick<BackendOptions, "backendBin" | "repoRoot">, args: string[]): Promise<unknown> {

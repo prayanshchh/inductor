@@ -40,6 +40,14 @@ impl ClaudeProvider {
         Ok(Self { command, cwd })
     }
 
+    pub fn with_cwd(cwd: PathBuf) -> Self {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        Self {
+            command: BridgeCommand::from_env(&manifest_dir),
+            cwd,
+        }
+    }
+
     pub fn with_command(command: impl Into<String>, args: Vec<String>, cwd: PathBuf) -> Self {
         Self {
             command: BridgeCommand {
@@ -136,6 +144,12 @@ impl ProviderPlugin for ClaudeProvider {
         let system_prompt = req.system_prompt;
         let messages = req.messages;
         let images = req.images;
+        let approval_policy = req
+            .metadata
+            .get("approval_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("never")
+            .to_string();
         let model = normalize_claude_model(&req.model).to_string();
         let idle_timeout = claude_idle_timeout();
 
@@ -153,6 +167,7 @@ impl ProviderPlugin for ClaudeProvider {
                 messages,
                 images,
                 system_prompt,
+                approval_policy,
             };
             if let Err(error) = timeout(idle_timeout, bridge.send_request(&request)).await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!(
@@ -516,6 +531,7 @@ struct BridgeRequest {
     messages: Vec<ModelMessage>,
     images: Vec<ImageAttachment>,
     system_prompt: Option<String>,
+    approval_policy: String,
 }
 
 struct SdkBridge {
@@ -604,6 +620,7 @@ impl SdkBridge {
             "messages": request.messages,
             "images": request.images,
             "system_prompt": request.system_prompt,
+            "approval_policy": request.approval_policy,
             "tool_definitions": tools::tool_definitions(),
         }))
         .await

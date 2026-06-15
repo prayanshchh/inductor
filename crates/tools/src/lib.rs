@@ -81,20 +81,20 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: ToolName::ReadFile,
-            description: "Read a UTF-8 text file in the workspace.",
+            description: "Read a UTF-8 text file. Paths may be workspace-relative or absolute when unrestricted access is enabled.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "Workspace-relative path" } },
+                "properties": { "path": { "type": "string", "description": "File path" } },
                 "required": ["path"]
             }),
             read_only: true,
         },
         ToolDefinition {
             name: ToolName::ListDir,
-            description: "List entries in a workspace directory, with directories suffixed by slash.",
+            description: "List entries in a directory, with directories suffixed by slash.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "Optional workspace-relative directory" } }
+                "properties": { "path": { "type": "string", "description": "Optional directory path" } }
             }),
             read_only: true,
         },
@@ -104,7 +104,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path" },
+                    "path": { "type": "string", "description": "File path" },
                     "content": { "type": "string", "description": "Full file contents" }
                 },
                 "required": ["path", "content"]
@@ -117,7 +117,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path" },
+                    "path": { "type": "string", "description": "File path" },
                     "old": { "type": "string", "description": "Exact text to replace. Must be unique." },
                     "new": { "type": "string", "description": "Replacement text" },
                     "expected_hash": { "type": "string", "description": "Optional sha256 of the current file contents" }
@@ -132,7 +132,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path" },
+                    "path": { "type": "string", "description": "File path" },
                     "edits": {
                         "type": "array",
                         "items": {
@@ -200,12 +200,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::Glob,
-            description: "Find files in the workspace by glob pattern.",
+            description: "Find files by glob pattern.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob pattern" },
-                    "path": { "type": "string", "description": "Optional workspace-relative directory" }
+                    "path": { "type": "string", "description": "Optional directory path" }
                 },
                 "required": ["pattern"]
             }),
@@ -213,7 +213,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::Grep,
-            description: "Search workspace text files for a substring or regular expression.",
+            description: "Search text files for a substring or regular expression.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "pattern": { "type": "string", "description": "Search pattern" } },
@@ -359,6 +359,15 @@ impl ToolRuntime {
             sandbox: SandboxPolicy::Disabled,
             allow_outside_paths: false,
         })
+    }
+
+    /// Build a runtime with unrestricted local access. File tools may resolve
+    /// absolute paths and `..` paths outside the workspace, and bash runs
+    /// without the macOS workspace sandbox.
+    pub fn unrestricted(workspace_root: impl AsRef<Path>) -> Result<Self, ToolError> {
+        let mut runtime = Self::new(workspace_root)?;
+        runtime.allow_outside_paths = true;
+        Ok(runtime)
     }
 
     /// Build a per-call runtime for a tool execution the user explicitly approved.
@@ -1727,6 +1736,22 @@ mod tests {
             result.metadata["path"],
             outside_file.canonicalize().unwrap().display().to_string()
         );
+    }
+
+    #[test]
+    fn unrestricted_runtime_allows_reads_and_writes_outside_workspace() {
+        let workspace = TempDir::new("unrestricted-workspace");
+        let outside = TempDir::new("unrestricted-target");
+        let outside_file = outside.path().join("memory.md");
+        fs::write(&outside_file, "remember this").unwrap();
+
+        let runtime = ToolRuntime::unrestricted(workspace.path()).unwrap();
+        let read = runtime.read_file(&outside_file).unwrap();
+        assert_eq!(read.output, "remember this");
+
+        let written = outside.path().join("notes").join("new.md");
+        runtime.write_file(&written, "new memory").unwrap();
+        assert_eq!(fs::read_to_string(written).unwrap(), "new memory");
     }
 
     #[test]

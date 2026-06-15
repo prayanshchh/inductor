@@ -41,8 +41,7 @@ pub struct GitWorktree {
 }
 
 /// Describes the drift between the commit a worktree branch was based on and
-/// the current tip of its target branch. Used to decide whether a merge is a
-/// trivial fast-forward, needs a real merge, or risks conflicts.
+/// the current tip of its target branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftStatus {
     /// Commit the worktree branch was originally created from.
@@ -51,33 +50,6 @@ pub struct DriftStatus {
     pub target_head: String,
     /// True when the target branch has advanced past `base_commit`.
     pub drifted: bool,
-}
-
-/// Request to merge a worktree branch into a target branch in the source repo.
-#[derive(Debug, Clone)]
-pub struct MergeRequest {
-    pub source_repo: PathBuf,
-    pub branch_name: String,
-    pub target_branch: String,
-    /// Commit the branch was based on, used for drift reporting.
-    pub base_commit: String,
-    /// Force a merge commit even when a fast-forward is possible.
-    pub no_ff: bool,
-}
-
-/// Result of attempting a local merge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeOutcome {
-    /// Target already contains the branch; nothing to do.
-    UpToDate,
-    /// Merge succeeded, producing (or fast-forwarding to) `merged_commit`.
-    Merged {
-        merged_commit: String,
-        fast_forward: bool,
-    },
-    /// Merge left the target checkout with conflicts that must be resolved or
-    /// aborted before the merge lock is released.
-    Conflict { files: Vec<PathBuf> },
 }
 
 #[derive(Debug, Clone)]
@@ -189,10 +161,6 @@ impl WorktreeManager {
     }
 
     /// Compare the commit a branch was based on against the current target tip.
-    ///
-    /// Callers use this to detect that the target branch moved while an agent
-    /// worked (the serialized-merge case): a drifted target may merge cleanly,
-    /// fast-forward, or conflict, so the result is re-checked at merge time.
     pub fn check_drift(
         &self,
         source_repo: &Path,
@@ -206,103 +174,6 @@ impl WorktreeManager {
             target_head,
         })
     }
-
-    /// Merge a worktree branch into its target branch in the source repo's
-    /// checkout.
-    ///
-    /// The merge runs in the source repo root, which must be clean. If the
-    /// root is not already on `target_branch` it is switched onto it first
-    /// (this fails cleanly if the branch is checked out in another worktree).
-    /// Conflicts are surfaced as [`MergeOutcome::Conflict`] without
-    /// auto-resolving; the caller decides whether to resolve manually or call
-    /// [`WorktreeManager::abort_merge`].
-    pub fn merge_branch(&self, request: MergeRequest) -> Result<MergeOutcome, GitError> {
-        let repo = self.inspect_repo(&request.source_repo)?;
-
-        if repo.is_dirty {
-            return Err(GitError::DirtyRepository(repo.root));
-        }
-
-        if repo.current_branch != request.target_branch {
-            git_stdout(&repo.root, ["switch", &request.target_branch])?;
-        }
-
-        let mut args = vec!["merge".to_string()];
-        if request.no_ff {
-            args.push("--no-ff".to_string());
-        }
-        args.push(request.branch_name.clone());
-
-        let result = git_run(&repo.root, &args)?;
-
-        if result.success {
-            if result.stdout.contains("Already up to date") {
-                return Ok(MergeOutcome::UpToDate);
-            }
-            let fast_forward = result.stdout.contains("Fast-forward");
-            let merged_commit = git_stdout(&repo.root, ["rev-parse", "HEAD"])?;
-            return Ok(MergeOutcome::Merged {
-                merged_commit,
-                fast_forward,
-            });
-        }
-
-        let conflicts = git_stdout(&repo.root, ["diff", "--name-only", "--diff-filter=U"])?;
-        if !conflicts.trim().is_empty() {
-            let files = conflicts
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(PathBuf::from)
-                .collect();
-            return Ok(MergeOutcome::Conflict { files });
-        }
-
-        Err(GitError::CommandFailed {
-            program: "git".to_string(),
-            args,
-            status: result.status,
-            stderr: result.stderr,
-        })
-    }
-
-    /// Abort an in-progress merge in the source repo, restoring the target
-    /// branch to its pre-merge state.
-    pub fn abort_merge(&self, source_repo: &Path) -> Result<(), GitError> {
-        let repo = self.inspect_repo(source_repo)?;
-        git_stdout(&repo.root, ["merge", "--abort"])?;
-        Ok(())
-    }
-}
-
-/// Captured output of a git invocation that may legitimately fail (e.g. a
-/// merge that hits conflicts), where the caller inspects the result rather
-/// than treating non-zero as an error.
-struct GitRun {
-    success: bool,
-    status: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-fn git_run(repo: &Path, args: &[String]) -> Result<GitRun, GitError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|source| GitError::CommandFailed {
-            program: "git".to_string(),
-            args: args.to_vec(),
-            status: None,
-            stderr: source.to_string(),
-        })?;
-
-    Ok(GitRun {
-        success: output.status.success(),
-        status: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -539,91 +410,6 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, GitError::DirtyRepository(_)));
-    }
-
-    #[test]
-    fn merge_branch_fast_forwards_clean_branch() {
-        let temp = TempDir::new("merge-ff");
-        let repo = temp.path().join("repo");
-        init_repo(&repo);
-
-        let manager = WorktreeManager::new(temp.path().join("managed"));
-        let worktree = manager
-            .create_worktree(CreateWorktreeRequest {
-                source_repo: repo.clone(),
-                slug: "feature".to_string(),
-                allow_dirty: false,
-            })
-            .unwrap();
-
-        fs::write(worktree.worktree_path.join("feature.txt"), "feature\n").unwrap();
-        run(&worktree.worktree_path, ["add", "feature.txt"]);
-        run(&worktree.worktree_path, ["commit", "-m", "add feature"]);
-
-        let outcome = manager
-            .merge_branch(MergeRequest {
-                source_repo: worktree.source_repo.clone(),
-                branch_name: worktree.branch_name.clone(),
-                target_branch: worktree.base_branch.clone(),
-                base_commit: worktree.base_commit.clone(),
-                no_ff: false,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            outcome,
-            MergeOutcome::Merged {
-                fast_forward: true,
-                ..
-            }
-        ));
-        assert!(repo.join("feature.txt").exists());
-    }
-
-    #[test]
-    fn merge_branch_reports_conflict_without_resolving() {
-        let temp = TempDir::new("merge-conflict");
-        let repo = temp.path().join("repo");
-        init_repo(&repo);
-
-        let manager = WorktreeManager::new(temp.path().join("managed"));
-        let worktree = manager
-            .create_worktree(CreateWorktreeRequest {
-                source_repo: repo.clone(),
-                slug: "feature".to_string(),
-                allow_dirty: false,
-            })
-            .unwrap();
-
-        // Diverge both sides on the same file to force a conflict.
-        fs::write(worktree.worktree_path.join("README.md"), "# branch\n").unwrap();
-        run(&worktree.worktree_path, ["add", "README.md"]);
-        run(&worktree.worktree_path, ["commit", "-m", "branch edit"]);
-
-        fs::write(repo.join("README.md"), "# main\n").unwrap();
-        run(&repo, ["add", "README.md"]);
-        run(&repo, ["commit", "-m", "main edit"]);
-
-        let outcome = manager
-            .merge_branch(MergeRequest {
-                source_repo: worktree.source_repo.clone(),
-                branch_name: worktree.branch_name.clone(),
-                target_branch: worktree.base_branch.clone(),
-                base_commit: worktree.base_commit.clone(),
-                no_ff: false,
-            })
-            .unwrap();
-
-        match outcome {
-            MergeOutcome::Conflict { files } => {
-                assert_eq!(files, vec![PathBuf::from("README.md")]);
-            }
-            other => panic!("expected conflict, got {other:?}"),
-        }
-
-        // The merge must still be abortable, leaving a clean tree.
-        manager.abort_merge(&worktree.source_repo).unwrap();
-        assert!(!manager.inspect_repo(&repo).unwrap().is_dirty);
     }
 
     #[test]

@@ -910,6 +910,53 @@ async fn approved_outside_read_file_executes() {
 }
 
 #[tokio::test]
+async fn never_policy_runs_outside_read_without_prompt() {
+    let workspace = TempDir::new("never-outside-workspace");
+    let outside = TempDir::new("never-outside-target");
+    let outside_file = outside.path().join("memory.md");
+    fs::write(&outside_file, "outside memory").unwrap();
+    let runtime = ToolRuntime::unrestricted(workspace.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        format!(
+            "<inductor_tool_call>{{\"name\":\"read_file\",\"input\":{{\"path\":{}}}}}</inductor_tool_call>",
+            serde_json::to_string(&outside_file.display().to_string()).unwrap()
+        ),
+        "read it".to_string(),
+    ]);
+    let auth = test_auth();
+    let approver = RecordingApprover::new(PermissionDecision::Deny);
+    let mut allow = AllowStore::new();
+    let mut state = SessionState::new(SessionId::new());
+    let mut config = HarnessConfig::new("test-model");
+    config.approval_policy = ApprovalPolicy::Never;
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &approver,
+        &mut allow,
+        &mut state,
+        "read outside memory".to_string(),
+        config,
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::PermissionRequest { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallResult { output, .. } if output.contains("outside memory")
+    )));
+}
+
+#[tokio::test]
 async fn benign_command_does_not_pause_under_on_request() {
     let temp = TempDir::new("approval-benign");
     let runtime = ToolRuntime::new(temp.path()).unwrap();
