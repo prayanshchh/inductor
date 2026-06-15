@@ -228,29 +228,6 @@ export async function listWorktrees(options: Pick<BackendOptions, "backendBin" |
   return Array.isArray(output) ? (output as Worktree[]) : []
 }
 
-export type CreatedWorktree = {
-  workspace_id: string
-  source_repo: string
-  worktree_path: string
-  state_db: string
-  branch_name: string
-  base_branch: string
-  base_commit: string
-}
-
-/**
- * Eagerly create an isolated worktree the moment a new session is opened,
- * before the first prompt is known. Uses a placeholder `session` slug; the
- * backend relabels the branch from the first prompt on the opening turn.
- */
-export async function createWorktree(
-  options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb" | "workspace">,
-): Promise<CreatedWorktree> {
-  const args = ["worktree", "create", "--repo", options.workspace, "--slug", "session", "--allow-dirty", "--json"]
-  if (options.appDb) args.push("--app-db", options.appDb)
-  const output = await runBackendJson(options, args)
-  return output as CreatedWorktree
-}
 
 export async function archiveWorktree(
   options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb">,
