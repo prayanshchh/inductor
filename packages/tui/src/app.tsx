@@ -3,7 +3,7 @@ import { MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import {
   applyPermissionDecision,
@@ -35,6 +35,7 @@ import {
   type PromptImageAttachment,
 } from "./mentions"
 import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
+import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
 
 export type AppProps = BackendOptions & {
   exitApp(): void
@@ -304,6 +305,39 @@ export function App(props: AppProps) {
     )
     return worktree?.worktree_path ?? props.workspace
   })
+
+  // Embedded terminal: a persistent shell scoped to the focused agent's
+  // worktree path. The PTY lives in the backend; we stream screen snapshots in
+  // and forward typed lines/control bytes out. It is recreated whenever the
+  // focused worktree path changes so its cwd always matches the active agent.
+  const TERMINAL_COLS = SESSION_SIDEBAR_TEXT_WIDTH
+  const terminalRows = createMemo(() => Math.max(6, Math.floor((dimensions().height - 16) / 2)))
+  const [terminalSnapshot, setTerminalSnapshot] = createSignal<TerminalSnapshot>()
+  let terminalSession: TerminalSession | undefined
+  let terminalCwd: string | undefined
+  function startTerminal(cwd: string) {
+    terminalSession?.kill()
+    setTerminalSnapshot(undefined)
+    terminalCwd = cwd
+    terminalSession = spawnTerminalSession(props, cwd, { rows: terminalRows(), cols: TERMINAL_COLS }, {
+      onSnapshot: (snapshot) => setTerminalSnapshot(snapshot),
+      onExit: () => {
+        if (terminalCwd === cwd) terminalSession = undefined
+      },
+    })
+  }
+  function terminalWrite(data: string) {
+    terminalSession?.write(data)
+  }
+  createEffect(() => {
+    const cwd = focusedWorktreePath()
+    if (cwd && cwd !== terminalCwd) startTerminal(cwd)
+  })
+  createEffect(() => {
+    const rows = terminalRows()
+    terminalSession?.resize({ rows, cols: TERMINAL_COLS })
+  })
+
   const commandItems = createMemo(() => {
     const query = draft().trim()
     if (!query.startsWith("/")) return commands
@@ -344,6 +378,7 @@ export function App(props: AppProps) {
     for (const run of runs.values()) run.kill()
     runs.clear()
     runFlags.clear()
+    terminalSession?.kill()
   })
 
   useKeyboard((event) => {
@@ -1028,10 +1063,12 @@ export function App(props: AppProps) {
             status={sessionListStatus()}
             devMode={devMode()}
             busyId={worktreeBusy()}
-            newSession={startNewSession}
             focusAgent={focusAgent}
             loadWorktree={loadWorktree}
             archiveWorktree={archiveWorktreeAction}
+            terminalSnapshot={terminalSnapshot}
+            terminalWrite={terminalWrite}
+            terminalCwd={focusedWorktreePath()}
           />
           <box
             flexGrow={1}
@@ -1192,10 +1229,12 @@ function SessionSidebar(props: {
   status: string
   devMode: DevMode
   busyId?: string
-  newSession: () => void
   focusAgent: (key: string) => void
   loadWorktree: (worktree: Worktree) => void
   archiveWorktree: (worktree: Worktree) => void
+  terminalSnapshot: () => TerminalSnapshot | undefined
+  terminalWrite: (data: string) => void
+  terminalCwd: string
 }) {
   const agentForWorktree = (worktree: Worktree) =>
     props.agents.find((a) => (a.sessionId && a.sessionId === worktree.session_id) || (a.workspaceId && a.workspaceId === worktree.workspace_id))
@@ -1221,57 +1260,142 @@ function SessionSidebar(props: {
       paddingBottom={1}
       flexDirection="column"
     >
+      <box flexGrow={1} minHeight={0} flexDirection="column">
+        <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
+          <text fg={theme.cyan}>WORKTREES</text>
+          <box flexGrow={1} />
+          <text fg={theme.dim}>{sessionCount()}</text>
+        </box>
+        <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, SESSION_SIDEBAR_TEXT_WIDTH)}</text>}>
+          <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
+            <box flexDirection="column" gap={1}>
+              <For each={draftAgents()}>
+                {(slot) => (
+                  <DraftSessionRow
+                    slot={slot}
+                    focused={props.focusedKey === slot.key}
+                    focus={() => props.focusAgent(slot.key)}
+                  />
+                )}
+              </For>
+              <For each={props.worktrees}>
+                {(worktree) => {
+                  const agent = () => agentForWorktree(worktree)
+                  return (
+                    <WorktreeRow
+                      worktree={worktree}
+                      agent={agent()}
+                      active={props.currentSessionId === worktree.session_id || agent()?.key === props.focusedKey}
+                      busy={props.busyId === worktree.workspace_id}
+                      load={() => {
+                        const open = agent()
+                        if (open) props.focusAgent(open.key)
+                        else props.loadWorktree(worktree)
+                      }}
+                      archive={() => props.archiveWorktree(worktree)}
+                    />
+                  )
+                }}
+              </For>
+            </box>
+          </scrollbox>
+        </Show>
+      </box>
+      <box width="100%" height={1} border={["top"]} borderColor={theme.borderSoft} marginTop={1} marginBottom={1} />
+      <TerminalPanel
+        snapshot={props.terminalSnapshot}
+        write={props.terminalWrite}
+        cwd={props.terminalCwd}
+      />
+    </box>
+  )
+}
+
+function TerminalPanel(props: {
+  snapshot: () => TerminalSnapshot | undefined
+  write: (data: string) => void
+  cwd: string
+}) {
+  let input!: TextareaRenderable
+  // vt100 screen contents render as a fixed grid; strip trailing blank lines so
+  // the log hugs the bottom instead of padding out the panel.
+  const lines = () => {
+    const snapshot = props.snapshot()
+    if (!snapshot) return []
+    return snapshot.contents.replace(/\s+$/g, "").split("\n")
+  }
+  const running = () => props.snapshot()?.is_running !== false
+  const submit = () => {
+    props.write(`${input.plainText}\n`)
+    input.setText("")
+  }
+  return (
+    <box flexGrow={1} minHeight={0} flexDirection="column">
+      <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
+        <text fg={theme.cyan}>TERMINAL</text>
+        <box flexGrow={1} />
+        <text fg={running() ? theme.green : theme.dim}>{running() ? "live" : "exited"}</text>
+      </box>
+      <scrollbox
+        flexGrow={1}
+        minHeight={0}
+        stickyScroll={true}
+        stickyStart="bottom"
+        scrollAcceleration={scrollAcceleration}
+        verticalScrollbarOptions={{ visible: false }}
+      >
+        <box flexDirection="column">
+          <Show when={lines().length > 0} fallback={<text fg={theme.dim}>starting shell…</text>}>
+            <For each={lines()}>
+              {(line) => <text fg={theme.muted} wrapMode="none" selectable={true}>{line.length ? line : " "}</text>}
+            </For>
+          </Show>
+        </box>
+      </scrollbox>
       <box
         width="100%"
         flexDirection="row"
+        alignItems="center"
         gap={1}
         paddingLeft={1}
-        paddingRight={1}
-        backgroundColor={theme.panelSoft}
-        onMouseUp={props.newSession}
+        marginTop={1}
+        border={["top"]}
+        borderColor={theme.borderSoft}
+        onMouseUp={() => input.focus()}
       >
-        <text fg={theme.cyan} attributes={TextAttributes.BOLD}>+</text>
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>New {props.devMode === "worktree" ? "worktree" : "session"}</text>
+        <text fg={theme.cyan}>$</text>
+        <textarea
+          width="100%"
+          minHeight={1}
+          maxHeight={3}
+          placeholder="run a command…"
+          placeholderColor={theme.dim}
+          textColor={theme.text}
+          focusedTextColor={theme.text}
+          focusedBackgroundColor={theme.surface3}
+          cursorColor={theme.cyan}
+          selectionBg={theme.selectionBg}
+          selectionFg={theme.text}
+          onSubmit={submit}
+          onKeyDown={(event: { key?: string; name?: string; ctrl?: boolean; preventDefault(): void; stopPropagation?: () => void }) => {
+            const key = event.key ?? event.name
+            const normalized = key?.toLowerCase()
+            if (key === "Enter" || key === "enter" || key === "return") {
+              event.preventDefault()
+              event.stopPropagation?.()
+              submit()
+              return
+            }
+            if (Boolean(event.ctrl) && normalized === "d") {
+              event.preventDefault()
+              event.stopPropagation?.()
+              props.write("\x04")
+              return
+            }
+          }}
+          ref={(ref: TextareaRenderable) => (input = ref)}
+        />
       </box>
-      <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginTop={1} marginBottom={1}>
-        <text fg={theme.cyan}>WORKTREES</text>
-        <box flexGrow={1} />
-        <text fg={theme.dim}>{sessionCount()}</text>
-      </box>
-      <Show when={!props.status} fallback={<text fg={theme.red}>{truncateRight(props.status, SESSION_SIDEBAR_TEXT_WIDTH)}</text>}>
-        <scrollbox flexGrow={1} minHeight={0} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
-          <box flexDirection="column" gap={1}>
-            <For each={draftAgents()}>
-              {(slot) => (
-                <DraftSessionRow
-                  slot={slot}
-                  focused={props.focusedKey === slot.key}
-                  focus={() => props.focusAgent(slot.key)}
-                />
-              )}
-            </For>
-            <For each={props.worktrees}>
-              {(worktree) => {
-                const agent = () => agentForWorktree(worktree)
-                return (
-                  <WorktreeRow
-                    worktree={worktree}
-                    agent={agent()}
-                    active={props.currentSessionId === worktree.session_id || agent()?.key === props.focusedKey}
-                    busy={props.busyId === worktree.workspace_id}
-                    load={() => {
-                      const open = agent()
-                      if (open) props.focusAgent(open.key)
-                      else props.loadWorktree(worktree)
-                    }}
-                    archive={() => props.archiveWorktree(worktree)}
-                  />
-                )
-              }}
-            </For>
-          </box>
-        </scrollbox>
-      </Show>
     </box>
   )
 }
@@ -1503,7 +1627,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border={["top", "bottom"]}
+            border={["top"]}
             borderColor={isWrite() ? theme.borderStrong : theme.border}
             paddingLeft={1}
             paddingRight={1}
