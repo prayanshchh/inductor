@@ -134,7 +134,7 @@ impl SessionNamer for ModelBasedNamer {
             }
         }
 
-        let name = clean_title(&response_text);
+        let name = limit_words(&clean_title(&response_text), 3);
 
         // Fallback if the name is too long or empty
         if name.is_empty() || name.chars().count() > 50 {
@@ -150,9 +150,10 @@ fn title_prompt(prompt_content: &str) -> String {
         "You are a title generator. You output ONLY a thread title. Nothing else.\n\n\
 <task>\n\
 Generate a brief title that would help the user find this conversation later.\n\
-Your output must be a single line, no more than 50 characters, with no explanations or quotes.\n\
+Your output must be a single line of AT MOST 3 words, no more than 50 characters, with no explanations or quotes.\n\
 </task>\n\n\
 <rules>\n\
+- Use at most 3 words. Prefer 2-3 punchy words.\n\
 - Use the same language as the user request.\n\
 - Focus on the main topic or change the user needs.\n\
 - Never include tool names.\n\
@@ -179,6 +180,17 @@ fn clean_title(response: &str) -> String {
         .trim();
 
     line.to_string()
+}
+
+/// Keep at most `max_words` whitespace-separated words, dropping any trailing
+/// punctuation the model may have appended to the last kept word.
+fn limit_words(name: &str, max_words: usize) -> String {
+    name.split_whitespace()
+        .take(max_words)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(|c: char| c == ',' || c == '.' || c == ':' || c == ';')
+        .to_string()
 }
 
 /// Generate a session name based on the first few user prompts
@@ -215,6 +227,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "New Session");
+    }
+
+    #[test]
+    fn limit_words_caps_at_three_words() {
+        assert_eq!(
+            limit_words("Fix login refresh bug now", 3),
+            "Fix login refresh"
+        );
+        assert_eq!(limit_words("Parser bug", 3), "Parser bug");
+        assert_eq!(limit_words("Add  retry,", 3), "Add retry");
+        assert_eq!(limit_words("", 3), "");
     }
 
     #[test]

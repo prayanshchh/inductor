@@ -399,8 +399,12 @@ mod tests {
 
     #[test]
     fn flags_global_install_as_outside_write() {
-        assert!(classify(&bash("cargo install --path crates/agent --bin inductor --force"))
-            .contains(&RiskFlag::WriteOutsideWorkspace));
+        assert!(
+            classify(&bash(
+                "cargo install --path crates/agent --bin inductor --force"
+            ))
+            .contains(&RiskFlag::WriteOutsideWorkspace)
+        );
     }
 
     #[test]

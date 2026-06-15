@@ -101,12 +101,12 @@ const TOOL_CALL_CLOSE: &str = "</inductor_tool_call>";
 /// Inductor text envelope and renders tool docs from the shared tool registry.
 fn generic_tools_preamble() -> String {
     format!(
-        "You are an Inductor coding agent operating inside a sandboxed workspace.\n\
+        "You are an Inductor coding agent operating on the user's machine.\n\
 You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your reply:\n\n\
 <inductor_tool_call>{{\"name\":\"<tool>\",\"input\":{{ ... }}}}</inductor_tool_call>\n\n\
 Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
-- Paths must be workspace-relative. Absolute paths and `..` escapes are rejected.\n\
+- Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - Prefer edit_file or multi_edit over write_file when changing existing files.\n\
 - Exact edit tools reject binary files, stale expected_hash values, and non-unique matches.\n\
 - Emit at most one envelope per reply. After a tool result is returned, continue.\n\
@@ -747,7 +747,10 @@ async fn run_local_tool_call(
         });
     }
 
-    if outside_path.is_some() || permissions.should_request(config.approval_policy, &risk_flags, call) {
+    if !matches!(config.approval_policy, ApprovalPolicy::Never)
+        && (outside_path.is_some()
+            || permissions.should_request(config.approval_policy, &risk_flags, call))
+    {
         let reason = risk_reason(&call.name, &risk_flags, outside_path.as_deref());
         let pending = permissions.begin_request(
             call,

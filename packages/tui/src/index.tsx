@@ -10,6 +10,8 @@ type Args = {
   model?: string
   approval: string
   repoRoot: string
+  appDb?: string
+  workspaceOnly?: boolean
 }
 
 const args = parseArgs(process.argv.slice(2))
@@ -95,7 +97,9 @@ function parseArgs(raw: string[]): Args {
     workspace: values.get("workspace") ?? process.cwd(),
     provider: values.get("provider") ?? "claude",
     model: values.get("model") || undefined,
-    approval: values.get("approval") ?? "mutating",
+    approval: values.get("approval") ?? "never",
     repoRoot: values.get("repo-root") ?? process.cwd(),
+    appDb: values.get("app-db") || undefined,
+    workspaceOnly: values.get("workspace-only") === "true",
   }
 }
