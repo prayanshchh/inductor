@@ -859,6 +859,7 @@ async fn run_opentui_command(
             tui_dir.display()
         ));
     }
+    ensure_opentui_dependencies(&repo_root, &tui_dir)?;
 
     let backend_bin = std::env::current_exe()
         .map_err(|err| format!("could not resolve current executable: {err}"))?;
@@ -904,6 +905,63 @@ async fn run_opentui_command(
     } else {
         Err(format!("OpenTUI frontend exited with {status}"))
     }
+}
+
+fn ensure_opentui_dependencies(repo_root: &Path, tui_dir: &Path) -> Result<(), String> {
+    if opentui_preload_exists(repo_root, tui_dir) {
+        return Ok(());
+    }
+
+    eprintln!("OpenTUI dependencies are missing; running `bun install --frozen-lockfile`...");
+    let status = std::process::Command::new("bun")
+        .arg("install")
+        .arg("--frozen-lockfile")
+        .current_dir(repo_root)
+        .status()
+        .map_err(|err| format!("failed to run bun install for OpenTUI dependencies: {err}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "OpenTUI dependency install failed with {status}; run `bun install` from {}",
+            repo_root.display()
+        ));
+    }
+
+    if opentui_preload_exists(repo_root, tui_dir) {
+        Ok(())
+    } else {
+        Err(format!(
+            "OpenTUI dependency install completed but @opentui/solid/preload is still missing; run `bun install` from {}",
+            repo_root.display()
+        ))
+    }
+}
+
+fn opentui_preload_exists(repo_root: &Path, tui_dir: &Path) -> bool {
+    let package_roots = [
+        repo_root
+            .join("node_modules")
+            .join("@opentui")
+            .join("solid"),
+        repo_root
+            .join("node_modules")
+            .join(".bun")
+            .join("node_modules")
+            .join("@opentui")
+            .join("solid"),
+        tui_dir.join("node_modules").join("@opentui").join("solid"),
+    ];
+
+    package_roots.iter().any(|package_root| {
+        [
+            package_root.join("scripts").join("preload.ts"),
+            package_root.join("scripts").join("preload.js"),
+            package_root.join("preload.ts"),
+            package_root.join("preload.js"),
+        ]
+        .iter()
+        .any(|path| path.exists())
+    })
 }
 
 /// Locate the inductor repository root that ships the OpenTUI frontend.
@@ -2398,6 +2456,51 @@ mod tests {
         assert_eq!(value["images"][0]["mime_type"], "image/png");
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn opentui_preload_detection_checks_workspace_and_package_node_modules() {
+        let repo = temp_workspace("opentui-preload");
+        let tui = repo.join("packages").join("tui");
+        std::fs::create_dir_all(&tui).unwrap();
+
+        assert!(!opentui_preload_exists(&repo, &tui));
+
+        let root_preload = repo
+            .join("node_modules")
+            .join("@opentui")
+            .join("solid")
+            .join("scripts")
+            .join("preload.ts");
+        std::fs::create_dir_all(root_preload.parent().unwrap()).unwrap();
+        std::fs::write(&root_preload, "").unwrap();
+        assert!(opentui_preload_exists(&repo, &tui));
+
+        std::fs::remove_file(&root_preload).unwrap();
+        let bun_preload = repo
+            .join("node_modules")
+            .join(".bun")
+            .join("node_modules")
+            .join("@opentui")
+            .join("solid")
+            .join("scripts")
+            .join("preload.ts");
+        std::fs::create_dir_all(bun_preload.parent().unwrap()).unwrap();
+        std::fs::write(&bun_preload, "").unwrap();
+        assert!(opentui_preload_exists(&repo, &tui));
+
+        std::fs::remove_file(&bun_preload).unwrap();
+        let package_preload = tui
+            .join("node_modules")
+            .join("@opentui")
+            .join("solid")
+            .join("scripts")
+            .join("preload.ts");
+        std::fs::create_dir_all(package_preload.parent().unwrap()).unwrap();
+        std::fs::write(&package_preload, "").unwrap();
+        assert!(opentui_preload_exists(&repo, &tui));
+
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

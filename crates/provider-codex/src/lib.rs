@@ -95,25 +95,58 @@ fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
 }
 
 fn codex_message(message: &ModelMessage) -> Value {
-    // The Responses API types content by author: assistant-authored turns use
-    // `output_text`, while user/system/developer turns use `input_text`. Sending
-    // `input_text` on an assistant message is rejected with HTTP 400.
-    let is_assistant = message.role.eq_ignore_ascii_case("assistant");
-    let content = message
-        .parts
+    let (role, parts) = codex_message_role_and_parts(message);
+    let is_assistant = role == "assistant";
+    let content = parts
         .iter()
         .map(|part| codex_part(part, is_assistant))
         .collect::<Vec<_>>();
     json!({
-        "role": message.role,
+        "role": role,
         "content": content,
     })
 }
 
+fn codex_message_role_and_parts(message: &ModelMessage) -> (&'static str, Vec<MessagePart>) {
+    match message.role.to_ascii_lowercase().as_str() {
+        "assistant" => ("assistant", message.parts.clone()),
+        "system" => ("system", message.parts.clone()),
+        "developer" => ("developer", message.parts.clone()),
+        "user" => ("user", message.parts.clone()),
+        "tool" => ("user", prefix_text_parts("Tool", &message.parts)),
+        _ => ("user", prefix_text_parts(&message.role, &message.parts)),
+    }
+}
+
+fn prefix_text_parts(label: &str, parts: &[MessagePart]) -> Vec<MessagePart> {
+    let prefix = format!("{label}:\n");
+    let mut prefixed = Vec::with_capacity(parts.len().max(1));
+    match parts.split_first() {
+        Some((MessagePart::Text { text }, rest)) => {
+            prefixed.push(MessagePart::Text {
+                text: format!("{prefix}{text}"),
+            });
+            prefixed.extend(rest.iter().cloned());
+        }
+        Some((first, rest)) => {
+            prefixed.push(MessagePart::Text { text: prefix });
+            prefixed.push(first.clone());
+            prefixed.extend(rest.iter().cloned());
+        }
+        None => prefixed.push(MessagePart::Text { text: prefix }),
+    }
+    prefixed
+}
+
 fn codex_part(part: &MessagePart, is_assistant: bool) -> Value {
     match part {
+        MessagePart::Text { text } if is_assistant => json!({
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        }),
         MessagePart::Text { text } => json!({
-            "type": if is_assistant { "output_text" } else { "input_text" },
+            "type": "input_text",
             "text": text,
         }),
         MessagePart::Image { image } => json!({
@@ -609,22 +642,58 @@ mod tests {
     }
 
     #[test]
-    fn assistant_history_uses_output_text() {
+    fn request_body_converts_tool_messages_to_valid_codex_input() {
         let provider = CodexProvider::with_base_url("https://example.test").unwrap();
         let mut request = text_request("legacy prompt");
         request.messages = vec![
-            ModelMessage::text("user", "hello"),
-            ModelMessage::text("assistant", "hi there"),
+            ModelMessage::text("assistant", "tool call requested"),
+            ModelMessage::text("tool", "read_file result:\nhello"),
         ];
 
         let body = provider.request_body(&request);
 
-        // User-authored content stays `input_text`; assistant turns must be
-        // `output_text` or the Responses API rejects the request with HTTP 400.
+        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(body["input"][0]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][0]["content"][0]["annotations"], json!([]));
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "Tool:\nread_file result:\nhello"
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["role"] != "tool")
+        );
+    }
+
+    #[test]
+    fn request_body_preserves_supported_codex_roles() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        let mut request = text_request("legacy prompt");
+        request.messages = vec![
+            ModelMessage::text("system", "system context"),
+            ModelMessage::text("developer", "developer context"),
+            ModelMessage::text("user", "user prompt"),
+            ModelMessage::text("assistant", "assistant answer"),
+        ];
+
+        let body = provider.request_body(&request);
+        let roles = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(roles, vec!["system", "developer", "user", "assistant"]);
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(body["input"][1]["role"], "assistant");
-        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
-        assert_eq!(body["input"][1]["content"][0]["text"], "hi there");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][3]["content"][0]["type"], "output_text");
     }
 
     #[test]
