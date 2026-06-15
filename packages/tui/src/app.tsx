@@ -194,8 +194,6 @@ function savePromptHistoryFile(filePath: string, entries: string[]) {
 export function App(props: AppProps) {
   let input!: TextareaRenderable
   let replacingPrompt = false
-  let stoppingRun = false
-  let exitAfterStop = false
   let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
   const startedAt = Date.now()
@@ -316,22 +314,24 @@ export function App(props: AppProps) {
   })
 
   const timer = setInterval(() => setNow(Date.now()), 1000)
-  const composerNotice = createMemo(() => notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission))
+  const composerNotice = createMemo(() => {
+    const state = fstate()
+    return notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission)
+  })
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
-    void refreshSessions()
+    void refreshWorktrees()
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
     clearInterval(timer)
     clearStopArmTimer()
-    clearForceStopTimer()
-    if (currentRun) {
-      const run = currentRun
-      currentRun = undefined
-      run.kill()
-      void run.exited.catch(() => undefined)
+    for (const flags of runFlags.values()) {
+      if (flags.forceTimer) clearTimeout(flags.forceTimer)
     }
+    for (const run of runs.values()) run.kill()
+    runs.clear()
+    runFlags.clear()
   })
 
   useKeyboard((event) => {
@@ -346,7 +346,7 @@ export function App(props: AppProps) {
     }
     if (event.eventType === "release") return
     if (event.repeated) return
-    if (state.pendingPermission && handlePermissionKey(event)) {
+    if (fstate().pendingPermission && handlePermissionKey(event)) {
       event.preventDefault()
       event.stopPropagation()
       return
@@ -416,17 +416,20 @@ export function App(props: AppProps) {
         setNotice({ text: truncateRight(lines.replace(/\s+/g, " "), 120), tone: "muted" })
       },
       onExit(code) {
-        clearForceStopTimer()
-        currentRun = undefined
-        if (exitAfterStop) {
+        if (flags.forceTimer) {
+          clearTimeout(flags.forceTimer)
+          flags.forceTimer = undefined
+        }
+        runs.delete(key)
+        if (flags.exitAfter) {
           props.exitApp()
           return
         }
-        if (stoppingRun) {
-          stoppingRun = false
+        if (flags.stopping) {
+          flags.stopping = false
           setNotice({ text: "stopped agent", tone: "red" })
-          setState(produce((next) => Object.assign(next, markAgentStopped(next))))
-          void refreshSessions()
+          updateAgentState(key, (next) => markAgentStopped(next))
+          void refreshWorktrees()
           return
         }
         updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
@@ -944,11 +947,7 @@ export function App(props: AppProps) {
     flags.forceTimer = setTimeout(() => {
       if (!flags.stopping) return
       run.kill()
-      if (exitAfterStop) {
-        void run.exited
-          .catch(() => undefined)
-          .finally(() => props.exitApp())
-      }
+      if (flags.exitAfter) props.exitApp()
     }, 5000)
   }
 
@@ -979,7 +978,7 @@ export function App(props: AppProps) {
           toggleDevMode={toggleDevMode}
           openPalette={openPalette}
         />
-        <box flexGrow={1} minHeight={0} flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+        <box flexGrow={1} minHeight={0} overflow="hidden" flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
           <SessionSidebar
             agents={store.agents}
             worktrees={worktrees()}
@@ -1435,8 +1434,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
         width="100%"
         flexDirection="column"
         backgroundColor={theme.row}
-        border
-        borderStyle="rounded"
+        border={["top", "bottom"]}
         borderColor={isOpen() ? theme.borderStrong : theme.borderSoft}
       >
         <box
@@ -1463,8 +1461,7 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border
-            borderStyle="rounded"
+            border={["top", "bottom"]}
             borderColor={isWrite() ? theme.borderStrong : theme.border}
             paddingLeft={1}
             paddingRight={1}
@@ -1536,43 +1533,31 @@ function DiffWithHunkReview(props: { diff: string; path?: string }) {
   const viewerHeight = createMemo(() => diffViewerHeight(props.diff))
   return (
     <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
-      <scrollbox
+      <diff
+        diff={props.diff}
+        view="split"
+        syncScroll={true}
+        filetype={filetype(props.path)}
         width="100%"
         height="100%"
         minHeight={0}
         overflow="hidden"
-        scrollX={true}
-        scrollY={true}
-        stickyScroll={false}
-        scrollAcceleration={scrollAcceleration}
-        viewportCulling={true}
-        viewportOptions={{ overflow: "hidden" }}
-        contentOptions={{ overflow: "hidden" }}
-        verticalScrollbarOptions={{ visible: false }}
-        horizontalScrollbarOptions={{ visible: false }}
-      >
-        <diff
-          diff={props.diff}
-          view="split"
-          filetype={filetype(props.path)}
-          width="100%"
-          wrapMode="word"
-          showLineNumbers={true}
-          syntaxStyle={syntaxStyle}
-          fg={theme.text}
-          selectionBg={theme.selectionBg}
-          selectionFg={theme.text}
-          addedBg={theme.addedBg}
-          removedBg={theme.removedBg}
-          contextBg={theme.surface}
-          addedSignColor={theme.green}
-          removedSignColor={theme.red}
-          lineNumberFg={theme.muted}
-          lineNumberBg={theme.surface}
-          addedLineNumberBg={theme.addedBg}
-          removedLineNumberBg={theme.removedBg}
-        />
-      </scrollbox>
+        wrapMode="word"
+        showLineNumbers={true}
+        syntaxStyle={syntaxStyle}
+        fg={theme.text}
+        selectionBg={theme.selectionBg}
+        selectionFg={theme.text}
+        addedBg={theme.addedBg}
+        removedBg={theme.removedBg}
+        contextBg={theme.surface}
+        addedSignColor={theme.green}
+        removedSignColor={theme.red}
+        lineNumberFg={theme.muted}
+        lineNumberBg={theme.surface}
+        addedLineNumberBg={theme.addedBg}
+        removedLineNumberBg={theme.removedBg}
+      />
     </box>
   )
 }
@@ -1622,8 +1607,7 @@ function TimelineShell(props: { marker: string; color: string; label: string; ch
         flexDirection="row"
         gap={2}
         backgroundColor={theme.row}
-        border
-        borderStyle="rounded"
+        border={["top", "bottom"]}
         borderColor={theme.borderSoft}
         paddingLeft={1}
         paddingRight={1}
@@ -1664,7 +1648,7 @@ function PermissionTimelineItem(props: {
           fallback={<code content={props.request.input} filetype="json" syntaxStyle={syntaxStyle} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text} />}
         >
           {(patch) => (
-            <box backgroundColor={theme.panelSoft} border borderStyle="rounded" borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+            <box backgroundColor={theme.panelSoft} border={["top", "bottom"]} borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
               <DiffWithHunkReview diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())} path={props.request.filepath} />
             </box>
           )}
