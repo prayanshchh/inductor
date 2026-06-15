@@ -1133,6 +1133,12 @@ async fn run_harness_command(
     // worktree registry lives in the app DB, so worktree mode needs one — fall
     // back to a default path when the caller didn't supply `--app-db`.
     let mut workspace = workspace;
+    // Remember the workspace Inductor was opened in before it is swapped for a
+    // worktree path below. Pasted/dropped images are written by the TUI into
+    // this source workspace's `.inductor/attachments/`, which is untracked and
+    // therefore absent from a freshly created worktree — keep it so prompt
+    // image mentions can be sourced from it.
+    let source_workspace = workspace.clone();
     let mut app_db = app_db;
     let mut forced_workspace_id = requested_workspace_id;
     let mut forced_state_db: Option<PathBuf> = None;
@@ -1333,7 +1339,7 @@ async fn run_harness_command(
     let approver: &dyn Approver = if yes { &auto } else { &channel_approver };
 
     let approval_policy_dbg = config.approval_policy;
-    let prompt = attach_prompt_image_mentions(&workspace_path, &prompt);
+    let prompt = attach_prompt_image_mentions(&workspace_path, &source_workspace, &prompt);
 
     let mut stream = run_turn(
         provider_plugin.as_ref(),
@@ -1660,7 +1666,7 @@ fn default_provider_model(provider: ProviderKind) -> &'static str {
     }
 }
 
-fn attach_prompt_image_mentions(workspace: &Path, prompt: &str) -> String {
+fn attach_prompt_image_mentions(workspace: &Path, source_workspace: &Path, prompt: &str) -> String {
     const PREFIX: &str = "__MULTIMODAL_MESSAGE__:";
     if prompt.starts_with(PREFIX) {
         return prompt.to_string();
@@ -1668,6 +1674,14 @@ fn attach_prompt_image_mentions(workspace: &Path, prompt: &str) -> String {
 
     let mut images = Vec::new();
     for rel in image_mentions(prompt) {
+        // The TUI writes pasted/dropped images into the source workspace. When
+        // the agent runs in a worktree, that untracked file is missing here, so
+        // mirror it into the worktree at the same relative path. This makes both
+        // the multimodal payload below and any later `read_file` tool call on
+        // the mentioned path resolve.
+        if workspace != source_workspace {
+            ensure_attachment_in_workspace(workspace, source_workspace, &rel);
+        }
         if let Some(image) = read_prompt_image(workspace, &rel) {
             images.push(image);
         }
@@ -1749,6 +1763,36 @@ fn read_prompt_image(workspace: &Path, rel: &str) -> Option<ImageAttachment> {
         height: dimensions.map(|(_, height)| height),
         file_size: bytes.len(),
     })
+}
+
+/// Copy a relative attachment from the source workspace into `workspace` when
+/// it is missing there. Used so worktree runs can see images the TUI wrote into
+/// the source checkout. Rejects absolute paths and `..` traversal, and never
+/// overwrites an existing file.
+fn ensure_attachment_in_workspace(workspace: &Path, source_workspace: &Path, rel: &str) {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return;
+    }
+
+    let dest = workspace.join(rel_path);
+    if dest.exists() {
+        return;
+    }
+    let src = source_workspace.join(rel_path);
+    if !src.exists() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::copy(&src, &dest);
 }
 
 fn is_image_path(path: &str) -> bool {
@@ -2317,7 +2361,7 @@ mod tests {
         let workspace = temp_workspace("image-wrap");
         std::fs::write(workspace.join("screen.png"), b"fake image bytes").unwrap();
 
-        let prompt = attach_prompt_image_mentions(&workspace, "describe @screen.png");
+        let prompt = attach_prompt_image_mentions(&workspace, &workspace, "describe @screen.png");
         let payload = prompt
             .strip_prefix("__MULTIMODAL_MESSAGE__:")
             .expect("prompt should be wrapped");
@@ -2333,6 +2377,44 @@ mod tests {
         assert_eq!(value["images"][0]["mime_type"], "image/png");
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn prompt_image_from_source_workspace_is_mirrored_into_worktree() {
+        let source = temp_workspace("image-source");
+        let worktree = temp_workspace("image-worktree");
+        // The TUI wrote the pasted image into the source workspace only; the
+        // freshly created worktree does not contain the untracked attachment.
+        std::fs::create_dir_all(source.join(".inductor/attachments")).unwrap();
+        std::fs::write(
+            source.join(".inductor/attachments/pasted-image-1.png"),
+            b"fake image bytes",
+        )
+        .unwrap();
+
+        let prompt = attach_prompt_image_mentions(
+            &worktree,
+            &source,
+            "look @.inductor/attachments/pasted-image-1.png",
+        );
+        let payload = prompt
+            .strip_prefix("__MULTIMODAL_MESSAGE__:")
+            .expect("prompt should be wrapped with the image payload");
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            value["images"][0]["path"],
+            ".inductor/attachments/pasted-image-1.png"
+        );
+        // The attachment must now exist in the worktree too so a later
+        // `read_file` on the mentioned path resolves there.
+        assert!(
+            worktree
+                .join(".inductor/attachments/pasted-image-1.png")
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(worktree);
     }
 
     #[test]
