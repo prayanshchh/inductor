@@ -266,7 +266,6 @@ export function App(props: AppProps) {
   const mode = () => focusedAgent().effort
   const setMode = (value: EffortValue) => patchFocused({ effort: value })
   const devMode = () => focusedAgent().devMode
-  const setDevMode = (value: DevMode) => patchFocused({ devMode: value })
   const approval = () => focusedAgent().approval
   const setApproval = (value: string) => patchFocused({ approval: value })
   const workspaceOnly = () => focusedAgent().workspaceOnly
@@ -846,16 +845,6 @@ export function App(props: AppProps) {
     queueMicrotask(() => input?.focus())
   }
 
-  function toggleDevMode() {
-    if (sessionId()) {
-      setNotice({ text: "Dev mode applies to new sessions — start one with /new", tone: "cyan" })
-      return
-    }
-    const next = devMode() === "worktree" ? "in-place" : "worktree"
-    setDevMode(next)
-    setNotice({ text: next === "worktree" ? "new sessions run in an isolated worktree" : "new sessions edit the workspace in place", tone: "muted" })
-  }
-
   async function archiveWorktreeAction(worktree: Worktree) {
     const open = agentForWorktree(worktree)
     if (open?.state.running) {
@@ -1084,9 +1073,7 @@ export function App(props: AppProps) {
           workspace={props.workspace}
           running={fstate().running}
           elapsed={formatElapsed(now() - startedAt)}
-          devMode={devMode()}
           branch={activeBranch()}
-          toggleDevMode={toggleDevMode}
           openPalette={openPalette}
         />
         <box flexGrow={1} minHeight={0} overflow="hidden" flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
@@ -1191,9 +1178,7 @@ function TopRail(props: {
   workspace: string
   running: boolean
   elapsed: string
-  devMode: DevMode
   branch: string
-  toggleDevMode: () => void
   openPalette: (kind: PaletteKind) => void
 }) {
   return (
@@ -1210,7 +1195,6 @@ function TopRail(props: {
       <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
       <TopMetric width={34} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 20)} color={theme.blue} onClick={() => props.openPalette("models")} />
       <TopMetric width={32} label="session" value={truncateRight(props.title, 18)} color={theme.cyan} />
-      <TopMetric width={22} label="dev" value={props.devMode === "worktree" ? "worktree" : "in-place"} color={props.devMode === "worktree" ? theme.green : theme.yellow} onClick={props.toggleDevMode} />
       <TopMetric width={28} label="branch" value={truncateRight(props.branch, 18)} color={theme.cyan} />
       <box flexGrow={1} height="100%" />
       <box width={18} height="100%" flexDirection="row" alignItems="center" justifyContent="center">
