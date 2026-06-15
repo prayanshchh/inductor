@@ -512,6 +512,22 @@ enum TerminalCommand {
         #[arg(long)]
         workspace: PathBuf,
     },
+    /// Spawn a persistent interactive PTY and stream JSON snapshots over stdio.
+    ///
+    /// Reads newline-delimited control messages on stdin
+    /// (`{"type":"input","data":"..."}` and `{"type":"resize","rows":N,"cols":M}`)
+    /// and writes `{"type":"snapshot",...}` lines on stdout whenever the screen
+    /// changes. Exits when the shell exits.
+    Serve {
+        #[arg(long)]
+        workspace: PathBuf,
+
+        #[arg(long, default_value_t = 30)]
+        rows: u16,
+
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1903,8 +1919,110 @@ async fn run_terminal_command(command: TerminalCommand) -> Result<(), String> {
             let exit_code = manager.kill(id).map_err(|err| err.to_string())?;
             println!("killed: {exit_code:?}");
         }
+        TerminalCommand::Serve {
+            workspace,
+            rows,
+            cols,
+        } => {
+            run_terminal_serve(workspace, rows, cols)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Drive a long-lived interactive PTY, forwarding stdin control messages into
+/// the shell and emitting screen snapshots on stdout. Used by the TUI's
+/// embedded terminal panel.
+fn run_terminal_serve(workspace: PathBuf, rows: u16, cols: u16) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    let manager = Arc::new(Mutex::new(PtyManager::new()));
+    let id = {
+        let mut guard = manager
+            .lock()
+            .map_err(|_| "terminal manager lock poisoned".to_string())?;
+        let mut request = SpawnTerminalRequest::new(workspace);
+        request.size = TerminalSize::new(rows, cols);
+        guard.spawn(request).map_err(|err| err.to_string())?
+    };
+
+    // Stdin reader thread: forward input/resize control messages to the PTY.
+    let reader_manager = manager.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            match value.get("type").and_then(|v| v.as_str()) {
+                Some("input") => {
+                    if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                        if let Ok(mut guard) = reader_manager.lock() {
+                            let _ = guard.write(id, data);
+                        }
+                    }
+                }
+                Some("resize") => {
+                    let new_rows = value.get("rows").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                    let new_cols = value.get("cols").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                    if new_rows > 0 && new_cols > 0 {
+                        if let Ok(mut guard) = reader_manager.lock() {
+                            let _ = guard.resize(id, TerminalSize::new(new_rows, new_cols));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Main loop: emit a snapshot whenever the screen contents or cursor change.
+    let mut last_contents = String::new();
+    let mut last_cursor = (u16::MAX, u16::MAX);
+    let stdout = std::io::stdout();
+    loop {
+        let snapshot = {
+            let mut guard = manager
+                .lock()
+                .map_err(|_| "terminal manager lock poisoned".to_string())?;
+            let _ = guard.try_wait(id);
+            guard.snapshot(id).map_err(|err| err.to_string())?
+        };
+        let cursor = (snapshot.cursor_row, snapshot.cursor_col);
+        if snapshot.contents != last_contents || cursor != last_cursor || !snapshot.is_running {
+            last_contents = snapshot.contents.clone();
+            last_cursor = cursor;
+            let payload = json!({
+                "type": "snapshot",
+                "contents": snapshot.contents,
+                "cursor_row": snapshot.cursor_row,
+                "cursor_col": snapshot.cursor_col,
+                "rows": snapshot.size.rows,
+                "cols": snapshot.size.cols,
+                "is_running": snapshot.is_running,
+            });
+            let line = serde_json::to_string(&payload).map_err(|err| err.to_string())?;
+            let mut handle = stdout.lock();
+            let _ = writeln!(handle, "{line}");
+            let _ = handle.flush();
+        }
+        if !snapshot.is_running {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    if let Ok(mut guard) = manager.lock() {
+        let _ = guard.kill(id);
+    }
     Ok(())
 }
 
