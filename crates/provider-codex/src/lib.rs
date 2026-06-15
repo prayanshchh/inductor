@@ -140,8 +140,13 @@ fn prefix_text_parts(label: &str, parts: &[MessagePart]) -> Vec<MessagePart> {
 
 fn codex_part(part: &MessagePart, is_assistant: bool) -> Value {
     match part {
+        MessagePart::Text { text } if is_assistant => json!({
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        }),
         MessagePart::Text { text } => json!({
-            "type": if is_assistant { "output_text" } else { "input_text" },
+            "type": "input_text",
             "text": text,
         }),
         MessagePart::Image { image } => json!({
@@ -648,7 +653,10 @@ mod tests {
         let body = provider.request_body(&request);
 
         assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(body["input"][0]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][0]["content"][0]["annotations"], json!([]));
         assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(
             body["input"][1]["content"][0]["text"],
             "Tool:\nread_file result:\nhello"
@@ -682,6 +690,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(roles, vec!["system", "developer", "user", "assistant"]);
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][3]["content"][0]["type"], "output_text");
     }
 
     #[test]
