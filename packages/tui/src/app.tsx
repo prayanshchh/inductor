@@ -19,6 +19,7 @@ import {
 import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
+import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
   findActiveMention,
@@ -35,7 +36,10 @@ import {
 } from "./mentions"
 import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
 
-export type AppProps = BackendOptions
+export type AppProps = BackendOptions & {
+  exitApp(): void
+  registerCtrlCHandler(handler: (() => void) | undefined): void
+}
 
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
 
@@ -72,13 +76,13 @@ type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
 
 const theme = {
-  bg: "#050606",
-  surface: "#070808",
-  surface2: "#101111",
-  surface3: "#101111",
-  panel: "#081012",
-  panelSoft: "#111313",
-  row: "#101415",
+  bg: "transparent",
+  surface: "transparent",
+  surface2: "transparent",
+  surface3: "transparent",
+  panel: "transparent",
+  panelSoft: "transparent",
+  row: "transparent",
   text: "#e8e8e8",
   muted: "#8b9298",
   dim: "#5a6268",
@@ -98,10 +102,10 @@ const theme = {
   addedBg: "#142f25",
   removedBg: "#34191b",
   selectionBg: "#3b4d6c",
-  palette: "#101819",
+  palette: "transparent",
   paletteSelected: "#12303a",
   progress: "#24c8ff",
-  progressTrack: "#343b3f",
+  progressTrack: "transparent",
 }
 
 const SESSION_SIDEBAR_WIDTH = 46
@@ -110,6 +114,8 @@ const TELEMETRY_SIDEBAR_WIDTH = 32
 const TELEMETRY_PROGRESS_WIDTH = 24
 const TELEMETRY_FILE_WIDTH = 22
 const TELEMETRY_FOOTER_WIDTH = 24
+const DIFF_VIEWER_MIN_HEIGHT = 8
+const DIFF_VIEWER_MAX_HEIGHT = 28
 
 const commands: Command[] = [
   { name: "/agents", description: "Switch agent", action: "agents" },
@@ -188,6 +194,9 @@ function savePromptHistoryFile(filePath: string, entries: string[]) {
 export function App(props: AppProps) {
   let input!: TextareaRenderable
   let replacingPrompt = false
+  let stoppingRun = false
+  let exitAfterStop = false
+  let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
   const startedAt = Date.now()
 
@@ -307,23 +316,37 @@ export function App(props: AppProps) {
   })
 
   const timer = setInterval(() => setNow(Date.now()), 1000)
-  const composerNotice = createMemo(() => notice() ?? defaultComposerNotice(fstate().status, fstate().running, fstate().pendingPermission))
-  onMount(() => void refreshWorktrees())
+  const composerNotice = createMemo(() => notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission))
+  onMount(() => {
+    props.registerCtrlCHandler(handleCtrlC)
+    void refreshSessions()
+  })
   onCleanup(() => {
+    props.registerCtrlCHandler(undefined)
     clearInterval(timer)
     clearStopArmTimer()
-    for (const flags of runFlags.values()) if (flags.forceTimer) clearTimeout(flags.forceTimer)
+    clearForceStopTimer()
+    if (currentRun) {
+      const run = currentRun
+      currentRun = undefined
+      run.kill()
+      void run.exited.catch(() => undefined)
+    }
   })
 
   useKeyboard((event) => {
-    if (event.eventType === "release" || event.repeated) return
     if (isCtrlC(event)) {
+      const now = Date.now()
+      if (event.eventType === "release" && now - lastCtrlCAt < 200) return
+      lastCtrlCAt = now
       event.preventDefault()
       event.stopPropagation()
       handleCtrlC()
       return
     }
-    if (fstate().pendingPermission && handlePermissionKey(event)) {
+    if (event.eventType === "release") return
+    if (event.repeated) return
+    if (state.pendingPermission && handlePermissionKey(event)) {
       event.preventDefault()
       event.stopPropagation()
       return
@@ -393,17 +416,17 @@ export function App(props: AppProps) {
         setNotice({ text: truncateRight(lines.replace(/\s+/g, " "), 120), tone: "muted" })
       },
       onExit(code) {
-        if (flags.forceTimer) {
-          clearTimeout(flags.forceTimer)
-          flags.forceTimer = undefined
+        clearForceStopTimer()
+        currentRun = undefined
+        if (exitAfterStop) {
+          props.exitApp()
+          return
         }
-        runs.delete(key)
-        if (flags.exitAfter) process.exit(0)
-        if (flags.stopping) {
-          flags.stopping = false
-          if (store.focusedKey === key) setNotice({ text: "stopped agent", tone: "red" })
-          updateAgentState(key, (next) => markAgentStopped(next))
-          void refreshWorktrees()
+        if (stoppingRun) {
+          stoppingRun = false
+          setNotice({ text: "stopped agent", tone: "red" })
+          setState(produce((next) => Object.assign(next, markAgentStopped(next))))
+          void refreshSessions()
           return
         }
         updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
@@ -678,7 +701,10 @@ export function App(props: AppProps) {
   }
 
   function runCommand(command: Command) {
-    if (command.action === "exit") process.exit(0)
+    if (command.action === "exit") {
+      props.exitApp()
+      return
+    }
     recordHistory(command.name)
     if (command.action === "new" || command.action === "clear") {
       startNewSession()
@@ -872,7 +898,7 @@ export function App(props: AppProps) {
       if (focusedRunning) {
         stopCurrentRun(true)
       } else {
-        process.exit(0)
+        props.exitApp()
       }
       return
     }
@@ -900,7 +926,7 @@ export function App(props: AppProps) {
     const key = store.focusedKey
     const run = runs.get(key)
     if (!run) {
-      if (quitAfterStop) process.exit(0)
+      if (quitAfterStop) props.exitApp()
       setNotice({ text: "No running agent to stop", tone: "muted" })
       setStopArmed(undefined)
       return
@@ -918,7 +944,11 @@ export function App(props: AppProps) {
     flags.forceTimer = setTimeout(() => {
       if (!flags.stopping) return
       run.kill()
-      if (flags.exitAfter) process.exit(0)
+      if (exitAfterStop) {
+        void run.exited
+          .catch(() => undefined)
+          .finally(() => props.exitApp())
+      }
     }, 5000)
   }
 
@@ -933,7 +963,7 @@ export function App(props: AppProps) {
   }
 
   return (
-    <box width="100%" height="100%" backgroundColor="#000000" paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
+    <box width="100%" height="100%" backgroundColor={theme.bg} paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
       <box width="100%" height="100%" backgroundColor={theme.bg} flexDirection="column" border borderStyle="rounded" borderColor={theme.border}>
         <TopRail
           mode={mode()}
@@ -969,6 +999,7 @@ export function App(props: AppProps) {
             height="100%"
             flexDirection="column"
             backgroundColor={theme.panel}
+            overflow="hidden"
             border
             borderStyle="rounded"
             borderColor={theme.border}
@@ -977,9 +1008,13 @@ export function App(props: AppProps) {
               <scrollbox
                 flexGrow={1}
                 minHeight={0}
+                overflow="hidden"
                 stickyScroll={true}
                 stickyStart="bottom"
                 scrollAcceleration={scrollAcceleration}
+                viewportCulling={true}
+                viewportOptions={{ overflow: "hidden" }}
+                contentOptions={{ overflow: "hidden" }}
                 verticalScrollbarOptions={{ visible: false }}
               >
                 <Timeline
@@ -1498,29 +1533,53 @@ function UserPrompt(props: { text: string }) {
 }
 
 function DiffWithHunkReview(props: { diff: string; path?: string }) {
+  const viewerHeight = createMemo(() => diffViewerHeight(props.diff))
   return (
-    <diff
-      diff={props.diff}
-      view="split"
-      filetype={filetype(props.path)}
-      width="100%"
-      wrapMode="word"
-      showLineNumbers={true}
-      syntaxStyle={syntaxStyle}
-      fg={theme.text}
-      selectionBg={theme.selectionBg}
-      selectionFg={theme.text}
-      addedBg={theme.addedBg}
-      removedBg={theme.removedBg}
-      contextBg={theme.surface}
-      addedSignColor={theme.green}
-      removedSignColor={theme.red}
-      lineNumberFg={theme.muted}
-      lineNumberBg={theme.surface}
-      addedLineNumberBg={theme.addedBg}
-      removedLineNumberBg={theme.removedBg}
-    />
+    <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
+      <scrollbox
+        width="100%"
+        height="100%"
+        minHeight={0}
+        overflow="hidden"
+        scrollX={true}
+        scrollY={true}
+        stickyScroll={false}
+        scrollAcceleration={scrollAcceleration}
+        viewportCulling={true}
+        viewportOptions={{ overflow: "hidden" }}
+        contentOptions={{ overflow: "hidden" }}
+        verticalScrollbarOptions={{ visible: false }}
+        horizontalScrollbarOptions={{ visible: false }}
+      >
+        <diff
+          diff={props.diff}
+          view="split"
+          filetype={filetype(props.path)}
+          width="100%"
+          wrapMode="word"
+          showLineNumbers={true}
+          syntaxStyle={syntaxStyle}
+          fg={theme.text}
+          selectionBg={theme.selectionBg}
+          selectionFg={theme.text}
+          addedBg={theme.addedBg}
+          removedBg={theme.removedBg}
+          contextBg={theme.surface}
+          addedSignColor={theme.green}
+          removedSignColor={theme.red}
+          lineNumberFg={theme.muted}
+          lineNumberBg={theme.surface}
+          addedLineNumberBg={theme.addedBg}
+          removedLineNumberBg={theme.removedBg}
+        />
+      </scrollbox>
+    </box>
   )
+}
+
+function diffViewerHeight(diff: string) {
+  const lineCount = diff.split("\n").length
+  return Math.min(DIFF_VIEWER_MAX_HEIGHT, Math.max(DIFF_VIEWER_MIN_HEIGHT, lineCount))
 }
 
 function ToolDetails(props: { item: Extract<TranscriptItem, { kind: "tool" }> }) {
@@ -1966,48 +2025,6 @@ function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: Modified
       </Show>
     </box>
   )
-}
-
-function openExternalDiffViewer(workspace: string, file: ModifiedFile) {
-  const dir = path.join(workspace, ".inductor", "diff-viewer")
-  mkdirSync(dir, { recursive: true })
-  const patchPath = path.join(dir, `${safeDiffName(file.file)}.diff`)
-  const patch = file.diff?.trim()
-    ? file.diff
-    : `No captured patch was available for ${file.file}.\n\nShowing live git diff if this file still has worktree changes.\n`
-  writeFileSync(patchPath, patch)
-
-  const command = [
-    `cd ${shellQuote(workspace)}`,
-    `printf '\\033]0;inductor diff viewer\\007'`,
-    `echo ${shellQuote(`INDUCTOR DIFF: ${file.file}`)}`,
-    `{ if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git diff --quiet -- ${shellQuote(file.file)} 2>/dev/null; then git diff --color=always -- ${shellQuote(file.file)}; else cat ${shellQuote(patchPath)}; fi; } | less -R`,
-  ].join("; ")
-
-  const script = [
-    `tell application "Terminal"`,
-    `activate`,
-    `if not (exists window 1) then reopen`,
-    `do script "${appleScriptString(command)}" in front window`,
-    `end tell`,
-  ].join("\n")
-  Bun.spawn(["osascript", "-e", script], {
-    stdout: "ignore",
-    stderr: "ignore",
-  }).unref()
-}
-
-function safeDiffName(file: string) {
-  const safe = file.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "")
-  return (safe || "diff").slice(-140)
-}
-
-function shellQuote(value: string) {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
-function appleScriptString(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")
 }
 
 function defaultModel(provider: string) {

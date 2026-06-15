@@ -15,20 +15,49 @@ type Args = {
 }
 
 const args = parseArgs(process.argv.slice(2))
+let rawCtrlCHandler: (() => void) | undefined
 const renderer = await createCliRenderer({
   externalOutputMode: "passthrough",
   targetFps: 60,
   exitOnCtrlC: false,
+  clearOnShutdown: false,
+  backgroundColor: "transparent",
   useKittyKeyboard: {},
   autoFocus: true,
   useMouse: true,
   consoleOptions: {
     keyBindings: [{ name: "y", ctrl: true, action: "copy-selection" }],
   },
+  prependInputHandlers: [
+    (sequence) => {
+      if (sequence !== "\x03" || !rawCtrlCHandler) return false
+      rawCtrlCHandler()
+      return true
+    },
+  ],
 })
+let exitRequested = false
+function exitApp(code = 0) {
+  if (exitRequested) return
+  exitRequested = true
+  renderer.destroy()
+  setTimeout(() => process.exit(code), 0)
+}
+
+process.once("SIGHUP", () => exitApp(129))
+process.once("SIGINT", () => exitApp(130))
+process.once("SIGTERM", () => exitApp(143))
 
 installSelectionClipboard(renderer)
-render(() => <App {...args} />, renderer)
+void render(() => (
+  <App
+    {...args}
+    exitApp={exitApp}
+    registerCtrlCHandler={(handler) => {
+      rawCtrlCHandler = handler
+    }}
+  />
+), renderer)
 
 type ClipboardSelection = {
   anchor: { x: number; y: number }
