@@ -16,7 +16,6 @@
 //! ```
 
 use std::{
-    collections::HashMap,
     fmt, fs,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -212,34 +211,6 @@ impl SessionState {
 pub struct ParsedToolCall {
     pub name: String,
     pub input: Value,
-}
-
-#[derive(Debug, Clone)]
-struct ToolLoopGuard {
-    max_repeats: usize,
-    calls: HashMap<String, usize>,
-}
-
-impl ToolLoopGuard {
-    fn new(max_repeats: usize) -> Self {
-        Self {
-            max_repeats,
-            calls: HashMap::new(),
-        }
-    }
-
-    fn record(&mut self, call: &ParsedToolCall) -> Result<(), String> {
-        let fingerprint = format!("{}:{}", call.name, call.input);
-        let count = self.calls.entry(fingerprint).or_insert(0);
-        *count += 1;
-        if *count > self.max_repeats {
-            return Err(format!(
-                "repeated identical tool call more than {} time(s): {}",
-                self.max_repeats, call.name
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Failure modes when parsing a tool-call envelope.
@@ -1429,7 +1400,6 @@ pub fn run_turn<'a>(
         // rounds get a fresh, empty channel.
         let mut responses = Some(responses);
         let mut permissions = risk::PermissionService::new(allow);
-        let mut loop_guard = ToolLoopGuard::new(3);
 
         yield SessionEvent::Status { session_id, status: SessionStatus::Starting };
 
@@ -1543,24 +1513,6 @@ pub fn run_turn<'a>(
                                 json!({ "name": &call.name, "input": &call.input })
                             ),
                         );
-                        if let Err(message) = loop_guard.record(&call) {
-                            yield SessionEvent::ToolCallError {
-                                session_id,
-                                tool_call_id,
-                                message: message.clone(),
-                            };
-                            yield SessionEvent::StepFinish {
-                                session_id,
-                                index: round as u32,
-                                stop_reason: StopReason::Error,
-                            };
-                            yield SessionEvent::Error {
-                                session_id,
-                                message,
-                            };
-                            yield SessionEvent::Result { session_id, stop_reason: StopReason::Error };
-                            return;
-                        }
                         if cancel.is_cancelled() {
                             yield SessionEvent::StepFinish {
                                 session_id,
@@ -1661,24 +1613,6 @@ pub fn run_turn<'a>(
                 // Well-formed envelope: gate it through approval, then execute.
                 Some(Ok(call)) => {
                     let tool_call_id = ToolCallId::new();
-                    if let Err(message) = loop_guard.record(&call) {
-                        yield SessionEvent::ToolCallError {
-                            session_id,
-                            tool_call_id,
-                            message: message.clone(),
-                        };
-                        yield SessionEvent::StepFinish {
-                            session_id,
-                            index: round as u32,
-                            stop_reason: StopReason::Error,
-                        };
-                        yield SessionEvent::Error {
-                            session_id,
-                            message,
-                        };
-                        yield SessionEvent::Result { session_id, stop_reason: StopReason::Error };
-                        return;
-                    }
                     if cancel.is_cancelled() {
                         yield SessionEvent::StepFinish {
                             session_id,
@@ -1706,25 +1640,6 @@ pub fn run_turn<'a>(
 
                     if denied {
                         round += 1;
-                        if round >= config.max_tool_rounds {
-                            yield SessionEvent::StepFinish {
-                                session_id,
-                                index: (round - 1) as u32,
-                                stop_reason: StopReason::Error,
-                            };
-                            yield SessionEvent::Error {
-                                session_id,
-                                message: format!(
-                                    "reached max tool rounds ({})",
-                                    config.max_tool_rounds
-                                ),
-                            };
-                            yield SessionEvent::Result {
-                                session_id,
-                                stop_reason: StopReason::Error,
-                            };
-                            return;
-                        }
                         yield SessionEvent::StepFinish {
                             session_id,
                             index: (round - 1) as u32,
@@ -1754,16 +1669,7 @@ pub fn run_turn<'a>(
                 stop_reason: StopReason::EndTurn,
             };
 
-            // --- Round limit -----------------------------------------------
             round += 1;
-            if round >= config.max_tool_rounds {
-                yield SessionEvent::Error {
-                    session_id,
-                    message: format!("reached max tool rounds ({})", config.max_tool_rounds),
-                };
-                yield SessionEvent::Result { session_id, stop_reason: StopReason::Error };
-                return;
-            }
         }
     })
 }
