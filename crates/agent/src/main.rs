@@ -1215,8 +1215,7 @@ async fn run_harness_command(
             .and_then(|sid| registry.get_session(sid).ok().flatten())
             .and_then(|session| registry.get_worktree(session.workspace_id).ok().flatten())
             .or_else(|| {
-                requested_workspace_id
-                    .and_then(|wid| registry.get_worktree(wid).ok().flatten())
+                requested_workspace_id.and_then(|wid| registry.get_worktree(wid).ok().flatten())
             });
 
         let binding = if let Some(worktree) = bound_worktree {
@@ -1404,6 +1403,8 @@ async fn run_harness_command(
 
     let approval_policy_dbg = config.approval_policy;
     let prompt = attach_prompt_image_mentions(&workspace_path, &source_workspace, &prompt);
+    persist_submitted_user_message(&workspace_db, session_id, &state.transcript, &prompt)
+        .map_err(|err| err.to_string())?;
 
     let mut stream = run_turn(
         provider_plugin.as_ref(),
@@ -1550,9 +1551,52 @@ fn stored_message_to_transcript(message: StoredMessage) -> Result<TranscriptMess
     Ok(TranscriptMessage::new(role, message.content))
 }
 
+fn persist_submitted_user_message(
+    db: &WorkspaceDb,
+    session_id: SessionId,
+    transcript: &[TranscriptMessage],
+    prompt: &str,
+) -> persistence::Result<()> {
+    let text = prompt_transcript_text(prompt);
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let event = SessionEvent::UserMessage {
+        session_id,
+        text: text.clone(),
+    };
+    db.append_event(session_id, &event)?;
+
+    let mut messages = transcript
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            StoredMessage::new(message.role.label(), message.content.clone(), index as i64)
+        })
+        .collect::<Vec<_>>();
+    messages.push(StoredMessage::new(
+        Role::User.label(),
+        text,
+        messages.len() as i64,
+    ));
+    db.replace_messages(session_id, &messages)?;
+    Ok(())
+}
+
+fn prompt_transcript_text(prompt: &str) -> String {
+    const PREFIX: &str = "__MULTIMODAL_MESSAGE__:";
+    prompt
+        .strip_prefix(PREFIX)
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|value| value["text"].as_str().map(str::to_string))
+        .unwrap_or_else(|| prompt.to_string())
+}
+
 fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<()> {
     match event {
         SessionEvent::Status { session_id, .. }
+        | SessionEvent::UserMessage { session_id, .. }
         | SessionEvent::TextDelta { session_id, .. }
         | SessionEvent::TextStart { session_id, .. }
         | SessionEvent::TextEnd { session_id, .. }
@@ -2240,7 +2284,10 @@ async fn run_worktree_command(command: WorktreeCommand) -> Result<(), String> {
                     "base_branch": worktree.base_branch,
                     "base_commit": worktree.base_commit,
                 });
-                println!("{}", serde_json::to_string(&payload).map_err(|err| err.to_string())?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&payload).map_err(|err| err.to_string())?
+                );
             } else {
                 println!("workspace_id: {}", worktree.workspace_id);
                 println!("source_repo: {}", worktree.source_repo.display());
@@ -2454,6 +2501,91 @@ mod tests {
         );
         assert_eq!(value["images"][0]["path"], "screen.png");
         assert_eq!(value["images"][0]["mime_type"], "image/png");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn submitted_user_message_is_durable_before_run_completion() {
+        let workspace = temp_workspace("submitted-user-message");
+        let db = WorkspaceDb::open(workspace.join("state.db")).unwrap();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            WorkspaceId::new(),
+            ProviderId("codex".to_string()),
+            "gpt-5.5".to_string(),
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        let transcript = vec![TranscriptMessage::new(Role::User, "hi")];
+
+        persist_submitted_user_message(
+            &db,
+            session_id,
+            &transcript,
+            "do all the tools calls availble to u just to check their reliability",
+        )
+        .unwrap();
+
+        let messages = db.messages(session_id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "hi");
+        assert_eq!(
+            messages[1].content,
+            "do all the tools calls availble to u just to check their reliability"
+        );
+
+        let events = db.events(session_id).unwrap();
+        assert_eq!(
+            events,
+            vec![SessionEvent::UserMessage {
+                session_id,
+                text: "do all the tools calls availble to u just to check their reliability"
+                    .to_string()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn submitted_multimodal_user_message_persists_visible_text() {
+        let workspace = temp_workspace("submitted-multimodal-user-message");
+        let db = WorkspaceDb::open(workspace.join("state.db")).unwrap();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            WorkspaceId::new(),
+            ProviderId("codex".to_string()),
+            "gpt-5.5".to_string(),
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        let payload = serde_json::json!({
+            "text": "look at this screenshot",
+            "images": [{"path": "screen.png"}]
+        });
+
+        persist_submitted_user_message(
+            &db,
+            session_id,
+            &[],
+            &format!("__MULTIMODAL_MESSAGE__:{payload}"),
+        )
+        .unwrap();
+
+        let messages = db.messages(session_id).unwrap();
+        assert_eq!(messages[0].content, "look at this screenshot");
+
+        let events = db.events(session_id).unwrap();
+        assert_eq!(
+            events,
+            vec![SessionEvent::UserMessage {
+                session_id,
+                text: "look at this screenshot".to_string()
+            }]
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }

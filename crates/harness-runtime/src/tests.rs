@@ -657,22 +657,18 @@ async fn loop_surfaces_tool_error_and_continues() {
 }
 
 #[tokio::test]
-async fn loop_stops_at_max_rounds() {
+async fn loop_does_not_stop_at_configured_tool_round_limit() {
     let temp = TempDir::new("loop-maxrounds");
     fs::write(temp.path().join("loop.txt"), "x").unwrap();
     let runtime = ToolRuntime::new(temp.path()).unwrap();
 
-    // Always requests a tool, never finishes.
-    let provider = ScriptedProvider::new(std::iter::repeat(
-        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"loop.txt\"}}</inductor_tool_call>",
-    )
-    .take(20)
-    .collect::<Vec<_>>());
+    let repeated = "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"loop.txt\"}}</inductor_tool_call>";
+    let provider = ScriptedProvider::new([repeated, repeated, "done"]);
 
     let auth = test_auth();
     let mut state = SessionState::new(SessionId::new());
     let mut config = HarnessConfig::new("test-model");
-    config.max_tool_rounds = 3;
+    config.max_tool_rounds = 1;
 
     let mut allow = AllowStore::new();
     let events = collect_events(run_turn(
@@ -692,20 +688,27 @@ async fn loop_stops_at_max_rounds() {
     assert!(matches!(
         events.last().unwrap(),
         SessionEvent::Result {
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::EndTurn,
             ..
         }
     ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ToolCallResult { .. }))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
-async fn loop_guard_stops_repeated_identical_tool_calls() {
+async fn loop_allows_repeated_identical_tool_calls() {
     let temp = TempDir::new("loop-repeat");
     fs::write(temp.path().join("hello.txt"), "file body").unwrap();
     let runtime = ToolRuntime::new(temp.path()).unwrap();
 
     let repeated = "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\"}}</inductor_tool_call>";
-    let provider = ScriptedProvider::new([repeated, repeated, repeated, repeated]);
+    let provider = ScriptedProvider::new([repeated, repeated, repeated, repeated, "done"]);
     let auth = test_auth();
     let mut state = SessionState::new(SessionId::new());
     let mut allow = AllowStore::new();
@@ -724,17 +727,24 @@ async fn loop_guard_stops_repeated_identical_tool_calls() {
     ))
     .await;
 
-    assert!(events.iter().any(|event| matches!(
-        event,
-        SessionEvent::Error { message, .. } if message.contains("repeated identical tool call")
-    )));
     assert!(matches!(
         events.last().unwrap(),
         SessionEvent::Result {
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::EndTurn,
             ..
         }
     ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ToolCallResult { .. }))
+            .count(),
+        4
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Error { message, .. } if message.contains("repeated identical tool call")
+    )));
 }
 
 #[tokio::test]

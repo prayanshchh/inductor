@@ -7,7 +7,9 @@ use harness_core::{
     MessagePart, ModelInfo, ModelMessage, ProviderCapabilities, SessionEvent, SessionStatus,
     StopReason, ToolCallId, TurnRequest,
 };
-use provider_core::{PermissionResponses, ProviderAuth, ProviderAuthKind, ProviderPlugin};
+use provider_core::{
+    PermissionResponses, ProviderAuth, ProviderAuthKind, ProviderPlugin, ProviderToolResponse,
+};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -46,13 +48,12 @@ impl CodexProvider {
         format!("{}/responses", self.base_url)
     }
 
+    #[cfg(test)]
     fn request_body(&self, req: &TurnRequest) -> Value {
-        let input = if req.messages.is_empty() {
-            legacy_input_messages(req)
-        } else {
-            req.messages.iter().map(codex_message).collect::<Vec<_>>()
-        };
+        self.request_body_with_input(req, codex_input_messages(req))
+    }
 
+    fn request_body_with_input(&self, req: &TurnRequest, input: Vec<Value>) -> Value {
         let mut body = json!({
             "model": normalize_codex_model(&req.model),
             "instructions": req.system_prompt.as_deref().unwrap_or("You are an Inductor coding agent working in the user's workspace. \
@@ -76,6 +77,14 @@ impl CodexProvider {
     }
 }
 
+fn codex_input_messages(req: &TurnRequest) -> Vec<Value> {
+    if req.messages.is_empty() {
+        legacy_input_messages(req)
+    } else {
+        req.messages.iter().filter_map(codex_message).collect()
+    }
+}
+
 fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
     let mut content = vec![json!({
         "type": "input_text",
@@ -94,17 +103,26 @@ fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
     })]
 }
 
-fn codex_message(message: &ModelMessage) -> Value {
+fn codex_message(message: &ModelMessage) -> Option<Value> {
     let (role, parts) = codex_message_role_and_parts(message);
     let is_assistant = role == "assistant";
     let content = parts
         .iter()
         .map(|part| codex_part(part, is_assistant))
         .collect::<Vec<_>>();
-    json!({
+    if content.iter().all(codex_part_is_empty_text) {
+        return None;
+    }
+    Some(json!({
         "role": role,
         "content": content,
-    })
+    }))
+}
+
+fn codex_part_is_empty_text(part: &Value) -> bool {
+    part.get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.trim().is_empty())
 }
 
 fn codex_message_role_and_parts(message: &ModelMessage) -> (&'static str, Vec<MessagePart>) {
@@ -201,18 +219,14 @@ impl ProviderPlugin for CodexProvider {
         cancel: CancellationToken,
         // Codex emits native function calls, but the harness owns execution.
         _permissions: PermissionResponses,
-        _tool_responses: provider_core::ToolResponses,
+        mut tool_responses: provider_core::ToolResponses,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, bearer_header(auth)?);
 
-        let request = self
-            .client
-            .post(self.responses_url())
-            .headers(headers)
-            .json(&self.request_body(&req));
-
         let session_id = req.session_id;
+        let provider = self.clone();
+        let responses_url = self.responses_url();
         let idle_timeout = codex_idle_timeout();
         let stream = try_stream! {
             yield SessionEvent::Status {
@@ -220,48 +234,15 @@ impl ProviderPlugin for CodexProvider {
                 status: SessionStatus::Starting,
             };
 
-            let response = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield SessionEvent::Result {
-                        session_id,
-                        stop_reason: StopReason::Interrupted,
-                    };
-                    return;
-                }
-                response = request.send() => response,
-                _ = sleep(idle_timeout) => {
-                    yield SessionEvent::Error {
-                        session_id,
-                        message: format!(
-                            "Codex provider produced no response for {} seconds; stopped the stale run",
-                            idle_timeout.as_secs()
-                        ),
-                    };
-                    return;
-                }
-            };
-            let response = response?;
-            let status = response.status();
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                yield SessionEvent::Error {
-                    session_id,
-                    message: format!("codex provider request failed with HTTP {status}: {}", redact_error_body(&body)),
-                };
-                return;
-            }
-
-            yield SessionEvent::Status {
-                session_id,
-                status: SessionStatus::Streaming,
-            };
-
-            let mut bytes = response.bytes_stream();
-            let mut buffer = String::new();
-
+            let mut input = codex_input_messages(&req);
             loop {
-                let chunk = tokio::select! {
+                let request = provider
+                    .client
+                    .post(&responses_url)
+                    .headers(headers.clone())
+                    .json(&provider.request_body_with_input(&req, input.clone()));
+
+                let response = tokio::select! {
                     _ = cancel.cancelled() => {
                         yield SessionEvent::Result {
                             session_id,
@@ -269,44 +250,138 @@ impl ProviderPlugin for CodexProvider {
                         };
                         return;
                     }
-                    chunk = bytes.next() => chunk,
+                    response = request.send() => response,
                     _ = sleep(idle_timeout) => {
                         yield SessionEvent::Error {
                             session_id,
                             message: format!(
-                                "Codex provider stream produced no events for {} seconds; stopped the stale run",
+                                "Codex provider produced no response for {} seconds; stopped the stale run",
                                 idle_timeout.as_secs()
                             ),
                         };
                         return;
                     }
                 };
+                let response = response?;
+                let status = response.status();
 
-                let Some(chunk) = chunk else {
-                    break;
-                };
-
-                if cancel.is_cancelled() {
-                    yield SessionEvent::Result {
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    yield SessionEvent::Error {
                         session_id,
-                        stop_reason: StopReason::Interrupted,
+                        message: format!("codex provider request failed with HTTP {status}: {}", redact_error_body(&body)),
                     };
                     return;
                 }
 
-                let chunk = chunk?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                yield SessionEvent::Status {
+                    session_id,
+                    status: SessionStatus::Streaming,
+                };
 
-                for event in drain_sse_events(&mut buffer) {
-                    for mapped in parse_response_stream_event(session_id, &event) {
+                let mut bytes = response.bytes_stream();
+                let mut buffer = String::new();
+                let mut output_items = Vec::new();
+                let mut pending_function_calls = Vec::new();
+
+                loop {
+                    let chunk = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            yield SessionEvent::Result {
+                                session_id,
+                                stop_reason: StopReason::Interrupted,
+                            };
+                            return;
+                        }
+                        chunk = bytes.next() => chunk,
+                        _ = sleep(idle_timeout) => {
+                            yield SessionEvent::Error {
+                                session_id,
+                                message: format!(
+                                    "Codex provider stream produced no events for {} seconds; stopped the stale run",
+                                    idle_timeout.as_secs()
+                                ),
+                            };
+                            return;
+                        }
+                    };
+
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+
+                    if cancel.is_cancelled() {
+                        yield SessionEvent::Result {
+                            session_id,
+                            stop_reason: StopReason::Interrupted,
+                        };
+                        return;
+                    }
+
+                    let chunk = chunk?;
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                    for event in drain_sse_events(&mut buffer) {
+                        let parsed = parse_response_stream_event_detail(session_id, &event);
+                        let _response_completed = parsed.completed;
+                        output_items.extend(parsed.output_items);
+                        pending_function_calls.extend(parsed.function_calls);
+                        for mapped in parsed.events {
+                            yield mapped;
+                        }
+                    }
+                }
+
+                for event in drain_sse_events_at_eof(&mut buffer) {
+                    let parsed = parse_response_stream_event_detail(session_id, &event);
+                    let _response_completed = parsed.completed;
+                    output_items.extend(parsed.output_items);
+                    pending_function_calls.extend(parsed.function_calls);
+                    for mapped in parsed.events {
                         yield mapped;
                     }
                 }
-            }
 
-            for event in drain_sse_events_at_eof(&mut buffer) {
-                for mapped in parse_response_stream_event(session_id, &event) {
-                    yield mapped;
+                if pending_function_calls.is_empty() {
+                    yield SessionEvent::Result {
+                        session_id,
+                        stop_reason: StopReason::EndTurn,
+                    };
+                    return;
+                }
+
+                input.extend(output_items);
+                for pending in pending_function_calls {
+                    let tool_result = loop {
+                        let response = tokio::select! {
+                            _ = cancel.cancelled() => {
+                                yield SessionEvent::Result {
+                                    session_id,
+                                    stop_reason: StopReason::Interrupted,
+                                };
+                                return;
+                            }
+                            response = tool_responses.recv() => response,
+                        };
+                        let Some(response) = response else {
+                            yield SessionEvent::Error {
+                                session_id,
+                                message: format!(
+                                    "codex provider lost local tool result for {}",
+                                    pending.name
+                                ),
+                            };
+                            yield SessionEvent::Result {
+                                session_id,
+                                stop_reason: StopReason::Error,
+                            };
+                            return;
+                        };
+                        if response.tool_call_id == pending.tool_call_id {
+                            break response;
+                        }
+                    };
+                    input.push(function_call_output_item(&pending, tool_result));
                 }
             }
         };
@@ -357,10 +432,41 @@ fn drain_sse_events_at_eof(buffer: &mut String) -> Vec<String> {
     vec![std::mem::take(buffer)]
 }
 
+#[cfg(test)]
 fn parse_response_stream_event(
     session_id: harness_core::SessionId,
     raw: &str,
 ) -> Vec<SessionEvent> {
+    let parsed = parse_response_stream_event_detail(session_id, raw);
+    let mut events = parsed.events;
+    if parsed.completed {
+        events.push(SessionEvent::Result {
+            session_id,
+            stop_reason: StopReason::EndTurn,
+        });
+    }
+    events
+}
+
+#[derive(Debug, Default)]
+struct ParsedResponseStreamEvent {
+    events: Vec<SessionEvent>,
+    output_items: Vec<Value>,
+    function_calls: Vec<PendingCodexFunctionCall>,
+    completed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexFunctionCall {
+    tool_call_id: ToolCallId,
+    call_id: String,
+    name: String,
+}
+
+fn parse_response_stream_event_detail(
+    session_id: harness_core::SessionId,
+    raw: &str,
+) -> ParsedResponseStreamEvent {
     let mut event_name = None;
     let mut data_lines = Vec::new();
 
@@ -375,59 +481,82 @@ fn parse_response_stream_event(
 
     let data = data_lines.join("\n");
     if data.is_empty() || data == "[DONE]" {
-        return Vec::new();
+        return ParsedResponseStreamEvent::default();
     }
 
     let Ok(value) = serde_json::from_str::<Value>(&data) else {
-        return Vec::new();
+        return ParsedResponseStreamEvent::default();
     };
     let Some(event_type) = value
         .get("type")
         .and_then(Value::as_str)
         .or(event_name.as_deref())
     else {
-        return Vec::new();
+        return ParsedResponseStreamEvent::default();
     };
 
     match event_type {
-        "response.output_text.delta" | "output_text.delta" | "text_delta" => value
-            .get("delta")
-            .or_else(|| value.get("text"))
-            .and_then(Value::as_str)
-            .map(|text| SessionEvent::TextDelta {
-                session_id,
-                text: text.to_string(),
-            })
-            .into_iter()
-            .collect(),
+        "response.output_text.delta" | "output_text.delta" | "text_delta" => {
+            let events = value
+                .get("delta")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| SessionEvent::TextDelta {
+                    session_id,
+                    text: text.to_string(),
+                })
+                .into_iter()
+                .collect();
+            ParsedResponseStreamEvent {
+                events,
+                ..ParsedResponseStreamEvent::default()
+            }
+        }
         // A completed native function call. Emit a structured harness request;
         // the harness executes and permission-gates it without a text envelope.
         "response.output_item.done" | "response.output_item.added" => {
             let Some(item) = value.get("item") else {
-                return Vec::new();
+                return ParsedResponseStreamEvent::default();
             };
             // `added` carries no arguments yet; only act on `done`.
             if event_type == "response.output_item.added" {
-                return Vec::new();
+                return ParsedResponseStreamEvent::default();
             }
+            let mut parsed = ParsedResponseStreamEvent::default();
             match item.get("type").and_then(Value::as_str) {
                 // Our function tools -> structured harness execution.
                 Some("function_call") => {
                     let Some(name) = item.get("name").and_then(Value::as_str) else {
-                        return Vec::new();
+                        return parsed;
                     };
+                    let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                        parsed.events.push(SessionEvent::Error {
+                            session_id,
+                            message: "codex provider function_call is missing call_id".to_string(),
+                        });
+                        return parsed;
+                    };
+                    parsed
+                        .output_items
+                        .push(function_call_input_item(name, call_id, item));
                     let tool_call_id = ToolCallId::new();
                     let input = item
                         .get("arguments")
                         .and_then(Value::as_str)
                         .and_then(|a| serde_json::from_str::<Value>(a).ok())
                         .unwrap_or_else(|| json!({}));
-                    vec![SessionEvent::ToolCallRequested {
+                    parsed.events.push(SessionEvent::ToolCallRequested {
                         session_id,
-                        tool_call_id,
+                        tool_call_id: tool_call_id.clone(),
                         name: name.to_string(),
                         input_json: input,
-                    }]
+                    });
+                    parsed.function_calls.push(PendingCodexFunctionCall {
+                        tool_call_id,
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                    });
+                    parsed
                 }
                 // OpenAI-hosted web search runs server-side — surface it for
                 // display only (no local execution / permission needed).
@@ -437,14 +566,15 @@ fn parse_response_stream_event(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    vec![SessionEvent::ToolCallStart {
+                    parsed.events.push(SessionEvent::ToolCallStart {
                         session_id,
                         tool_call_id: ToolCallId::new(),
                         name: "web_search".to_string(),
                         input_json: json!({ "query": query }),
-                    }]
+                    });
+                    parsed
                 }
-                _ => Vec::new(),
+                _ => parsed,
             }
         }
         "response.completed" | "completed" | "done" => {
@@ -453,24 +583,56 @@ fn parse_response_stream_event(
             if let Some(usage) = usage_event(session_id, &value) {
                 events.push(usage);
             }
-            events.push(SessionEvent::Result {
-                session_id,
-                stop_reason: StopReason::EndTurn,
-            });
-            events
+            ParsedResponseStreamEvent {
+                events,
+                completed: true,
+                ..ParsedResponseStreamEvent::default()
+            }
         }
-        "response.failed" | "error" => vec![SessionEvent::Error {
-            session_id,
-            message: value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| value.get("message").and_then(Value::as_str))
-                .unwrap_or("codex provider stream failed")
-                .to_string(),
-        }],
-        _ => Vec::new(),
+        "response.failed" | "error" => ParsedResponseStreamEvent {
+            events: vec![SessionEvent::Error {
+                session_id,
+                message: value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
+                    .unwrap_or("codex provider stream failed")
+                    .to_string(),
+            }],
+            ..ParsedResponseStreamEvent::default()
+        },
+        _ => ParsedResponseStreamEvent::default(),
     }
+}
+
+fn function_call_input_item(name: &str, call_id: &str, item: &Value) -> Value {
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
+fn function_call_output_item(
+    pending: &PendingCodexFunctionCall,
+    response: ProviderToolResponse,
+) -> Value {
+    let output = if response.is_error {
+        format!("error: {}", response.output)
+    } else {
+        response.output
+    };
+    json!({
+        "type": "function_call_output",
+        "call_id": pending.call_id,
+        "output": output,
+    })
 }
 
 /// Extract OpenAI Responses usage (`response.usage`) into a Usage event.
@@ -552,9 +714,16 @@ fn extend_models_from_env(models: &mut Vec<ModelInfo>, env_key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use harness_core::ImageAttachment;
     use harness_core::SessionId;
     use secrecy::SecretString;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::timeout,
+    };
 
     fn text_request(prompt: &str) -> TurnRequest {
         TurnRequest {
@@ -567,6 +736,52 @@ mod tests {
             metadata: Value::Null,
             images: Vec::new(),
         }
+    }
+
+    async fn read_http_body(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before headers completed");
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(index) = find_subsequence(&bytes, b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before body completed");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+
+        String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).unwrap()
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    async fn write_sse_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
     }
 
     #[test]
@@ -697,6 +912,25 @@ mod tests {
     }
 
     #[test]
+    fn request_body_skips_empty_stored_messages() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        let mut request = text_request("legacy prompt");
+        request.messages = vec![
+            ModelMessage::text("user", "resume"),
+            ModelMessage::text("assistant", ""),
+            ModelMessage::text("assistant", "done"),
+        ];
+
+        let body = provider.request_body(&request);
+        let input = body["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "done");
+    }
+
+    #[test]
     fn sse_parser_converts_text_delta() {
         let session_id = SessionId::new();
         let raw = r#"event: response.output_text.delta
@@ -725,6 +959,212 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
                 if name == "write_file" && input_json == &json!({ "path": "a.txt", "content": "hi" })
         ));
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn function_call_detail_sanitizes_response_item_and_retains_call_id() {
+        let session_id = SessionId::new();
+        let raw = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","name":"write_file","call_id":"call_1","arguments":"{\"path\":\"a.txt\",\"content\":\"hi\"}"}}
+"#;
+
+        let parsed = parse_response_stream_event_detail(session_id, raw);
+
+        assert_eq!(parsed.output_items.len(), 1);
+        assert_eq!(parsed.output_items[0]["type"], "function_call");
+        assert!(parsed.output_items[0].get("id").is_none());
+        assert_eq!(parsed.function_calls.len(), 1);
+        assert_eq!(parsed.function_calls[0].call_id, "call_1");
+        assert_eq!(parsed.function_calls[0].name, "write_file");
+        assert!(matches!(
+            parsed.events.first().unwrap(),
+            SessionEvent::ToolCallRequested { tool_call_id, .. }
+                if tool_call_id == &parsed.function_calls[0].tool_call_id
+        ));
+    }
+
+    #[test]
+    fn reasoning_output_items_are_not_replayed_with_store_false() {
+        let session_id = SessionId::new();
+        let raw = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_0601405c3a9a119e016a30d89a680c8199a65219609d8df619","summary":[]}}
+"#;
+
+        let parsed = parse_response_stream_event_detail(session_id, raw);
+
+        assert!(parsed.output_items.is_empty());
+        assert!(parsed.function_calls.is_empty());
+        assert!(parsed.events.is_empty());
+    }
+
+    #[test]
+    fn function_call_output_uses_codex_call_id() {
+        let pending = PendingCodexFunctionCall {
+            tool_call_id: ToolCallId::new(),
+            call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+        };
+        let output = function_call_output_item(
+            &pending,
+            ProviderToolResponse {
+                tool_call_id: pending.tool_call_id.clone(),
+                output: "file contents".to_string(),
+                is_error: false,
+            },
+        );
+
+        assert_eq!(output["type"], "function_call_output");
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["output"], "file contents");
+    }
+
+    #[test]
+    fn function_call_output_marks_tool_errors() {
+        let pending = PendingCodexFunctionCall {
+            tool_call_id: ToolCallId::new(),
+            call_id: "call_1".to_string(),
+            name: "read_file".to_string(),
+        };
+        let output = function_call_output_item(
+            &pending,
+            ProviderToolResponse {
+                tool_call_id: pending.tool_call_id.clone(),
+                output: "not found".to_string(),
+                is_error: true,
+            },
+        );
+
+        assert_eq!(output["output"], "error: not found");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_turn_continues_after_failed_tool_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let server = tokio::spawn(async move {
+            let responses = [
+                r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"checking"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_0601405c3a9a119e016a30d89a680c8199a65219609d8df619","summary":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","name":"list_dir","call_id":"call_1","arguments":"{}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":3}}}
+
+data: [DONE]
+
+"#,
+                r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"continued after failure"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":4}}}
+
+data: [DONE]
+
+"#,
+            ];
+
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_body = read_http_body(&mut stream).await;
+                request_tx.send(request_body).unwrap();
+                write_sse_response(&mut stream, body).await;
+            }
+        });
+
+        let provider = CodexProvider::with_base_url(format!("http://{addr}")).unwrap();
+        let auth = ProviderAuth::new(
+            ProviderAuthKind::SessionToken,
+            SecretString::from("secret-token".to_string()),
+        );
+        let (tool_tx, tool_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = provider
+            .stream_turn(
+                &auth,
+                text_request("check all tools"),
+                CancellationToken::new(),
+                provider_core::empty_permission_responses(),
+                tool_rx,
+            )
+            .await
+            .unwrap();
+
+        let mut saw_tool_call = false;
+        let mut saw_continuation = false;
+        let mut saw_result = false;
+        timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                let event = event.unwrap();
+                match event {
+                    SessionEvent::ToolCallRequested {
+                        tool_call_id,
+                        name,
+                        input_json,
+                        ..
+                    } => {
+                        assert_eq!(name, "list_dir");
+                        assert_eq!(input_json, json!({}));
+                        saw_tool_call = true;
+                        tool_tx
+                            .send(ProviderToolResponse {
+                                tool_call_id,
+                                output: "list_dir failed".to_string(),
+                                is_error: true,
+                            })
+                            .unwrap();
+                    }
+                    SessionEvent::TextDelta { text, .. } => {
+                        if text == "continued after failure" {
+                            saw_continuation = true;
+                        }
+                    }
+                    SessionEvent::Result { .. } => {
+                        saw_result = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(saw_tool_call);
+        assert!(saw_continuation);
+        assert!(saw_result);
+
+        let first_request: Value = serde_json::from_str(&request_rx.recv().await.unwrap()).unwrap();
+        let second_request: Value =
+            serde_json::from_str(&request_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first_request["input"][0]["role"], "user");
+
+        let second_input = second_request["input"].as_array().unwrap();
+        assert!(second_input.iter().any(|item| {
+            item["type"] == "function_call"
+                && item["name"] == "list_dir"
+                && item["call_id"] == "call_1"
+                && item.get("id").is_none()
+        }));
+        assert!(
+            !second_input
+                .iter()
+                .any(|item| item["type"] == "reasoning" || item["id"].as_str().is_some())
+        );
+        let output = second_input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(output["output"], "error: list_dir failed");
+
+        server.await.unwrap();
     }
 
     #[test]
@@ -790,6 +1230,24 @@ data: {"type":"response.completed"}
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn completion_detail_does_not_emit_final_result() {
+        let session_id = SessionId::new();
+        let raw = r#"event: response.completed
+data: {"type":"response.completed"}
+"#;
+
+        let parsed = parse_response_stream_event_detail(session_id, raw);
+
+        assert!(parsed.completed);
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Result { .. }))
+        );
     }
 
     #[test]

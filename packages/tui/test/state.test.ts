@@ -270,6 +270,77 @@ describe("transcript reducer", () => {
     expect(state.transcript[5]).toMatchObject({ kind: "assistant", text: "final thoughts" })
   })
 
+  test("replays repeated user prompts from durable user message events", () => {
+    const state = loadStoredSession({
+      session: {
+        id: "s1",
+        provider_id: "codex",
+        model: "gpt-5.5",
+        status: "streaming",
+        display_name: null,
+        created_at: "2026-06-13T00:00:00Z",
+        updated_at: "2026-06-13T00:00:00Z",
+      },
+      messages: [
+        { role: "user", content: "hi", ordinal: 0 },
+        { role: "assistant", content: "Hi! What would you like me to work on?", ordinal: 1 },
+        { role: "user", content: "do all the tools calls availble to u just to check their reliability", ordinal: 2 },
+      ],
+      events: [
+        { type: "user_message", text: "hi" },
+        { type: "text_delta", text: "Hi! What would you like me to work on?" },
+        { type: "tool_call_requested", tool_call_id: "call-1", name: "list_dir", input_json: {} },
+        { type: "tool_call_error", tool_call_id: "call-1", message: "list_dir failed" },
+        { type: "user_message", text: "do all the tools calls availble to u just to check their reliability" },
+        { type: "tool_call_requested", tool_call_id: "call-2", name: "list_dir", input_json: {} },
+      ],
+    })
+
+    expect(state.transcript.map((item) => item.kind)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "user",
+      "tool",
+    ])
+    expect(state.transcript[3]).toMatchObject({
+      kind: "user",
+      text: "do all the tools calls availble to u just to check their reliability",
+    })
+  })
+
+  test("keeps old first prompt when later turns have user message events", () => {
+    const state = loadStoredSession({
+      session: {
+        id: "s1",
+        provider_id: "codex",
+        model: "gpt-5.5",
+        status: "streaming",
+        display_name: null,
+        created_at: "2026-06-13T00:00:00Z",
+        updated_at: "2026-06-13T00:00:00Z",
+      },
+      messages: [
+        { role: "user", content: "hi", ordinal: 0 },
+        { role: "assistant", content: "Hello.", ordinal: 1 },
+        { role: "user", content: "do all the tools calls availble to u just to check their reliability", ordinal: 2 },
+      ],
+      events: [
+        { type: "text_delta", text: "Hello." },
+        { type: "result", stop_reason: "end_turn" },
+        { type: "user_message", text: "do all the tools calls availble to u just to check their reliability" },
+        { type: "tool_call_requested", tool_call_id: "call-2", name: "list_dir", input_json: {} },
+      ],
+    })
+
+    expect(state.transcript.map((item) => item.kind)).toEqual(["user", "assistant", "user", "tool"])
+    expect(state.transcript[0]).toMatchObject({ kind: "user", text: "hi" })
+    expect(state.transcript[2]).toMatchObject({
+      kind: "user",
+      text: "do all the tools calls availble to u just to check their reliability",
+    })
+  })
+
   test("shows stopped agent for interrupted results", () => {
     let state = addUserMessage(createInitialState(), "do a long task")
     state = applySessionEvent(state, { type: "result", stop_reason: "interrupted" })
