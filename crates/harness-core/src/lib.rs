@@ -318,6 +318,10 @@ pub enum SessionEvent {
         session_id: SessionId,
         status: SessionStatus,
     },
+    UserMessage {
+        session_id: SessionId,
+        text: String,
+    },
     TextDelta {
         session_id: SessionId,
         text: String,
@@ -496,6 +500,26 @@ mod tests {
                 "type": "text_delta",
                 "session_id": "01KT4H9V3W2M0W4Z5X6Y7Z8A9B",
                 "text": "hello"
+            })
+        );
+    }
+
+    #[test]
+    fn user_message_event_uses_tagged_json_shape() {
+        let session_id = SessionId(Ulid::from_string("01KT4H9V3W2M0W4Z5X6Y7Z8A9B").unwrap());
+        let event = SessionEvent::UserMessage {
+            session_id,
+            text: "do all the tool calls".to_string(),
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "user_message",
+                "session_id": "01KT4H9V3W2M0W4Z5X6Y7Z8A9B",
+                "text": "do all the tool calls"
             })
         );
     }

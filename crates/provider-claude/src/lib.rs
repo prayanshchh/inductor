@@ -10,7 +10,8 @@ use async_stream::try_stream;
 use futures_core::Stream;
 use harness_core::{
     ImageAttachment, ModelInfo, ModelMessage, PermissionDecision, PermissionRequestId,
-    ProviderCapabilities, SessionEvent, SessionStatus, StopReason, ToolCallId, TurnRequest,
+    ProviderCapabilities, SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId,
+    TurnRequest,
 };
 use provider_core::{PermissionResponses, ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Value, json};
@@ -328,36 +329,12 @@ impl ProviderPlugin for ClaudeProvider {
                             continue;
                         }
 
-                        // Native SDK tool result → ToolCallResult / ToolCallError.
+                        // Native SDK tool result -> ToolCallResult / ToolCallError.
                         if value.get("type").and_then(Value::as_str) == Some("tool_result") {
-                            let bridge_id = value
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let output = value
-                                .get("output")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let Some(tool_call_id) = tool_ids.remove(&bridge_id) else {
-                                continue;
-                            };
-                            if value.get("is_error").and_then(Value::as_bool) == Some(true) {
-                                yield SessionEvent::ToolCallError {
-                                    session_id,
-                                    tool_call_id,
-                                    message: output,
-                                };
-                            } else {
-                                yield SessionEvent::ToolCallResult {
-                                    session_id,
-                                    tool_call_id,
-                                    title: None,
-                                    metadata: serde_json::Value::Null,
-                                    output,
-                                    exit_code: None,
-                                };
+                            if let Some(event) =
+                                bridge_tool_result_to_session_event(session_id, &value, &mut tool_ids)
+                            {
+                                yield event;
                             }
                             continue;
                         }
@@ -666,10 +643,46 @@ impl Drop for SdkBridge {
     }
 }
 
-fn bridge_event_to_session_event(
-    session_id: harness_core::SessionId,
+fn bridge_tool_result_to_session_event(
+    session_id: SessionId,
     value: &Value,
+    tool_ids: &mut HashMap<String, ToolCallId>,
 ) -> Option<SessionEvent> {
+    if value.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+
+    let bridge_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let output = value
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool_call_id = tool_ids.remove(&bridge_id)?;
+
+    if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+        Some(SessionEvent::ToolCallError {
+            session_id,
+            tool_call_id,
+            message: output,
+        })
+    } else {
+        Some(SessionEvent::ToolCallResult {
+            session_id,
+            tool_call_id,
+            title: None,
+            metadata: serde_json::Value::Null,
+            output,
+            exit_code: None,
+        })
+    }
+}
+
+fn bridge_event_to_session_event(session_id: SessionId, value: &Value) -> Option<SessionEvent> {
     match value.get("type").and_then(Value::as_str)? {
         "text_delta" => value
             .get("text")
@@ -835,6 +848,52 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn bridge_tool_result_error_converts_to_tool_call_error() {
+        let session_id = SessionId::new();
+        let bridge_id = "toolu_error".to_string();
+        let tool_call_id = ToolCallId::new();
+        let mut tool_ids = HashMap::from([(bridge_id.clone(), tool_call_id)]);
+        let value = json!({
+            "type": "tool_result",
+            "id": bridge_id,
+            "output": "read_file failed",
+            "is_error": true,
+        });
+
+        let event = bridge_tool_result_to_session_event(session_id, &value, &mut tool_ids)
+            .expect("tool result should map to a session event");
+
+        assert!(tool_ids.is_empty());
+        assert!(matches!(
+            event,
+            SessionEvent::ToolCallError { message, .. } if message == "read_file failed"
+        ));
+    }
+
+    #[test]
+    fn bridge_tool_result_success_converts_to_tool_call_result() {
+        let session_id = SessionId::new();
+        let bridge_id = "toolu_success".to_string();
+        let tool_call_id = ToolCallId::new();
+        let mut tool_ids = HashMap::from([(bridge_id.clone(), tool_call_id)]);
+        let value = json!({
+            "type": "tool_result",
+            "id": bridge_id,
+            "output": "file contents",
+            "is_error": false,
+        });
+
+        let event = bridge_tool_result_to_session_event(session_id, &value, &mut tool_ids)
+            .expect("tool result should map to a session event");
+
+        assert!(tool_ids.is_empty());
+        assert!(matches!(
+            event,
+            SessionEvent::ToolCallResult { output, .. } if output == "file contents"
         ));
     }
 

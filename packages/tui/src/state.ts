@@ -84,7 +84,8 @@ export function loadStoredSession(detail: StoredSessionDetail): AppState {
   }
   if (Array.isArray(detail.events) && detail.events.length > 0) {
     const firstPrompt = firstUserMessage(detail)
-    const withPrompt = firstPrompt
+    const startsWithUserEvent = detail.events[0]?.type === "user_message"
+    const withPrompt = firstPrompt && !startsWithUserEvent
       ? { ...initial, transcript: [{ id: nextId("user"), kind: "user" as const, text: firstPrompt }] }
       : initial
     return detail.events.reduce((current, event) => applySessionEvent(current, event), withPrompt)
@@ -102,6 +103,8 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
   switch (event.type) {
     case "status":
       return { ...state, status: String(event.status ?? "unknown") }
+    case "user_message":
+      return appendUserMessageFromEvent(state, event.text ?? "")
     case "text_delta":
       return appendAssistantText(state, event.text ?? "")
     case "text_start":
@@ -266,6 +269,20 @@ function appendAssistantText(state: AppState, text: string): AppState {
     transcript.push({ id: nextId("assistant"), kind: "assistant", text })
   }
   return { ...state, transcript }
+}
+
+function appendUserMessageFromEvent(state: AppState, text: string): AppState {
+  if (!text.trim()) return state
+  const last = state.transcript.at(-1)
+  if (last?.kind === "user" && last.text === text) {
+    return { ...state, running: true, title: state.title === "New session" ? summarizeTitle(text) : state.title }
+  }
+  return {
+    ...state,
+    running: true,
+    title: state.title === "New session" ? summarizeTitle(text) : state.title,
+    transcript: [...state.transcript, { id: nextId("user"), kind: "user", text }],
+  }
 }
 
 function appendRequestedTool(state: AppState, name: string, inputJson: unknown, toolCallId?: string): AppState {
