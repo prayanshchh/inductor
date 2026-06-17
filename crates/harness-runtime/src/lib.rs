@@ -1811,7 +1811,7 @@ impl PromptComposer {
             PromptLayer {
                 name: "base",
                 content: match provider {
-                    ProviderFamily::Claude | ProviderFamily::Codex => {
+                    ProviderFamily::Claude | ProviderFamily::Codex | ProviderFamily::Copilot => {
                         String::from(NATIVE_TOOLS_PREAMBLE)
                     }
                     _ => generic_tools_preamble(),

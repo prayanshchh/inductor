@@ -15,5 +15,6 @@ tokio-util = "0.7"
 harness-core = { path = "../harness-core" }
 provider-claude = { path = "../provider-claude" }
 provider-codex = { path = "../provider-codex" }
+provider-copilot = { path = "../provider-copilot" }
 provider-core = { path = "../provider-core" }
 auth = { path = "../auth" }

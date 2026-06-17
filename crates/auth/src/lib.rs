@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const CLAUDE_CODE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const GITHUB_COPILOT_TOKEN_ENV: &str = "GITHUB_COPILOT_TOKEN";
+const GITHUB_COPILOT_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 #[derive(Debug, Clone)]
 pub struct AuthDetector {
@@ -50,6 +52,10 @@ impl AuthDetector {
             detected.push(credential);
         }
 
+        if let Some(credential) = self.detect_copilot() {
+            detected.push(credential);
+        }
+
         detected
     }
 
@@ -80,11 +86,41 @@ impl AuthDetector {
         })
     }
 
+    pub fn detect_copilot(&self) -> Option<DetectedCredential> {
+        if std::env::var_os(GITHUB_COPILOT_TOKEN_ENV).is_some() {
+            return Some(DetectedCredential {
+                provider: ProviderKind::Copilot,
+                provider_id: ProviderId("copilot".to_string()),
+                source: CredentialSource::Environment {
+                    variable: GITHUB_COPILOT_TOKEN_ENV.to_string(),
+                },
+                identity_hint: None,
+            });
+        }
+
+        let auth_path = self.copilot_auth_path();
+        let identity_hint = copilot_identity_hint(&auth_path)?;
+
+        Some(DetectedCredential {
+            provider: ProviderKind::Copilot,
+            provider_id: ProviderId("copilot".to_string()),
+            source: CredentialSource::File { path: auth_path },
+            identity_hint,
+        })
+    }
+
     fn codex_auth_path(&self) -> PathBuf {
         self.codex_home
             .clone()
             .unwrap_or_else(|| self.home_dir.join(".codex"))
             .join("auth.json")
+    }
+
+    pub fn copilot_auth_path(&self) -> PathBuf {
+        self.home_dir
+            .join(".config")
+            .join("github-copilot")
+            .join("apps.json")
     }
 
     pub fn home_dir(&self) -> &Path {
@@ -130,6 +166,12 @@ impl RuntimeCredentialLoader {
             (ProviderKind::Claude, CredentialSource::MacosKeychain { service }) => {
                 load_claude_keychain_access_token(service)?
             }
+            (ProviderKind::Copilot, CredentialSource::Environment { variable }) => {
+                load_env_secret(ProviderKind::Copilot, variable)?
+            }
+            (ProviderKind::Copilot, CredentialSource::File { path }) => {
+                load_copilot_oauth_token(path)?
+            }
             (provider, source) => {
                 return Err(CredentialLoadError::ProviderSourceMismatch {
                     provider: *provider,
@@ -150,6 +192,7 @@ impl RuntimeCredentialLoader {
 pub enum ProviderKind {
     Claude,
     Codex,
+    Copilot,
 }
 
 impl ProviderKind {
@@ -157,12 +200,13 @@ impl ProviderKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
         }
     }
 
     pub fn provider_auth_kind(self) -> ProviderAuthKind {
         match self {
-            Self::Claude | Self::Codex => ProviderAuthKind::SessionToken,
+            Self::Claude | Self::Codex | Self::Copilot => ProviderAuthKind::SessionToken,
         }
     }
 }
@@ -178,6 +222,7 @@ impl fmt::Display for ProviderKind {
 pub enum CredentialSource {
     MacosKeychain { service: String },
     File { path: PathBuf },
+    Environment { variable: String },
 }
 
 impl CredentialSource {
@@ -185,6 +230,7 @@ impl CredentialSource {
         match self {
             Self::MacosKeychain { service } => format!("macos_keychain:{service}"),
             Self::File { path } => format!("file:{}", display_path_safe(path, home_dir)),
+            Self::Environment { variable } => format!("env:{variable}"),
         }
     }
 }
@@ -282,6 +328,13 @@ fn codex_identity_hint(path: &Path) -> Option<Option<String>> {
     Some(find_identity_hint(&json))
 }
 
+fn copilot_identity_hint(path: &Path) -> Option<Option<String>> {
+    let raw = fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    let entry = copilot_app_entry(&json)?;
+    Some(find_identity_hint(entry))
+}
+
 fn load_codex_secret(path: &Path) -> Result<SecretString, CredentialLoadError> {
     let json = read_json_file(path)?;
     let secret = find_secret_string(
@@ -304,6 +357,58 @@ fn load_codex_secret(path: &Path) -> Result<SecretString, CredentialLoadError> {
     Ok(SecretString::from(secret))
 }
 
+fn load_copilot_oauth_token(path: &Path) -> Result<SecretString, CredentialLoadError> {
+    let json = read_json_file(path)?;
+    let entry = copilot_app_entry(&json).ok_or_else(|| CredentialLoadError::MissingSecret {
+        provider: ProviderKind::Copilot,
+        source: CredentialSource::File {
+            path: path.to_path_buf(),
+        },
+    })?;
+    let secret = entry
+        .get("oauth_token")
+        .or_else(|| entry.get("access_token"))
+        .or_else(|| entry.get("token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| CredentialLoadError::MissingSecret {
+            provider: ProviderKind::Copilot,
+            source: CredentialSource::File {
+                path: path.to_path_buf(),
+            },
+        })?;
+
+    Ok(SecretString::from(secret.to_string()))
+}
+
+fn copilot_app_entry(json: &Value) -> Option<&Value> {
+    let key = format!("github.com:{GITHUB_COPILOT_OAUTH_CLIENT_ID}");
+    json.get(&key).or_else(|| {
+        json.as_object().and_then(|object| {
+            object
+                .iter()
+                .find(|(key, _)| key.ends_with(GITHUB_COPILOT_OAUTH_CLIENT_ID))
+                .map(|(_, value)| value)
+        })
+    })
+}
+
+fn load_env_secret(
+    provider: ProviderKind,
+    variable: &str,
+) -> Result<SecretString, CredentialLoadError> {
+    let secret = std::env::var(variable)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CredentialLoadError::MissingSecret {
+            provider,
+            source: CredentialSource::Environment {
+                variable: variable.to_string(),
+            },
+        })?;
+    Ok(SecretString::from(secret))
+}
+
 fn read_json_file(path: &Path) -> Result<Value, CredentialLoadError> {
     let raw = fs::read_to_string(path)
         .map_err(|_| CredentialLoadError::MissingFile(path.to_path_buf()))?;
@@ -311,7 +416,7 @@ fn read_json_file(path: &Path) -> Result<Value, CredentialLoadError> {
 }
 
 fn find_identity_hint(json: &Value) -> Option<String> {
-    for key in ["email", "user_email", "username"] {
+    for key in ["email", "user_email", "username", "user"] {
         if let Some(value) = json.get(key).and_then(Value::as_str) {
             return Some(value.to_string());
         }
@@ -620,6 +725,56 @@ mod tests {
         let runtime = RuntimeCredentialLoader::load(&reference).unwrap();
 
         assert_eq!(runtime.expose_secret(), "nested-secret");
+    }
+
+    #[test]
+    fn loads_copilot_oauth_token_from_editor_cache() {
+        let temp = TempDir::new("copilot-cache");
+        let config_dir = temp.path().join(".config/github-copilot");
+        fs::create_dir_all(&config_dir).unwrap();
+        let apps_path = config_dir.join("apps.json");
+        fs::write(
+            &apps_path,
+            r#"{
+                "github.com:Iv1.b507a08c87ecfe98": {
+                    "oauth_token": "copilot-oauth-token",
+                    "user": "dev@example.com"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let secret = load_copilot_oauth_token(&apps_path).unwrap();
+        let detector = AuthDetector::new(temp.path().to_path_buf(), None);
+        let credential = detector.detect_copilot().unwrap();
+
+        assert_eq!(secret.expose_secret(), "copilot-oauth-token");
+        assert_eq!(credential.provider, ProviderKind::Copilot);
+        assert_eq!(
+            credential.identity_hint,
+            Some("dev@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn copilot_cache_errors_when_token_is_missing() {
+        let temp = TempDir::new("copilot-missing-token");
+        let apps_path = temp.path().join("apps.json");
+        fs::write(
+            &apps_path,
+            r#"{"github.com:Iv1.b507a08c87ecfe98":{"user":"dev@example.com"}}"#,
+        )
+        .unwrap();
+
+        let error = load_copilot_oauth_token(&apps_path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CredentialLoadError::MissingSecret {
+                provider: ProviderKind::Copilot,
+                ..
+            }
+        ));
     }
 
     #[test]

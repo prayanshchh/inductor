@@ -26,9 +26,11 @@ use persistence::{
 };
 use provider_claude::ClaudeProvider;
 use provider_codex::CodexProvider;
+use provider_copilot::CopilotProvider;
 use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use session_naming::{SessionNamingConfig, generate_session_name};
 use std::time::{Duration, Instant};
 use terminal::{PtyManager, SpawnTerminalRequest, TerminalSize};
@@ -185,11 +187,16 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Detect,
+    CopilotLogin,
 }
 
 #[derive(Debug, Subcommand)]
 enum ProviderCommand {
     InspectAuth {
+        #[arg(long)]
+        provider: ProviderArg,
+    },
+    Models {
         #[arg(long)]
         provider: ProviderArg,
     },
@@ -290,6 +297,7 @@ enum DbCommand {
 enum EffortProviderArg {
     Claude,
     Codex,
+    Copilot,
     Generic,
 }
 
@@ -298,6 +306,7 @@ impl From<EffortProviderArg> for ProviderFamily {
         match value {
             EffortProviderArg::Claude => Self::Claude,
             EffortProviderArg::Codex => Self::Codex,
+            EffortProviderArg::Copilot => Self::Copilot,
             EffortProviderArg::Generic => Self::Generic,
         }
     }
@@ -332,6 +341,7 @@ impl From<EffortArg> for ModelEffort {
 enum ProviderArg {
     Claude,
     Codex,
+    Copilot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -390,6 +400,7 @@ impl From<ProviderArg> for ProviderKind {
         match value {
             ProviderArg::Claude => Self::Claude,
             ProviderArg::Codex => Self::Codex,
+            ProviderArg::Copilot => Self::Copilot,
         }
     }
 }
@@ -399,6 +410,7 @@ impl std::fmt::Display for ProviderArg {
         match self {
             ProviderArg::Claude => write!(f, "claude"),
             ProviderArg::Codex => write!(f, "codex"),
+            ProviderArg::Copilot => write!(f, "copilot"),
         }
     }
 }
@@ -745,7 +757,45 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
                     println!("provider_auth: {provider_auth_debug}");
                     println!("provider_auth_kind: {:?}", provider_auth.kind());
                 }
+                ProviderKind::Copilot => {
+                    let runtime =
+                        RuntimeCredentialLoader::load(reference).map_err(|err| err.to_string())?;
+                    let runtime_debug = format!("{runtime:?}");
+                    let provider_auth = runtime.into_provider_auth();
+                    let provider_auth_debug = format!("{provider_auth:?}");
+                    let provider = CopilotProvider::new().map_err(|err| err.to_string())?;
+
+                    println!("auth_loaded: true");
+                    println!("runtime_credential: {runtime_debug}");
+                    println!("provider_auth: {provider_auth_debug}");
+                    println!("provider_auth_kind: {:?}", provider_auth.kind());
+                    match provider.list_models(&provider_auth).await {
+                        Ok(models) => println!("model_count: {}", models.len()),
+                        Err(error) => println!("auth_error: {error}"),
+                    }
+                }
             }
+        }
+        ProviderCommand::Models { provider } => {
+            let provider = ProviderKind::from(provider);
+            let detector = AuthDetector::from_env().map_err(|err| err.to_string())?;
+            let credentials = detector.detect_all();
+            let reference = credentials
+                .iter()
+                .find(|credential| credential.provider == provider)
+                .ok_or_else(|| format!("no detected credential for {provider}"))?;
+            let auth = provider_auth_for_kind(provider, reference)?;
+            let models = provider_plugin_for_kind(
+                provider,
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )?
+            .list_models(&auth)
+            .await
+            .map_err(|err| err.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string(&models).map_err(|err| err.to_string())?
+            );
         }
         ProviderCommand::Turn {
             provider,
@@ -760,15 +810,7 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
                 .find(|credential| credential.provider == provider)
                 .ok_or_else(|| format!("no detected credential for {provider}"))?;
 
-            let provider_auth = match provider {
-                ProviderKind::Claude => ProviderAuth::new(
-                    ProviderAuthKind::SessionToken,
-                    SecretString::from(String::new()),
-                ),
-                ProviderKind::Codex => RuntimeCredentialLoader::load(reference)
-                    .map_err(|err| err.to_string())?
-                    .into_provider_auth(),
-            };
+            let provider_auth = provider_auth_for_kind(provider, reference)?;
             let session_id = SessionId::new();
             let request = TurnRequest {
                 session_id,
@@ -785,18 +827,14 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
             // surfaces an interactive prompt, so its permission channel stays empty.
             let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel::<PermissionResponse>();
             let tool_rx = provider_core::empty_tool_responses();
-            let mut stream = match provider {
-                ProviderKind::Claude => ClaudeProvider::new()
-                    .map_err(|err| err.to_string())?
-                    .stream_turn(&provider_auth, request, cancel, perm_rx, tool_rx)
-                    .await
-                    .map_err(|err| err.to_string())?,
-                ProviderKind::Codex => CodexProvider::new()
-                    .map_err(|err| err.to_string())?
-                    .stream_turn(&provider_auth, request, cancel, perm_rx, tool_rx)
-                    .await
-                    .map_err(|err| err.to_string())?,
-            };
+            let plugin = provider_plugin_for_kind(
+                provider,
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )?;
+            let mut stream = plugin
+                .stream_turn(&provider_auth, request, cancel, perm_rx, tool_rx)
+                .await
+                .map_err(|err| err.to_string())?;
 
             while let Some(event) = stream.next().await {
                 let event = event.map_err(|err| err.to_string())?;
@@ -807,6 +845,36 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn provider_auth_for_kind(
+    provider: ProviderKind,
+    reference: &auth::DetectedCredential,
+) -> Result<ProviderAuth, String> {
+    match provider {
+        ProviderKind::Claude => Ok(ProviderAuth::new(
+            ProviderAuthKind::SessionToken,
+            SecretString::from(String::new()),
+        )),
+        ProviderKind::Codex | ProviderKind::Copilot => Ok(RuntimeCredentialLoader::load(reference)
+            .map_err(|err| err.to_string())?
+            .into_provider_auth()),
+    }
+}
+
+fn provider_plugin_for_kind(
+    provider: ProviderKind,
+    cwd: PathBuf,
+) -> Result<Box<dyn ProviderPlugin>, String> {
+    match provider {
+        ProviderKind::Claude => Ok(Box::new(ClaudeProvider::with_cwd(cwd))),
+        ProviderKind::Codex => Ok(Box::new(
+            CodexProvider::new().map_err(|err| err.to_string())?,
+        )),
+        ProviderKind::Copilot => Ok(Box::new(
+            CopilotProvider::new().map_err(|err| err.to_string())?,
+        )),
+    }
 }
 
 async fn run_diff_command(command: DiffCommand) -> Result<(), String> {
@@ -1260,6 +1328,9 @@ async fn run_harness_command(
         ProviderKind::Codex => RuntimeCredentialLoader::load(reference)
             .map_err(|err| err.to_string())?
             .into_provider_auth(),
+        ProviderKind::Copilot => RuntimeCredentialLoader::load(reference)
+            .map_err(|err| err.to_string())?
+            .into_provider_auth(),
     };
 
     // Yolo mode is the default: file tools may read/write outside the
@@ -1274,6 +1345,7 @@ async fn run_harness_command(
     let provider_plugin: Box<dyn ProviderPlugin> = match provider {
         ProviderKind::Claude => Box::new(ClaudeProvider::with_cwd(workspace_path.clone())),
         ProviderKind::Codex => Box::new(CodexProvider::new().map_err(|err| err.to_string())?),
+        ProviderKind::Copilot => Box::new(CopilotProvider::new().map_err(|err| err.to_string())?),
     };
 
     let tools = if workspace_only {
@@ -1360,6 +1432,7 @@ async fn run_harness_command(
     config.provider_family = match provider {
         ProviderKind::Claude => ProviderFamily::Claude,
         ProviderKind::Codex => ProviderFamily::Codex,
+        ProviderKind::Copilot => ProviderFamily::Copilot,
     };
     let cancel = CancellationToken::new();
     let cancel_on_signal = cancel.clone();
@@ -1786,6 +1859,7 @@ fn default_provider_model(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "sonnet",
         ProviderKind::Codex => "gpt-5.5",
+        ProviderKind::Copilot => "gpt-4.1",
     }
 }
 
@@ -1964,9 +2038,175 @@ async fn run_auth_command(command: AuthCommand) -> Result<(), String> {
                 println!();
             }
         }
+        AuthCommand::CopilotLogin => copilot_device_login().await?,
     }
 
     Ok(())
+}
+
+const GITHUB_COPILOT_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    expires_in: u64,
+    #[serde(default)]
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+async fn copilot_device_login() -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let device = client
+        .post("https://github.com/login/device/code")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&json!({
+            "client_id": GITHUB_COPILOT_OAUTH_CLIENT_ID,
+            "scope": "read:user",
+        }))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = device.status();
+    let body = device.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "copilot device login failed with HTTP {status}: {}",
+            redact_auth_body(&body)
+        ));
+    }
+    let device: DeviceCodeResponse = serde_json::from_str(&body).map_err(|err| err.to_string())?;
+    emit_auth_status(json!({
+        "type": "auth_status",
+        "provider": "copilot",
+        "status": "device_code",
+        "verification_uri": device.verification_uri,
+        "user_code": device.user_code,
+        "expires_in": device.expires_in,
+    }));
+
+    let mut interval = Duration::from_secs(device.interval.max(5));
+    let expires_at = Instant::now() + Duration::from_secs(device.expires_in.max(900));
+    loop {
+        if Instant::now() >= expires_at {
+            emit_auth_status(json!({
+                "type": "auth_status",
+                "provider": "copilot",
+                "status": "expired",
+            }));
+            return Err("copilot device login expired before approval".to_string());
+        }
+        tokio::time::sleep(interval).await;
+        let response = client
+            .post("https://github.com/login/oauth/access_token")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&json!({
+                "client_id": GITHUB_COPILOT_OAUTH_CLIENT_ID,
+                "device_code": device.device_code.as_str(),
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "copilot device token poll failed with HTTP {status}: {}",
+                redact_auth_body(&body)
+            ));
+        }
+        let token: AccessTokenResponse =
+            serde_json::from_str(&body).map_err(|err| err.to_string())?;
+        if let Some(access_token) = token.access_token {
+            write_copilot_apps_cache(&access_token).map_err(|err| err.to_string())?;
+            emit_auth_status(json!({
+                "type": "auth_status",
+                "provider": "copilot",
+                "status": "connected",
+            }));
+            return Ok(());
+        }
+        match token.error.as_deref() {
+            Some("authorization_pending") => {
+                emit_auth_status(json!({
+                    "type": "auth_status",
+                    "provider": "copilot",
+                    "status": "waiting",
+                }));
+            }
+            Some("slow_down") => {
+                interval += Duration::from_secs(5);
+                emit_auth_status(json!({
+                    "type": "auth_status",
+                    "provider": "copilot",
+                    "status": "waiting",
+                }));
+            }
+            Some(error) => {
+                let message = token.error_description.unwrap_or_else(|| error.to_string());
+                emit_auth_status(json!({
+                    "type": "auth_status",
+                    "provider": "copilot",
+                    "status": "failed",
+                    "message": message,
+                }));
+                return Err(format!("copilot device login failed: {error}"));
+            }
+            None => {
+                return Err("copilot device login returned no token or error".to_string());
+            }
+        }
+    }
+}
+
+fn emit_auth_status(value: Value) {
+    use std::io::Write;
+    if let Ok(line) = serde_json::to_string(&value) {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn write_copilot_apps_cache(access_token: &str) -> std::io::Result<()> {
+    let detector = AuthDetector::from_env()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::NotFound, err.to_string()))?;
+    let path = detector.copilot_auth_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut cache = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let key = format!("github.com:{GITHUB_COPILOT_OAUTH_CLIENT_ID}");
+    cache[&key] = json!({
+        "oauth_token": access_token,
+        "user": ""
+    });
+    let bytes = serde_json::to_vec_pretty(&cache)?;
+    std::fs::write(path, bytes)
+}
+
+fn redact_auth_body(body: &str) -> String {
+    body.chars()
+        .take(2_000)
+        .collect::<String>()
+        .replace("access_token", "access_token_redacted")
+        .replace("oauth_token", "oauth_token_redacted")
 }
 
 async fn run_session_command(command: SessionCommand) -> Result<(), String> {

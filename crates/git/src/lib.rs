@@ -476,7 +476,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(leaf, worktree.branch_name.strip_prefix("inductor/").unwrap());
+        assert_eq!(
+            leaf,
+            worktree.branch_name.strip_prefix("inductor/").unwrap()
+        );
 
         let list = manager.list_worktrees(&worktree.source_repo).unwrap();
         let created_path = fs::canonicalize(&worktree.worktree_path).unwrap();
