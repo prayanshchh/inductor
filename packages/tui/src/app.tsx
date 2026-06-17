@@ -316,7 +316,7 @@ export function App(props: AppProps) {
   const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
   const dimensions = useTerminalDimensions()
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
-  const hasTranscript = createMemo(() => fstate().transcript.length > 0)
+  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || Boolean(fstate().pendingPermission))
   // Full filesystem path the focused agent runs in: its managed worktree when
   // one exists, otherwise the workspace Inductor was opened in.
   const focusedWorktreePath = createMemo(() => {
@@ -394,7 +394,7 @@ export function App(props: AppProps) {
     return commandItems()
   })
 
-  const timer = setInterval(() => setNow(Date.now()), 1000)
+  const timer = setInterval(() => setNow(Date.now()), 120)
   const composerNotice = createMemo(() => {
     const state = fstate()
     return notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission)
@@ -1223,6 +1223,9 @@ export function App(props: AppProps) {
                 <Timeline
                   items={fstate().transcript}
                   pendingPermission={fstate().pendingPermission}
+                  running={fstate().running}
+                  runningStatus={fstate().status}
+                  activityGlyph={runningGlyph(now())}
                   permissionSelected={permissionSelected()}
                   selectPermission={setPermissionSelected}
                   expanded={expanded()}
@@ -1264,7 +1267,6 @@ export function App(props: AppProps) {
           insertPromptNewline={insertPromptNewline}
           navigatePromptHistory={navigatePromptHistory}
           notice={composerNotice()}
-          activityGlyph={runningGlyph(now())}
           pasteFromClipboard={pasteFromClipboard}
         />
       </box>
@@ -1629,9 +1631,9 @@ function WorktreeRow(props: {
 
 function defaultComposerNotice(status: string, running: boolean, pendingPermission?: AppState["pendingPermission"]): ComposerNotice {
   if (pendingPermission) return { text: "approval required · ↑/↓ choose · enter confirm", tone: "cyan" }
-  if (running) return { text: "agent running", tone: "cyan" }
   if (!status || status === "idle") return { text: "ready", tone: "muted" }
   if (status === "stopped") return { text: "stopped agent", tone: "red" }
+  if (running) return { text: status, tone: "muted" }
   return { text: status, tone: "muted" }
 }
 
@@ -1684,6 +1686,9 @@ function StartScreen(_props: { height: number }) {
 function Timeline(props: {
   items: TranscriptItem[]
   pendingPermission?: AppState["pendingPermission"]
+  running: boolean
+  runningStatus: string
+  activityGlyph: string
   permissionSelected: number
   selectPermission: (index: number) => void
   expanded: Set<string>
@@ -1703,6 +1708,9 @@ function Timeline(props: {
       </For>
       <Show when={props.pendingPermission}>
         {(request) => <PermissionTimelineItem request={request()} selected={props.permissionSelected} select={props.selectPermission} decide={props.decide} />}
+      </Show>
+      <Show when={props.running && !props.pendingPermission}>
+        <AgentWorkingTimelineItem glyph={props.activityGlyph} status={props.runningStatus} />
       </Show>
     </box>
   )
@@ -1942,6 +1950,20 @@ function TimelineShell(props: { marker: string; color: string; label: string; ch
   )
 }
 
+function AgentWorkingTimelineItem(props: { glyph: string; status: string }) {
+  return (
+    <TimelineShell marker={props.glyph} color={theme.cyan} label="agent">
+      <box flexDirection="column">
+        <box flexDirection="row" gap={1}>
+          <text fg={theme.text} attributes={TextAttributes.BOLD} selectable={false}>{agentActivityText(props.status)}</text>
+          <text fg={theme.cyan} selectable={false}>{activityPulse(props.glyph)}</text>
+        </box>
+        <text fg={theme.dim} selectable={false}>Esc Esc stop · Ctrl+C Ctrl+C quit</text>
+      </box>
+    </TimelineShell>
+  )
+}
+
 function PermissionTimelineItem(props: {
   request: NonNullable<AppState["pendingPermission"]>
   selected: number
@@ -2018,11 +2040,10 @@ function Composer(props: {
   insertPromptNewline: () => void
   navigatePromptHistory: (direction: HistoryDirection) => boolean
   notice: ComposerNotice
-  activityGlyph: string
   pasteFromClipboard: () => Promise<void>
 }) {
   let textarea!: TextareaRenderable
-  const showActivity = () => props.state.running || Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
+  const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
       <Show when={props.palette()}>
@@ -2047,15 +2068,12 @@ function Composer(props: {
             paddingRight={1}
           >
             <text fg={noticeColor(props.notice)} attributes={TextAttributes.BOLD}>
-              {props.state.running ? props.activityGlyph : props.notice.tone === "red" ? "!" : "•"}
+              {props.notice.tone === "red" ? "!" : "•"}
             </text>
             <text fg={noticeColor(props.notice)} attributes={props.notice.tone === "cyan" || props.notice.tone === "red" ? TextAttributes.BOLD : undefined}>
               {props.notice.text}
             </text>
           </box>
-          <Show when={props.state.running}>
-            <text fg={theme.dim}>Esc Esc stop · Ctrl+C Ctrl+C quit</text>
-          </Show>
         </box>
       </Show>
       <box
@@ -2076,7 +2094,7 @@ function Composer(props: {
             width="100%"
             minHeight={1}
             maxHeight={5}
-            placeholder={props.state.pendingPermission ? "approval required: press 1, 2, or 3" : props.state.running ? "agent is working..." : "Ask INDUCTOR..."}
+            placeholder={props.state.pendingPermission ? "approval required: press 1, 2, or 3" : props.state.running ? "agent running..." : "Ask INDUCTOR..."}
             placeholderColor={theme.dim}
             textColor={theme.text}
             focusedTextColor={theme.text}
@@ -2440,6 +2458,20 @@ function modelDisplay(provider: string, model: string) {
 function runningGlyph(now: number) {
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
   return frames[Math.floor(now / 90) % frames.length] ?? "⠋"
+}
+
+function activityPulse(glyph: string) {
+  const frames = ["   ", ".  ", ".. ", "..."]
+  const seed = glyph.codePointAt(0) ?? 0
+  return frames[seed % frames.length] ?? "..."
+}
+
+function agentActivityText(status: string) {
+  if (status === "running_tools") return "running tools"
+  if (status === "waiting_for_permission") return "waiting for approval"
+  if (status === "streaming") return "writing response"
+  if (status === "running" || !status || status === "idle") return "agent is working"
+  return status.replaceAll("_", " ")
 }
 
 function toolLabel(name: string) {
