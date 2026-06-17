@@ -1498,8 +1498,36 @@ async fn run_harness_command(
     ));
 
     let mut final_status = SessionStatus::Completed;
+    let mut saw_terminal_result = false;
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|err| err.to_string())?;
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                let message = format!("agent stream failed: {err}");
+                dlog(&message);
+                let error_event = SessionEvent::Error {
+                    session_id,
+                    message,
+                };
+                persist_event(&workspace_db, &error_event).map_err(|err| err.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&error_event).map_err(|err| err.to_string())?
+                );
+                let result_event = SessionEvent::Result {
+                    session_id,
+                    stop_reason: StopReason::Error,
+                };
+                persist_event(&workspace_db, &result_event).map_err(|err| err.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&result_event).map_err(|err| err.to_string())?
+                );
+                final_status = SessionStatus::Failed;
+                saw_terminal_result = true;
+                break;
+            }
+        };
         match &event {
             SessionEvent::PermissionRequest {
                 tool_name,
@@ -1534,6 +1562,9 @@ async fn run_harness_command(
         ) {
             final_status = SessionStatus::Failed;
         }
+        if matches!(event, SessionEvent::Result { .. }) {
+            saw_terminal_result = true;
+        }
         if matches!(
             event,
             SessionEvent::Result {
@@ -1563,6 +1594,30 @@ async fn run_harness_command(
         println!("{line}");
     }
     drop(stream);
+
+    if !saw_terminal_result {
+        let message = "agent stream ended without a terminal result".to_string();
+        dlog(&message);
+        let error_event = SessionEvent::Error {
+            session_id,
+            message,
+        };
+        persist_event(&workspace_db, &error_event).map_err(|err| err.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string(&error_event).map_err(|err| err.to_string())?
+        );
+        let result_event = SessionEvent::Result {
+            session_id,
+            stop_reason: StopReason::Error,
+        };
+        persist_event(&workspace_db, &result_event).map_err(|err| err.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string(&result_event).map_err(|err| err.to_string())?
+        );
+        final_status = SessionStatus::Failed;
+    }
 
     let stored_messages = state
         .transcript
@@ -1726,6 +1781,9 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
                 exit_code: *exit_code,
                 blob_id: None,
             })?;
+        }
+        SessionEvent::ToolCallError { tool_call_id, .. } => {
+            db.mark_tool_failed(&tool_call_id.to_string())?;
         }
         _ => {}
     }
