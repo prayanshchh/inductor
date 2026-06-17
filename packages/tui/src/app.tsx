@@ -18,7 +18,7 @@ import {
 } from "./state"
 import { archiveWorktree, listProviderModels, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
-import { createUnifiedPatchFromContent } from "./diff_patch"
+import { createUnifiedPatchFromContent, normalizeDiffForRendering } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
@@ -1862,7 +1862,7 @@ function DiffWithHunkReview(props: { diff: string; path?: string }) {
   return (
     <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
       <diff
-        diff={props.diff}
+        diff={normalizeDiffForRendering(props.diff)}
         view="split"
         syncScroll={true}
         filetype={filetype(props.path)}
