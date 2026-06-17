@@ -1,14 +1,20 @@
 use std::{
+    collections::HashMap,
     fmt, fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use sandbox::SandboxPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::process::Command as TokioCommand;
+use tokio::{io::AsyncReadExt, process::Command as TokioCommand, sync::Notify};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
@@ -31,6 +37,8 @@ pub enum ToolName {
     WebFetch,
     TodoWrite,
     Bash,
+    BashWait,
+    BashKill,
 }
 
 impl ToolName {
@@ -48,6 +56,8 @@ impl ToolName {
             Self::WebFetch => "web_fetch",
             Self::TodoWrite => "todo_write",
             Self::Bash => "bash",
+            Self::BashWait => "bash_wait",
+            Self::BashKill => "bash_kill",
         }
     }
 
@@ -65,6 +75,8 @@ impl ToolName {
             Self::WebFetch => "Fetch Webpage",
             Self::TodoWrite => "Update Todo List",
             Self::Bash => "Run Command",
+            Self::BashWait => "Wait For Command",
+            Self::BashKill => "Stop Command",
         }
     }
 }
@@ -255,11 +267,36 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::Bash,
-            description: "Run a shell command in the workspace.",
+            description: "Run a shell command in the workspace. Long-running commands may return a checkpoint with a command_id; use bash_wait to keep waiting for final output or bash_kill to stop it.",
             input_schema: json!({
                 "type": "object",
                 "properties": { "command": { "type": "string", "description": "Shell command" } },
                 "required": ["command"]
+            }),
+            read_only: false,
+        },
+        ToolDefinition {
+            name: ToolName::BashWait,
+            description: "Continue waiting for a bash command that returned a checkpoint. Returns final output when the command finishes, or another checkpoint after timeout_secs while it keeps running.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command_id": { "type": "string", "description": "command_id returned by a bash checkpoint" },
+                    "timeout_secs": { "type": "integer", "description": "Seconds to wait before returning another checkpoint; defaults to 30" }
+                },
+                "required": ["command_id"]
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::BashKill,
+            description: "Stop a bash command that is still running after a checkpoint and return the output captured so far.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command_id": { "type": "string", "description": "command_id returned by a bash checkpoint" }
+                },
+                "required": ["command_id"]
             }),
             read_only: false,
         },
@@ -345,6 +382,53 @@ pub struct ToolRuntime {
     grep_match_limit: usize,
     sandbox: SandboxPolicy,
     allow_outside_paths: bool,
+    background_commands: Arc<Mutex<HashMap<String, BackgroundCommand>>>,
+    background_command_counter: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundCommand {
+    id: String,
+    command: String,
+    started_at: Instant,
+    stdout_buffer: Arc<Mutex<Vec<u8>>>,
+    stderr_buffer: Arc<Mutex<Vec<u8>>>,
+    status: Arc<Mutex<BackgroundCommandStatus>>,
+    kill: CancellationToken,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundCommandStatus {
+    Running,
+    Completed { exit_code: Option<i32> },
+    Killed { exit_code: Option<i32> },
+}
+
+impl BackgroundCommand {
+    fn status(&self) -> BackgroundCommandStatus {
+        self.status
+            .lock()
+            .map(|status| *status)
+            .unwrap_or(BackgroundCommandStatus::Running)
+    }
+
+    fn combined_output(&self) -> String {
+        let stdout = self
+            .stdout_buffer
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let stderr = self
+            .stderr_buffer
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let mut combined = String::new();
+        combined.push_str(&String::from_utf8_lossy(&stdout));
+        combined.push_str(&String::from_utf8_lossy(&stderr));
+        combined
+    }
 }
 
 impl ToolRuntime {
@@ -358,6 +442,8 @@ impl ToolRuntime {
             grep_match_limit: DEFAULT_GREP_MATCH_LIMIT,
             sandbox: SandboxPolicy::Disabled,
             allow_outside_paths: false,
+            background_commands: Arc::new(Mutex::new(HashMap::new())),
+            background_command_counter: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -380,6 +466,8 @@ impl ToolRuntime {
             grep_match_limit: self.grep_match_limit,
             sandbox: SandboxPolicy::Disabled,
             allow_outside_paths: true,
+            background_commands: self.background_commands.clone(),
+            background_command_counter: self.background_command_counter.clone(),
         }
     }
 
@@ -801,41 +889,354 @@ impl ToolRuntime {
         command: impl AsRef<str>,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
+        self.bash_cancellable_until(command, cancel, None).await
+    }
+
+    pub async fn bash_cancellable_until(
+        &self,
+        command: impl AsRef<str>,
+        cancel: CancellationToken,
+        checkpoint_after: Option<Duration>,
+    ) -> Result<ToolResult, ToolError> {
         let command = command.as_ref();
         let (program, args) = self.sandbox.wrap_shell_command(command);
-        let child = TokioCommand::new(&program)
+        let mut command_builder = TokioCommand::new(&program);
+        command_builder
             .args(&args)
             .current_dir(&self.workspace_root)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        command_builder.process_group(0);
+        let mut child = command_builder
             .spawn()
             .map_err(|err| ToolError::CommandSpawnFailed {
                 command: command.to_string(),
                 source: err,
             })?;
+        let child_id = child.id();
 
-        let output = tokio::select! {
-            output = child.wait_with_output() => output.map_err(|err| ToolError::CommandSpawnFailed {
-                command: command.to_string(),
-                source: err,
-            })?,
-            _ = cancel.cancelled() => return Err(ToolError::CommandCancelled {
-                command: command.to_string(),
-            }),
+        let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stdout_task = {
+            let buffer = stdout_buffer.clone();
+            let stdout = child.stdout.take();
+            tokio::spawn(async move {
+                if let Some(mut stdout) = stdout {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stdout.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if let Ok(mut guard) = buffer.lock() {
+                                    guard.extend_from_slice(&chunk[..n]);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })
+        };
+        let stderr_task = {
+            let buffer = stderr_buffer.clone();
+            let stderr = child.stderr.take();
+            tokio::spawn(async move {
+                if let Some(mut stderr) = stderr {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stderr.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if let Ok(mut guard) = buffer.lock() {
+                                    guard.extend_from_slice(&chunk[..n]);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })
         };
 
+        enum BashOutcome {
+            Completed(std::process::ExitStatus),
+            Cancelled,
+            Checkpoint,
+        }
+
+        let checkpoint = async {
+            if let Some(duration) = checkpoint_after {
+                tokio::time::sleep(duration).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(checkpoint);
+        let outcome = tokio::select! {
+            output = child.wait() => BashOutcome::Completed(output.map_err(|err| ToolError::CommandSpawnFailed {
+                command: command.to_string(),
+                source: err,
+            })?),
+            _ = cancel.cancelled() => {
+                kill_background_process(child_id);
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                BashOutcome::Cancelled
+            }
+            _ = &mut checkpoint => {
+                BashOutcome::Checkpoint
+            }
+        };
+
+        let status = match outcome {
+            BashOutcome::Completed(status) => {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                status
+            }
+            BashOutcome::Cancelled => {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(ToolError::CommandCancelled {
+                    command: command.to_string(),
+                });
+            }
+            BashOutcome::Checkpoint => {
+                let command_id = self.next_background_command_id();
+                let kill = CancellationToken::new();
+                let notify = Arc::new(Notify::new());
+                let status_state = Arc::new(Mutex::new(BackgroundCommandStatus::Running));
+                let handle = BackgroundCommand {
+                    id: command_id.clone(),
+                    command: command.to_string(),
+                    started_at: Instant::now()
+                        .checked_sub(checkpoint_after.unwrap_or_default())
+                        .unwrap_or_else(Instant::now),
+                    stdout_buffer: stdout_buffer.clone(),
+                    stderr_buffer: stderr_buffer.clone(),
+                    status: status_state.clone(),
+                    kill: kill.clone(),
+                    notify: notify.clone(),
+                };
+                self.store_background_command(handle)?;
+                tokio::spawn(async move {
+                    let outcome = tokio::select! {
+                        output = child.wait() => BackgroundCommandStatus::Completed {
+                            exit_code: output.ok().and_then(|status| status.code()),
+                        },
+                        _ = kill.cancelled() => {
+                            kill_background_process(child_id);
+                            let _ = child.start_kill();
+                            BackgroundCommandStatus::Killed {
+                                exit_code: child.wait().await.ok().and_then(|status| status.code()),
+                            }
+                        }
+                    };
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    if let Ok(mut status) = status_state.lock() {
+                        *status = outcome;
+                    }
+                    notify.notify_waiters();
+                });
+                let stdout = stdout_buffer
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let stderr = stderr_buffer
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let mut combined = String::new();
+                combined.push_str(&String::from_utf8_lossy(&stdout));
+                combined.push_str(&String::from_utf8_lossy(&stderr));
+                let elapsed = checkpoint_after.unwrap_or_default();
+                return Err(ToolError::CommandCheckpoint {
+                    command_id,
+                    command: command.to_string(),
+                    elapsed,
+                    output: cap_output(combined, self.output_limit_bytes).text,
+                });
+            }
+        };
+
+        let stdout = stdout_buffer
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let stderr = stderr_buffer
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let mut combined = String::new();
-        combined.push_str(&String::from_utf8_lossy(&output.stdout));
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        combined.push_str(&String::from_utf8_lossy(&stdout));
+        combined.push_str(&String::from_utf8_lossy(&stderr));
 
         Ok(ToolResult {
             name: ToolName::Bash,
             title: ToolName::Bash.title().to_string(),
             metadata: json!({ "command": command }),
             output: cap_output(combined, self.output_limit_bytes).text,
-            exit_code: output.status.code(),
+            exit_code: status.code(),
             truncated: false,
+        }
+        .with_output_cap(self.output_limit_bytes))
+    }
+
+    pub async fn bash_wait(
+        &self,
+        command_id: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<ToolResult, ToolError> {
+        let command_id = command_id.as_ref();
+        let handle = self.background_command(command_id)?;
+
+        if matches!(handle.status(), BackgroundCommandStatus::Running) {
+            let notified = handle.notify.notified();
+            if matches!(handle.status(), BackgroundCommandStatus::Running) {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(timeout) => {}
+                }
+            }
+        }
+
+        match handle.status() {
+            BackgroundCommandStatus::Running => {
+                let output = cap_output(handle.combined_output(), self.output_limit_bytes);
+                Ok(ToolResult {
+                    name: ToolName::BashWait,
+                    title: ToolName::BashWait.title().to_string(),
+                    metadata: json!({
+                        "command_id": handle.id,
+                        "command": handle.command,
+                        "running": true,
+                        "elapsed_secs": handle.started_at.elapsed().as_secs(),
+                    }),
+                    output: format!(
+                        "command_id {} is still running after waiting {}. The command is NOT killed. Call bash_wait again to keep waiting for final output, or bash_kill to stop it.\n{}",
+                        command_id,
+                        format_duration(timeout),
+                        format_partial_output(&output.text),
+                    ),
+                    exit_code: None,
+                    truncated: output.truncated,
+                }
+                .with_output_cap(self.output_limit_bytes))
+            }
+            BackgroundCommandStatus::Completed { exit_code } => {
+                self.remove_background_command(command_id);
+                self.finished_background_result(&handle, "completed", exit_code, ToolName::BashWait)
+            }
+            BackgroundCommandStatus::Killed { exit_code } => {
+                self.remove_background_command(command_id);
+                self.finished_background_result(&handle, "killed", exit_code, ToolName::BashWait)
+            }
+        }
+    }
+
+    pub async fn bash_kill(&self, command_id: impl AsRef<str>) -> Result<ToolResult, ToolError> {
+        let command_id = command_id.as_ref();
+        let handle = self.background_command(command_id)?;
+
+        if matches!(handle.status(), BackgroundCommandStatus::Running) {
+            handle.kill.cancel();
+            let notified = handle.notify.notified();
+            if matches!(handle.status(), BackgroundCommandStatus::Running) {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        return Err(ToolError::CommandKillTimedOut {
+                            command_id: command_id.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let status = handle.status();
+        self.remove_background_command(command_id);
+        match status {
+            BackgroundCommandStatus::Running => Err(ToolError::CommandKillTimedOut {
+                command_id: command_id.to_string(),
+            }),
+            BackgroundCommandStatus::Completed { exit_code } => self.finished_background_result(
+                &handle,
+                "completed before kill",
+                exit_code,
+                ToolName::BashKill,
+            ),
+            BackgroundCommandStatus::Killed { exit_code } => {
+                self.finished_background_result(&handle, "killed", exit_code, ToolName::BashKill)
+            }
+        }
+    }
+
+    fn next_background_command_id(&self) -> String {
+        let id = self
+            .background_command_counter
+            .fetch_add(1, Ordering::Relaxed);
+        format!("bash-{id}")
+    }
+
+    fn store_background_command(&self, command: BackgroundCommand) -> Result<(), ToolError> {
+        let mut commands = self
+            .background_commands
+            .lock()
+            .map_err(|_| ToolError::BackgroundCommandRegistryPoisoned)?;
+        commands.insert(command.id.clone(), command);
+        Ok(())
+    }
+
+    fn background_command(&self, command_id: &str) -> Result<BackgroundCommand, ToolError> {
+        let commands = self
+            .background_commands
+            .lock()
+            .map_err(|_| ToolError::BackgroundCommandRegistryPoisoned)?;
+        commands
+            .get(command_id)
+            .cloned()
+            .ok_or_else(|| ToolError::UnknownBackgroundCommand {
+                command_id: command_id.to_string(),
+            })
+    }
+
+    fn remove_background_command(&self, command_id: &str) {
+        if let Ok(mut commands) = self.background_commands.lock() {
+            commands.remove(command_id);
+        }
+    }
+
+    fn finished_background_result(
+        &self,
+        handle: &BackgroundCommand,
+        status: &str,
+        exit_code: Option<i32>,
+        name: ToolName,
+    ) -> Result<ToolResult, ToolError> {
+        let output = cap_output(handle.combined_output(), self.output_limit_bytes);
+        Ok(ToolResult {
+            name,
+            title: name.title().to_string(),
+            metadata: json!({
+                "command_id": handle.id,
+                "command": handle.command,
+                "status": status,
+                "elapsed_secs": handle.started_at.elapsed().as_secs(),
+            }),
+            output: format!(
+                "command_id {} {status}. Final output:\n{}",
+                handle.id,
+                if output.text.is_empty() {
+                    "<no output>"
+                } else {
+                    &output.text
+                },
+            ),
+            exit_code,
+            truncated: output.truncated,
         }
         .with_output_cap(self.output_limit_bytes))
     }
@@ -1253,6 +1654,19 @@ pub enum ToolError {
     CommandCancelled {
         command: String,
     },
+    CommandCheckpoint {
+        command_id: String,
+        command: String,
+        elapsed: Duration,
+        output: String,
+    },
+    UnknownBackgroundCommand {
+        command_id: String,
+    },
+    BackgroundCommandRegistryPoisoned,
+    CommandKillTimedOut {
+        command_id: String,
+    },
     BinaryFile {
         path: PathBuf,
     },
@@ -1343,6 +1757,31 @@ impl fmt::Display for ToolError {
                 write!(f, "failed to run command {command:?}: {source}")
             }
             Self::CommandCancelled { command } => write!(f, "command cancelled: {command:?}"),
+            Self::CommandCheckpoint {
+                command_id,
+                command,
+                elapsed,
+                output,
+            } => {
+                write!(
+                    f,
+                    "command {command:?} has been running for {} and reached the tool checkpoint. command_id: {command_id}. The command is still running in the background. Call bash_wait with this command_id to keep waiting and receive the final output when it finishes, or call bash_kill with this command_id to stop it. {}",
+                    format_duration(*elapsed),
+                    format_partial_output(output)
+                )
+            }
+            Self::UnknownBackgroundCommand { command_id } => {
+                write!(f, "unknown background command_id: {command_id}")
+            }
+            Self::BackgroundCommandRegistryPoisoned => {
+                write!(f, "background command registry is unavailable")
+            }
+            Self::CommandKillTimedOut { command_id } => {
+                write!(
+                    f,
+                    "timed out while stopping background command_id: {command_id}"
+                )
+            }
             Self::BinaryFile { path } => {
                 write!(f, "refusing to edit binary file: {}", path.display())
             }
@@ -1403,6 +1842,42 @@ fn cap_output(text: String, limit: usize) -> CappedOutput {
     CappedOutput {
         text: text[..end].to_string(),
         truncated: true,
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn format_partial_output(output: &str) -> String {
+    if output.trim().is_empty() {
+        "No output was captured before the checkpoint.".to_string()
+    } else {
+        format!("Partial output captured before the checkpoint:\n{output}")
+    }
+}
+
+fn kill_background_process(child_id: Option<u32>) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child_id {
+            // Commands are spawned in their own process group, so a negative pid
+            // terminates the shell and any children it started.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child_id;
     }
 }
 
@@ -1861,6 +2336,103 @@ mod tests {
         let result = runtime.bash("exit 7").unwrap();
 
         assert_eq!(result.exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn bash_checkpoint_does_not_interrupt_command() {
+        let temp = TempDir::new("bash-checkpoint");
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let err = runtime
+            .bash_cancellable_until(
+                "printf partial; sleep 1; printf done > marker.txt",
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap_err();
+
+        let command_id = match err {
+            ToolError::CommandCheckpoint {
+                command_id, output, ..
+            } => {
+                assert!(output.contains("partial"));
+                command_id
+            }
+            other => panic!("expected checkpoint, got {other:?}"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert_eq!(
+            fs::read_to_string(temp.path().join("marker.txt")).unwrap(),
+            "done"
+        );
+
+        let result = runtime
+            .bash_wait(command_id, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(result.name, ToolName::BashWait);
+        assert!(result.output.contains("Final output"));
+        assert!(result.output.contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn bash_wait_returns_final_output_after_checkpoint() {
+        let temp = TempDir::new("bash-wait-final");
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let err = runtime
+            .bash_cancellable_until(
+                "printf partial; sleep 1; printf done",
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap_err();
+
+        let command_id = match err {
+            ToolError::CommandCheckpoint { command_id, .. } => command_id,
+            other => panic!("expected checkpoint, got {other:?}"),
+        };
+
+        let result = runtime
+            .bash_wait(command_id, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(result.name, ToolName::BashWait);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("Final output"));
+        assert!(result.output.contains("partialdone"));
+    }
+
+    #[tokio::test]
+    async fn bash_kill_stops_checkpointed_command_tree() {
+        let temp = TempDir::new("bash-kill");
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let err = runtime
+            .bash_cancellable_until(
+                "printf start; sleep 2; printf done > marker.txt",
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap_err();
+
+        let command_id = match err {
+            ToolError::CommandCheckpoint { command_id, .. } => command_id,
+            other => panic!("expected checkpoint, got {other:?}"),
+        };
+
+        let result = runtime.bash_kill(command_id).await.unwrap();
+
+        assert_eq!(result.name, ToolName::BashKill);
+        assert!(result.output.contains("killed"));
+        assert!(result.output.contains("start"));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!temp.path().join("marker.txt").exists());
     }
 
     #[test]

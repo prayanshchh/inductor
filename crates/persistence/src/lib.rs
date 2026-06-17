@@ -978,6 +978,14 @@ VALUES (?1, ?2, ?3, ?4, ?5)
         Ok(())
     }
 
+    pub fn mark_tool_failed(&self, tool_call_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_calls SET status = 'failed', updated_at = ?1 WHERE id = ?2",
+            params![now_rfc3339()?, tool_call_id],
+        )?;
+        Ok(())
+    }
+
     pub fn put_blob(&self, blob: &BlobRecord) -> Result<()> {
         self.conn.execute(
             r#"
@@ -1459,12 +1467,57 @@ mod tests {
         })
         .unwrap();
         db.add_tool_result(&ToolResultRecord {
-            tool_call_id,
+            tool_call_id: tool_call_id.clone(),
             output: "ok".to_string(),
             exit_code: Some(0),
             blob_id: None,
         })
         .unwrap();
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT status FROM tool_calls WHERE id = ?1",
+                [tool_call_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn workspace_db_marks_tool_errors_failed() {
+        let db = WorkspaceDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        let tool_call_id = ToolCallId::new().to_string();
+        let session = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.5",
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+
+        db.upsert_tool_call(&ToolCallRecord {
+            id: tool_call_id.clone(),
+            session_id,
+            name: "edit_file".to_string(),
+            input_json: json!({"path": "src/lib.rs"}),
+            status: "started".to_string(),
+        })
+        .unwrap();
+        db.mark_tool_failed(&tool_call_id).unwrap();
+
+        let status: String = db
+            .conn
+            .query_row(
+                "SELECT status FROM tool_calls WHERE id = ?1",
+                [tool_call_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     #[test]

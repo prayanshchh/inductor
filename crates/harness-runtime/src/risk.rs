@@ -302,6 +302,7 @@ pub fn is_mutating_tool_name(name: &str) -> bool {
             | "apply_patch_freeform"
             | "apply_patch_structured"
             | "todo_write"
+            | "bash_kill"
             | "bash"
     )
 }

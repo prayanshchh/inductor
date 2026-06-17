@@ -10,7 +10,7 @@ use context::{ModelEffort, ProviderFamily};
 use futures_util::StreamExt;
 use harness_core::{
     AllowRule, AllowRuleKind, ApprovalPolicy, MessagePart, ModelInfo, PermissionDecision,
-    ProviderCapabilities, SessionEvent, StopReason,
+    ProviderCapabilities, SessionEvent, StopReason, ToolCallId,
 };
 use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
@@ -532,6 +532,197 @@ impl ProviderPlugin for ScriptedProvider {
     }
 }
 
+struct StartFailingProvider;
+
+#[async_trait::async_trait]
+impl ProviderPlugin for StartFailingProvider {
+    fn id(&self) -> &'static str {
+        "start-failing-test-stub"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            token_counting: false,
+            tool_calling: false,
+        }
+    }
+
+    async fn list_models(&self, _auth: &ProviderAuth) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn stream_turn(
+        &self,
+        _auth: &ProviderAuth,
+        _req: TurnRequest,
+        _cancel: CancellationToken,
+        _permissions: provider_core::PermissionResponses,
+        _tool_responses: provider_core::ToolResponses,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+        anyhow::bail!("start boom")
+    }
+}
+
+struct StreamFailingProvider;
+
+#[async_trait::async_trait]
+impl ProviderPlugin for StreamFailingProvider {
+    fn id(&self) -> &'static str {
+        "stream-failing-test-stub"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            token_counting: false,
+            tool_calling: false,
+        }
+    }
+
+    async fn list_models(&self, _auth: &ProviderAuth) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn stream_turn(
+        &self,
+        _auth: &ProviderAuth,
+        req: TurnRequest,
+        _cancel: CancellationToken,
+        _permissions: provider_core::PermissionResponses,
+        _tool_responses: provider_core::ToolResponses,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+        let session_id = req.session_id;
+        let stream = async_stream::try_stream! {
+            yield SessionEvent::TextDelta {
+                session_id,
+                text: "partial answer".to_string(),
+            };
+            Err::<(), anyhow::Error>(anyhow::anyhow!("stream boom"))?;
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+struct EndingWithoutResultProvider;
+
+#[async_trait::async_trait]
+impl ProviderPlugin for EndingWithoutResultProvider {
+    fn id(&self) -> &'static str {
+        "ending-without-result-test-stub"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            token_counting: false,
+            tool_calling: false,
+        }
+    }
+
+    async fn list_models(&self, _auth: &ProviderAuth) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn stream_turn(
+        &self,
+        _auth: &ProviderAuth,
+        req: TurnRequest,
+        _cancel: CancellationToken,
+        _permissions: provider_core::PermissionResponses,
+        _tool_responses: provider_core::ToolResponses,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+        let session_id = req.session_id;
+        let stream = async_stream::try_stream! {
+            yield SessionEvent::TextDelta {
+                session_id,
+                text: "partial answer".to_string(),
+            };
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+struct NativeCheckpointWaitProvider;
+
+#[async_trait::async_trait]
+impl ProviderPlugin for NativeCheckpointWaitProvider {
+    fn id(&self) -> &'static str {
+        "native-checkpoint-wait-test-stub"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            token_counting: false,
+            tool_calling: true,
+        }
+    }
+
+    async fn list_models(&self, _auth: &ProviderAuth) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn stream_turn(
+        &self,
+        _auth: &ProviderAuth,
+        req: TurnRequest,
+        _cancel: CancellationToken,
+        _permissions: provider_core::PermissionResponses,
+        mut tool_responses: provider_core::ToolResponses,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+        let session_id = req.session_id;
+        let stream = async_stream::try_stream! {
+            let bash_call_id = ToolCallId::new();
+            yield SessionEvent::ToolCallRequested {
+                session_id,
+                tool_call_id: bash_call_id,
+                name: ToolName::Bash.as_str().to_string(),
+                input_json: json!({
+                    "command": "printf partial; sleep 1; printf done"
+                }),
+            };
+            let checkpoint = tool_responses
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("missing checkpoint response"))?;
+            assert_eq!(checkpoint.tool_call_id, bash_call_id);
+            assert!(checkpoint.output.contains("command_id: bash-"));
+            let command_id = checkpoint
+                .output
+                .split("command_id: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(|value| value.trim_end_matches('.').to_string())
+                .ok_or_else(|| anyhow::anyhow!("missing command_id in checkpoint"))?;
+
+            let wait_call_id = ToolCallId::new();
+            yield SessionEvent::ToolCallRequested {
+                session_id,
+                tool_call_id: wait_call_id,
+                name: ToolName::BashWait.as_str().to_string(),
+                input_json: json!({
+                    "command_id": command_id,
+                    "timeout_secs": 2,
+                }),
+            };
+            let final_output = tool_responses
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("missing wait response"))?;
+            assert_eq!(final_output.tool_call_id, wait_call_id);
+            assert!(!final_output.is_error);
+            assert!(final_output.output.contains("Final output"));
+            assert!(final_output.output.contains("partialdone"));
+            yield SessionEvent::Result {
+                session_id,
+                stop_reason: StopReason::EndTurn,
+            };
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
 fn test_auth() -> ProviderAuth {
     ProviderAuth::new(
         ProviderAuthKind::SessionToken,
@@ -606,6 +797,276 @@ async fn loop_executes_tool_then_finishes() {
     ));
     // Transcript captured user, assistant, tool, assistant.
     assert_eq!(state.transcript.len(), 4);
+}
+
+#[tokio::test]
+async fn provider_start_error_becomes_terminal_error_result() {
+    let temp = TempDir::new("provider-start-error");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+    let provider = StartFailingProvider;
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "hello".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Error { message, .. } if message.contains("provider failed to start turn")
+            && message.contains("start boom")
+    )));
+    assert!(matches!(
+        events.last().unwrap(),
+        SessionEvent::Result {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn provider_stream_error_becomes_terminal_error_result() {
+    let temp = TempDir::new("provider-stream-error");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+    let provider = StreamFailingProvider;
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "hello".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::TextEnd { text, .. } if text == "partial answer"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Error { message, .. } if message.contains("provider stream failed")
+            && message.contains("stream boom")
+    )));
+    assert!(matches!(
+        events.last().unwrap(),
+        SessionEvent::Result {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn provider_eof_without_result_becomes_terminal_error_result() {
+    let temp = TempDir::new("provider-eof-error");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+    let provider = EndingWithoutResultProvider;
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "hello".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::TextEnd { text, .. } if text == "partial answer"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Error { message, .. } if message.contains("ended without a terminal result")
+    )));
+    assert!(matches!(
+        events.last().unwrap(),
+        SessionEvent::Result {
+            stop_reason: StopReason::Error,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn long_running_bash_emits_progress_before_result() {
+    let temp = TempDir::new("loop-progress");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"bash\",\"input\":{\"command\":\"sleep 6; echo done\"}}</inductor_tool_call>",
+        "done",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut config = HarnessConfig::new("test-model");
+    config.approval_policy = ApprovalPolicy::Never;
+
+    let mut allow = AllowStore::new();
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "run a slow command".to_string(),
+        config,
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    let start_index = events
+        .iter()
+        .position(
+            |event| matches!(event, SessionEvent::ToolCallStart { name, .. } if name == "bash"),
+        )
+        .expect("tool start should be visible before completion");
+    let progress_index = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::ToolCallProgress { message, .. } if message.contains("still running for")))
+        .expect("long-running tool should emit stopwatch progress");
+    let result_index = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::ToolCallResult { output, .. } if output.contains("done")))
+        .expect("tool should still finish normally");
+
+    assert!(start_index < progress_index);
+    assert!(progress_index < result_index);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Status {
+            status: SessionStatus::RunningTools,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn bash_checkpoint_returns_partial_output_to_model() {
+    let temp = TempDir::new("loop-checkpoint");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"bash\",\"input\":{\"command\":\"printf partial-output; sleep 5; printf late-output\"}}</inductor_tool_call>",
+        "I will stop here.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut config = HarnessConfig::new("test-model");
+    config.approval_policy = ApprovalPolicy::Never;
+    config.tool_model_checkpoint_after = std::time::Duration::from_secs(1);
+
+    let mut allow = AllowStore::new();
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "run a command that may hang".to_string(),
+        config,
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::ToolCallError { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("checkpoint should be surfaced as a model-visible tool error");
+
+    assert!(message.contains("reached the tool checkpoint"));
+    assert!(message.contains("command_id: bash-"));
+    assert!(message.contains("The command is still running in the background"));
+    assert!(message.contains("bash_wait"));
+    assert!(message.contains("bash_kill"));
+    assert!(message.contains("Partial output captured before the checkpoint"));
+    assert!(message.contains("partial-output"));
+    assert!(matches!(
+        events.last().unwrap(),
+        SessionEvent::Result {
+            stop_reason: StopReason::EndTurn,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_provider_can_wait_for_checkpointed_bash_final_output() {
+    let temp = TempDir::new("loop-checkpoint-wait");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+    let provider = NativeCheckpointWaitProvider;
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut config = HarnessConfig::new("test-model");
+    config.approval_policy = ApprovalPolicy::Never;
+    config.tool_model_checkpoint_after = std::time::Duration::from_millis(100);
+
+    let mut allow = AllowStore::new();
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "run a command and wait for it".to_string(),
+        config,
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallResult {
+            output,
+            exit_code: Some(0),
+            ..
+        } if output.contains("Final output") && output.contains("partialdone")
+    )));
+    assert!(matches!(
+        events.last().unwrap(),
+        SessionEvent::Result {
+            stop_reason: StopReason::EndTurn,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
