@@ -20,8 +20,10 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Command,
+    time::Duration,
 };
 
+use ::time::OffsetDateTime;
 use async_stream::try_stream;
 use context::{
     ApproxTokenCounter, BlobStore, ContextLimits, ContextMessage, ModelEffort, ProviderFamily,
@@ -36,13 +38,16 @@ use harness_core::{
 };
 use provider_core::{ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Map, Value, json};
-use time::OffsetDateTime;
+use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use tools::{StructuredPatch, TextEdit, ToolName, ToolRuntime};
 
 pub mod risk;
 
 pub use risk::AllowStore;
+
+const TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const TOOL_MODEL_CHECKPOINT_AFTER: Duration = Duration::from_secs(30);
 
 /// Context passed to an [`Approver`] when a tool call needs a decision.
 #[derive(Debug, Clone)]
@@ -384,14 +389,40 @@ pub async fn execute_tool_call_cancellable(
     call: &ParsedToolCall,
     cancel: CancellationToken,
 ) -> Result<tools::ToolResult, ToolExecError> {
-    if call.name == ToolName::Bash.as_str() {
-        return tools
-            .bash_cancellable(string_field(&call.input, "command", &call.name)?, cancel)
-            .await
-            .map_err(ToolExecError::Runtime);
-    }
+    execute_tool_call_cancellable_until(tools, call, cancel, None).await
+}
 
-    execute_tool_call(tools, call)
+pub async fn execute_tool_call_cancellable_until(
+    tools: &ToolRuntime,
+    call: &ParsedToolCall,
+    cancel: CancellationToken,
+    checkpoint_after: Option<Duration>,
+) -> Result<tools::ToolResult, ToolExecError> {
+    match call.name.as_str() {
+        name if name == ToolName::Bash.as_str() => tools
+            .bash_cancellable_until(
+                string_field(&call.input, "command", &call.name)?,
+                cancel,
+                checkpoint_after,
+            )
+            .await
+            .map_err(ToolExecError::Runtime),
+        name if name == ToolName::BashWait.as_str() => {
+            let timeout_secs = optional_u64_field(&call.input, "timeout_secs").unwrap_or(30);
+            tools
+                .bash_wait(
+                    string_field(&call.input, "command_id", &call.name)?,
+                    Duration::from_secs(timeout_secs),
+                )
+                .await
+                .map_err(ToolExecError::Runtime)
+        }
+        name if name == ToolName::BashKill.as_str() => tools
+            .bash_kill(string_field(&call.input, "command_id", &call.name)?)
+            .await
+            .map_err(ToolExecError::Runtime),
+        _ => execute_tool_call(tools, call),
+    }
 }
 
 fn string_field<'a>(
@@ -412,11 +443,16 @@ fn optional_string_field<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
     input.get(field).and_then(Value::as_str)
 }
 
+fn optional_u64_field(input: &Value, field: &str) -> Option<u64> {
+    input.get(field).and_then(Value::as_u64)
+}
+
 /// Configuration for a harness turn.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     pub model: String,
     pub max_tool_rounds: usize,
+    pub tool_model_checkpoint_after: Duration,
     pub approval_policy: ApprovalPolicy,
     pub context: ContextRuntimeConfig,
     pub prompt: PromptRuntimeConfig,
@@ -430,6 +466,7 @@ impl HarnessConfig {
         Self {
             model: model.into(),
             max_tool_rounds: 8,
+            tool_model_checkpoint_after: TOOL_MODEL_CHECKPOINT_AFTER,
             approval_policy: ApprovalPolicy::default(),
             context: ContextRuntimeConfig::default(),
             prompt: PromptRuntimeConfig::default(),
@@ -675,24 +712,35 @@ enum LocalToolRunStatus {
 
 #[derive(Debug, Clone)]
 struct LocalToolRunResult {
-    events: Vec<SessionEvent>,
     provider_response: ProviderToolResponse,
     status: LocalToolRunStatus,
 }
 
+#[derive(Debug)]
+enum LocalToolRunUpdate {
+    Event(SessionEvent),
+    Done(LocalToolRunResult),
+}
+
+#[derive(Debug)]
+enum ToolExecutionUpdate {
+    Event(SessionEvent),
+    Done(Result<tools::ToolResult, ToolExecError>),
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_local_tool_call(
+fn run_local_tool_call<'a>(
     session_id: SessionId,
     tool_call_id: ToolCallId,
-    tools: &ToolRuntime,
-    approver: &dyn Approver,
-    permissions: &mut risk::PermissionService<'_>,
-    state: &mut SessionState,
-    call: &ParsedToolCall,
-    config: &HarnessConfig,
+    tools: &'a ToolRuntime,
+    approver: &'a dyn Approver,
+    permissions: &'a mut risk::PermissionService<'_>,
+    state: &'a mut SessionState,
+    call: &'a ParsedToolCall,
+    config: &'a HarnessConfig,
     cancel: CancellationToken,
-) -> anyhow::Result<LocalToolRunResult> {
-    let mut events = Vec::new();
+) -> Pin<Box<dyn Stream<Item = anyhow::Result<LocalToolRunUpdate>> + Send + 'a>> {
+    Box::pin(try_stream! {
     let risk_flags = risk::classify(call);
     let outside_path = get_outside_path(call);
     let preview_input = permission_preview_input(tools, call);
@@ -701,14 +749,13 @@ async fn run_local_tool_call(
 
     if permissions.is_denied_for_session(call) {
         let message = format!("tool call denied for this session: {}", call.name);
-        events.push(SessionEvent::ToolCallError {
+        yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
             session_id,
             tool_call_id,
             message: message.clone(),
         });
         state.push(Role::Tool, message.clone());
-        return Ok(LocalToolRunResult {
-            events,
+        yield LocalToolRunUpdate::Done(LocalToolRunResult {
             provider_response: ProviderToolResponse {
                 tool_call_id,
                 output: message,
@@ -716,6 +763,7 @@ async fn run_local_tool_call(
             },
             status: LocalToolRunStatus::Denied,
         });
+        return;
     }
 
     if !matches!(config.approval_policy, ApprovalPolicy::Never)
@@ -729,14 +777,14 @@ async fn run_local_tool_call(
             risk_flags.clone(),
             reason.clone(),
         );
-        events.push(SessionEvent::PermissionRequest {
+        yield LocalToolRunUpdate::Event(SessionEvent::PermissionRequest {
             session_id,
             request_id: pending.request_id,
             reason: pending.reason.clone(),
             tool_name: pending.tool_name.clone(),
             input_json: pending.input.clone(),
         });
-        events.push(SessionEvent::Status {
+        yield LocalToolRunUpdate::Event(SessionEvent::Status {
             session_id,
             status: SessionStatus::WaitingForPermission,
         });
@@ -753,7 +801,7 @@ async fn run_local_tool_call(
             })
             .await;
 
-        events.push(SessionEvent::PermissionResolved {
+        yield LocalToolRunUpdate::Event(SessionEvent::PermissionResolved {
             session_id,
             request_id: pending.request_id,
             decision,
@@ -767,14 +815,13 @@ async fn run_local_tool_call(
                 }
                 _ => format!("tool call denied by user: {}", call.name),
             };
-            events.push(SessionEvent::ToolCallError {
+            yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
                 session_id,
                 tool_call_id,
                 message: message.clone(),
             });
             state.push(Role::Tool, message.clone());
-            return Ok(LocalToolRunResult {
-                events,
+            yield LocalToolRunUpdate::Done(LocalToolRunResult {
                 provider_response: ProviderToolResponse {
                     tool_call_id,
                     output: message,
@@ -782,29 +829,30 @@ async fn run_local_tool_call(
                 },
                 status: LocalToolRunStatus::Denied,
             });
+            return;
         }
 
         approved_unlocked_execution = execution_needs_unlocked_access(call, &risk_flags);
     }
 
     let targets = ToolTargets::capture(tools, call);
-    events.push(SessionEvent::ToolInputStart {
+    yield LocalToolRunUpdate::Event(SessionEvent::ToolInputStart {
         session_id,
         tool_call_id,
         name: call.name.clone(),
     });
-    events.push(SessionEvent::ToolInputEnd {
+    yield LocalToolRunUpdate::Event(SessionEvent::ToolInputEnd {
         session_id,
         tool_call_id,
         input_json: preview_input.clone(),
     });
-    events.push(SessionEvent::ToolCallStart {
+    yield LocalToolRunUpdate::Event(SessionEvent::ToolCallStart {
         session_id,
         tool_call_id,
         name: call.name.clone(),
         input_json: preview_input.clone(),
     });
-    events.push(SessionEvent::Status {
+    yield LocalToolRunUpdate::Event(SessionEvent::Status {
         session_id,
         status: SessionStatus::RunningTools,
     });
@@ -817,7 +865,28 @@ async fn run_local_tool_call(
         tools
     };
 
-    match execute_tool_call_cancellable(execution_tools, call, cancel.clone()).await {
+    let mut execution = execute_tool_call_with_progress(
+        session_id,
+        tool_call_id,
+        execution_tools,
+        call,
+        cancel.clone(),
+        config.tool_model_checkpoint_after,
+    );
+    let result = loop {
+        let Some(update) = execution.next().await else {
+            break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
+                command: call.name.clone(),
+            }));
+        };
+        match update? {
+            ToolExecutionUpdate::Event(event) => yield LocalToolRunUpdate::Event(event),
+            ToolExecutionUpdate::Done(result) => break result,
+        }
+    };
+    drop(execution);
+
+    match result {
         Ok(mut result) => {
             if sandbox_denied_result(tools, call, &result) && !approved_unlocked_execution {
                 let reason = format!(
@@ -830,14 +899,14 @@ async fn run_local_tool_call(
                     risk_flags.clone(),
                     reason.clone(),
                 );
-                events.push(SessionEvent::PermissionRequest {
+                yield LocalToolRunUpdate::Event(SessionEvent::PermissionRequest {
                     session_id,
                     request_id: pending.request_id,
                     reason: pending.reason.clone(),
                     tool_name: pending.tool_name.clone(),
                     input_json: pending.input.clone(),
                 });
-                events.push(SessionEvent::Status {
+                yield LocalToolRunUpdate::Event(SessionEvent::Status {
                     session_id,
                     status: SessionStatus::WaitingForPermission,
                 });
@@ -852,7 +921,7 @@ async fn run_local_tool_call(
                         outside_path: outside_path.clone(),
                     })
                     .await;
-                events.push(SessionEvent::PermissionResolved {
+                yield LocalToolRunUpdate::Event(SessionEvent::PermissionResolved {
                     session_id,
                     request_id: pending.request_id,
                     decision,
@@ -860,7 +929,27 @@ async fn run_local_tool_call(
                 permissions.resolve(pending.request_id, decision, call);
                 if !matches!(decision, PermissionDecision::Deny) {
                     let unlocked = tools.approved_outside_access();
-                    result = execute_tool_call_cancellable(&unlocked, call, cancel.clone()).await?;
+                    let mut retry = execute_tool_call_with_progress(
+                        session_id,
+                        tool_call_id,
+                        &unlocked,
+                        call,
+                        cancel.clone(),
+                        config.tool_model_checkpoint_after,
+                    );
+                    result = loop {
+                        let Some(update) = retry.next().await else {
+                            break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
+                                command: call.name.clone(),
+                            }))?;
+                        };
+                        match update? {
+                            ToolExecutionUpdate::Event(event) => {
+                                yield LocalToolRunUpdate::Event(event)
+                            }
+                            ToolExecutionUpdate::Done(result) => break result?,
+                        }
+                    };
                 }
             }
             let patch = targets.patch(tools);
@@ -870,7 +959,7 @@ async fn run_local_tool_call(
                 config.context.limits.tool_result_inline_bytes,
                 blob_store.as_ref(),
             )?;
-            events.push(SessionEvent::ToolCallResult {
+            yield LocalToolRunUpdate::Event(SessionEvent::ToolCallResult {
                 session_id,
                 tool_call_id,
                 title: Some(result.title.clone()),
@@ -884,26 +973,25 @@ async fn run_local_tool_call(
             );
             if !patch.files.is_empty() {
                 let diagnostics = diagnostics_for_patch(tools, &patch.files);
-                events.push(SessionEvent::Patch {
+                yield LocalToolRunUpdate::Event(SessionEvent::Patch {
                     session_id,
                     additions: patch.additions,
                     deletions: patch.deletions,
                     files: patch.files,
                 });
-                events.push(SessionEvent::Diagnostics {
+                yield LocalToolRunUpdate::Event(SessionEvent::Diagnostics {
                     session_id,
                     files: diagnostics,
                 });
             }
-            Ok(LocalToolRunResult {
-                events,
+            yield LocalToolRunUpdate::Done(LocalToolRunResult {
                 provider_response: ProviderToolResponse {
                     tool_call_id,
                     output: stubbed.inline_output,
                     is_error: false,
                 },
                 status: LocalToolRunStatus::Executed,
-            })
+            });
         }
         Err(exec_error) => {
             let message = exec_error.to_string();
@@ -917,7 +1005,7 @@ async fn run_local_tool_call(
                     risk_flags.clone(),
                     format!("{} failed: {message}", call.name),
                 );
-                events.push(SessionEvent::PermissionRequest {
+                yield LocalToolRunUpdate::Event(SessionEvent::PermissionRequest {
                     session_id,
                     request_id: pending.request_id,
                     reason: pending.reason.clone(),
@@ -935,7 +1023,7 @@ async fn run_local_tool_call(
                         outside_path: get_outside_path(call),
                     })
                     .await;
-                events.push(SessionEvent::PermissionResolved {
+                yield LocalToolRunUpdate::Event(SessionEvent::PermissionResolved {
                     session_id,
                     request_id: pending.request_id,
                     decision,
@@ -943,22 +1031,67 @@ async fn run_local_tool_call(
                 permissions.resolve(pending.request_id, decision, call);
             }
 
-            events.push(SessionEvent::ToolCallError {
+            yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
                 session_id,
                 tool_call_id,
                 message: message.clone(),
             });
             state.push(Role::Tool, format!("{} error: {message}", call.name));
-            Ok(LocalToolRunResult {
-                events,
+            yield LocalToolRunUpdate::Done(LocalToolRunResult {
                 provider_response: ProviderToolResponse {
                     tool_call_id,
                     output: message,
                     is_error: true,
                 },
                 status: LocalToolRunStatus::Executed,
-            })
+            });
         }
+    }
+    })
+}
+
+fn execute_tool_call_with_progress<'a>(
+    session_id: SessionId,
+    tool_call_id: ToolCallId,
+    tools: &'a ToolRuntime,
+    call: &'a ParsedToolCall,
+    cancel: CancellationToken,
+    checkpoint_after: Duration,
+) -> Pin<Box<dyn Stream<Item = anyhow::Result<ToolExecutionUpdate>> + Send + 'a>> {
+    Box::pin(try_stream! {
+        let execution = execute_tool_call_cancellable_until(tools, call, cancel, Some(checkpoint_after));
+        tokio::pin!(execution);
+        let started = Instant::now();
+        let next_progress = time::sleep(TOOL_PROGRESS_INTERVAL);
+        tokio::pin!(next_progress);
+
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    yield ToolExecutionUpdate::Done(result);
+                    break;
+                }
+                _ = &mut next_progress => {
+                    yield ToolExecutionUpdate::Event(SessionEvent::ToolCallProgress {
+                        session_id,
+                        tool_call_id,
+                        message: format!("still running for {}", format_elapsed(started.elapsed())),
+                    });
+                    next_progress.as_mut().reset(Instant::now() + TOOL_PROGRESS_INTERVAL);
+                }
+            }
+        }
+    })
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
     }
 }
 
@@ -1428,12 +1561,31 @@ pub fn run_turn<'a>(
                 .take()
                 .unwrap_or_else(provider_core::empty_permission_responses);
             let (tool_response_tx, tool_response_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut stream = provider
+            let mut stream = match provider
                 .stream_turn(auth, request, cancel.clone(), turn_responses, tool_response_rx)
-                .await?;
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    yield SessionEvent::Error {
+                        session_id,
+                        message: format!("provider failed to start turn: {error}"),
+                    };
+                    yield SessionEvent::StepFinish {
+                        session_id,
+                        index: round as u32,
+                        stop_reason: StopReason::Error,
+                    };
+                    yield SessionEvent::Result {
+                        session_id,
+                        stop_reason: StopReason::Error,
+                    };
+                    return;
+                }
+            };
 
             let mut assistant_text = String::new();
-            let mut provider_stop_reason = StopReason::EndTurn;
+            let mut provider_stop_reason = None;
             let text_id = format!("round-{round}-text-0");
             let mut text_started = false;
             let mut text_ended = false;
@@ -1477,7 +1629,33 @@ pub fn run_turn<'a>(
                 let Some(event) = event else {
                     break;
                 };
-                match event? {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        if text_started && !text_ended {
+                            yield SessionEvent::TextEnd {
+                                session_id,
+                                text_id: text_id.clone(),
+                                text: assistant_text.clone(),
+                            };
+                        }
+                        yield SessionEvent::Error {
+                            session_id,
+                            message: format!("provider stream failed: {error}"),
+                        };
+                        yield SessionEvent::StepFinish {
+                            session_id,
+                            index: round as u32,
+                            stop_reason: StopReason::Error,
+                        };
+                        yield SessionEvent::Result {
+                            session_id,
+                            stop_reason: StopReason::Error,
+                        };
+                        return;
+                    }
+                };
+                match event {
                     SessionEvent::TextDelta { text, .. } => {
                         if !text_started {
                             text_started = true;
@@ -1522,7 +1700,7 @@ pub fn run_turn<'a>(
                             yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
                             return;
                         }
-                        let run = run_local_tool_call(
+                        let mut updates = run_local_tool_call(
                             session_id,
                             tool_call_id,
                             tools,
@@ -1532,10 +1710,16 @@ pub fn run_turn<'a>(
                             &call,
                             &config,
                             cancel.clone(),
-                        ).await?;
-                        for event in run.events {
-                            yield event;
+                        );
+                        let mut run = None;
+                        while let Some(update) = updates.next().await {
+                            match update? {
+                                LocalToolRunUpdate::Event(event) => yield event,
+                                LocalToolRunUpdate::Done(result) => run = Some(result),
+                            }
                         }
+                        drop(updates);
+                        let run = run.ok_or_else(|| anyhow::anyhow!("tool run ended without a result"))?;
                         let _ = tool_response_tx.send(run.provider_response);
                         if cancel.is_cancelled() {
                             yield SessionEvent::StepFinish {
@@ -1549,7 +1733,7 @@ pub fn run_turn<'a>(
                     }
                     // Provider-level result ends this round's stream.
                     SessionEvent::Result { stop_reason, .. } => {
-                        provider_stop_reason = stop_reason;
+                        provider_stop_reason = Some(stop_reason);
                         break;
                     }
                     SessionEvent::Error { message, .. } => {
@@ -1566,6 +1750,30 @@ pub fn run_turn<'a>(
                     other => yield other,
                 }
             }
+
+            let Some(provider_stop_reason) = provider_stop_reason else {
+                if text_started && !text_ended {
+                    yield SessionEvent::TextEnd {
+                        session_id,
+                        text_id: text_id.clone(),
+                        text: assistant_text.clone(),
+                    };
+                }
+                yield SessionEvent::Error {
+                    session_id,
+                    message: "provider stream ended without a terminal result".to_string(),
+                };
+                yield SessionEvent::StepFinish {
+                    session_id,
+                    index: round as u32,
+                    stop_reason: StopReason::Error,
+                };
+                yield SessionEvent::Result {
+                    session_id,
+                    stop_reason: StopReason::Error,
+                };
+                return;
+            };
 
             if text_started && !text_ended {
                 yield SessionEvent::TextEnd {
@@ -1622,7 +1830,7 @@ pub fn run_turn<'a>(
                         yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
                         return;
                     }
-                    let run = run_local_tool_call(
+                    let mut updates = run_local_tool_call(
                         session_id,
                         tool_call_id,
                         tools,
@@ -1632,11 +1840,17 @@ pub fn run_turn<'a>(
                         &call,
                         &config,
                         cancel.clone(),
-                    ).await?;
-                    let denied = matches!(run.status, LocalToolRunStatus::Denied);
-                    for event in run.events {
-                        yield event;
+                    );
+                    let mut run = None;
+                    while let Some(update) = updates.next().await {
+                        match update? {
+                            LocalToolRunUpdate::Event(event) => yield event,
+                            LocalToolRunUpdate::Done(result) => run = Some(result),
+                        }
                     }
+                    drop(updates);
+                    let run = run.ok_or_else(|| anyhow::anyhow!("tool run ended without a result"))?;
+                    let denied = matches!(run.status, LocalToolRunStatus::Denied);
 
                     if denied {
                         round += 1;
