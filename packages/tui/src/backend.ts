@@ -32,6 +32,10 @@ export type SessionEvent = {
   reasoning_id?: string
   delta?: string
   decision?: PermissionDecision
+  display_name?: string | null
+  workspace_id?: string | null
+  worktree_path?: string | null
+  branch_name?: string | null
 }
 
 export type DevMode = "in-place" | "worktree"

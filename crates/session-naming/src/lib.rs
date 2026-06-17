@@ -21,6 +21,8 @@ pub struct SessionNamingConfig {
     pub model: String,
     /// Whether to enable session naming
     pub enabled: bool,
+    /// Optional cwd for providers that derive workspace context from cwd.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl Default for SessionNamingConfig {
@@ -29,6 +31,7 @@ impl Default for SessionNamingConfig {
             provider: ProviderKind::Claude,
             model: "haiku".to_string(), // Use cheaper Claude Haiku for naming
             enabled: true,
+            cwd: None,
         }
     }
 }
@@ -61,7 +64,11 @@ impl ModelBasedNamer {
 
         let (provider, auth): (Box<dyn ProviderPlugin>, ProviderAuth) = match self.config.provider {
             ProviderKind::Claude => {
-                let provider = Box::new(ClaudeProvider::new()?);
+                let provider: Box<dyn ProviderPlugin> = if let Some(cwd) = &self.config.cwd {
+                    Box::new(ClaudeProvider::with_cwd(cwd.clone()))
+                } else {
+                    Box::new(ClaudeProvider::new()?)
+                };
                 let auth = ProviderAuth::new(
                     ProviderAuthKind::SessionToken,
                     SecretString::from(String::new()),
@@ -106,7 +113,7 @@ impl SessionNamer for ModelBasedNamer {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let naming_prompt = title_prompt(&prompt_content);
+        let naming_prompt = naming_prompt(&prompt_content);
 
         let (provider, auth) = self.get_provider_and_auth().await?;
 
@@ -151,7 +158,7 @@ impl SessionNamer for ModelBasedNamer {
     }
 }
 
-fn title_prompt(prompt_content: &str) -> String {
+fn naming_prompt(prompt_content: &str) -> String {
     format!(
         "You are a title generator. You output ONLY a thread title. Nothing else.\n\n\
 <task>\n\
@@ -209,6 +216,17 @@ pub async fn generate_session_name(
     namer.generate_name(prompts).await
 }
 
+/// Generate a session/worktree/branch name from arbitrary context using the
+/// same provider/model as the active user session.
+pub async fn generate_context_name(
+    context: &str,
+    config: Option<SessionNamingConfig>,
+) -> Result<String> {
+    let config = config.unwrap_or_default();
+    let namer = ModelBasedNamer::new(config);
+    namer.generate_name(&[context.to_string()]).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,8 +270,8 @@ mod tests {
     }
 
     #[test]
-    fn title_prompt_keeps_strict_rules() {
-        let prompt = title_prompt("fix auth refresh");
+    fn naming_prompt_keeps_strict_rules() {
+        let prompt = naming_prompt("fix auth refresh");
 
         assert!(prompt.contains("ONLY a thread title"));
         assert!(prompt.contains("fix auth refresh"));

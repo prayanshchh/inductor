@@ -31,7 +31,7 @@ use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use session_naming::{SessionNamingConfig, generate_session_name};
+use session_naming::{SessionNamingConfig, generate_context_name, generate_session_name};
 use std::time::{Duration, Instant};
 use terminal::{PtyManager, SpawnTerminalRequest, TerminalSize};
 use tokio_util::sync::CancellationToken;
@@ -1268,7 +1268,7 @@ async fn run_harness_command(
     let mut app_db = app_db;
     let mut forced_workspace_id = requested_workspace_id;
     let mut forced_state_db: Option<PathBuf> = None;
-    let mut generated_display_name: Option<String> = None;
+    let mut worktree_rename_candidate: Option<git::ManagedWorktree> = None;
     if mode == ModeArg::Worktree {
         if app_db.is_none() {
             app_db = Some(default_app_db_path()?);
@@ -1291,22 +1291,18 @@ async fn run_harness_command(
             WorktreeBinding {
                 workspace_id: worktree.id,
                 worktree_path: worktree.worktree_path,
+                created_worktree: None,
             }
         } else {
-            // Fresh session: name the worktree (branch + directory) after the
-            // work the first prompt describes, e.g. `inductor/terminal-bug-fix`,
-            // and reuse that as the session's display name. The worktree is
-            // created here — on the first prompt — so its name reflects the work
-            // rather than a placeholder.
-            let mut effective_slug = slug.clone();
-            if let Some(name) = derive_worktree_name(&prompt).await {
-                effective_slug = Some(name.clone());
-                generated_display_name = Some(name);
-            }
-            create_worktree_binding(&registry, &workspace, effective_slug.as_deref())?
+            // Fresh session: create a placeholder worktree immediately. After
+            // the first user prompt is persisted, a silent provider call renames
+            // the session, branch, and directory in-place and emits a metadata
+            // event so the TUI updates without restart.
+            create_worktree_binding(&registry, &workspace, slug.as_deref())?
         };
-        workspace = binding.worktree_path;
+        workspace = binding.worktree_path.clone();
         forced_workspace_id = Some(binding.workspace_id);
+        worktree_rename_candidate = binding.created_worktree;
         // Keep the session's state.db outside the worktree so archiving
         // (which deletes the worktree dir) preserves the chats.
         forced_state_db = Some(worktree_state_db_path(binding.workspace_id)?);
@@ -1376,13 +1372,6 @@ async fn run_harness_command(
     session_record.provider_id = provider_id.clone();
     session_record.model = model.clone();
     session_record.status = SessionStatus::Starting;
-    // Apply the chat-derived worktree name as the session display name so the
-    // dashboard shows it immediately (the end-of-turn namer then leaves it be).
-    if session_record.display_name.is_none() {
-        if let Some(name) = generated_display_name.take() {
-            session_record.display_name = Some(name);
-        }
-    }
     session_record.updated_at = now_rfc3339().map_err(|err| err.to_string())?;
     workspace_db
         .upsert_session(&session_record)
@@ -1422,8 +1411,9 @@ async fn run_harness_command(
     } else {
         SessionState::with_transcript(session_id, loaded_messages)
     };
+    let should_silently_name = state.transcript.is_empty() && session_record.display_name.is_none();
 
-    let mut config = HarnessConfig::new(model);
+    let mut config = HarnessConfig::new(model.clone());
     config.max_tool_rounds = max_tool_rounds;
     config.approval_policy = ApprovalPolicy::from(approval);
     config.context.limits = ContextLimits::new(soft_tokens, hard_tokens, tool_result_inline_bytes);
@@ -1478,6 +1468,27 @@ async fn run_harness_command(
     let prompt = attach_prompt_image_mentions(&workspace_path, &source_workspace, &prompt);
     persist_submitted_user_message(&workspace_db, session_id, &state.transcript, &prompt)
         .map_err(|err| err.to_string())?;
+
+    if should_silently_name {
+        if let Some(event) = silently_name_session_and_worktree(
+            provider,
+            &model,
+            &workspace_path,
+            &prompt,
+            &mut session_record,
+            &workspace_db,
+            live_app_db.as_ref(),
+            worktree_rename_candidate.as_ref(),
+        )
+        .await
+        {
+            persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string(&event).map_err(|err| err.to_string())?
+            );
+        }
+    }
 
     let mut stream = run_turn(
         provider_plugin.as_ref(),
@@ -1671,6 +1682,104 @@ async fn run_harness_command(
     Ok(())
 }
 
+async fn silently_name_session_and_worktree(
+    provider: ProviderKind,
+    model: &str,
+    workspace_path: &Path,
+    prompt: &str,
+    session_record: &mut persistence::SessionRecord,
+    workspace_db: &WorkspaceDb,
+    app_db: Option<&AppDb>,
+    worktree: Option<&git::ManagedWorktree>,
+) -> Option<SessionEvent> {
+    let context = naming_context(prompt, workspace_path, worktree);
+    let config = SessionNamingConfig {
+        provider,
+        model: model.to_string(),
+        enabled: true,
+        cwd: Some(workspace_path.to_path_buf()),
+    };
+    let mut name = match generate_context_name(&context, Some(config)).await {
+        Ok(name) if name != "New Session" && !name.trim().is_empty() => name,
+        _ => fallback_worktree_name(prompt)?,
+    };
+    name = name.trim().to_string();
+
+    session_record.display_name = Some(name.clone());
+    session_record.updated_at = now_rfc3339().ok()?;
+    if let Err(err) = workspace_db.upsert_session(session_record) {
+        dlog(&format!("silent session name update failed: {err}"));
+        return None;
+    }
+    if let Some(db) = app_db {
+        if let Err(err) = db.upsert_session(session_record) {
+            dlog(&format!("silent app session name update failed: {err}"));
+        }
+    }
+
+    if let Some(db) = app_db {
+        if let Err(err) = db.upsert_workspace(session_record.workspace_id, workspace_path, &name) {
+            dlog(&format!("silent workspace name update failed: {err}"));
+        }
+    }
+
+    let mut workspace_id = None;
+    let mut worktree_path = None;
+    let mut branch_name = None;
+    if let (Some(db), Some(worktree)) = (app_db, worktree) {
+        let manager = WorktreeManager::new(default_managed_root().ok()?);
+        match manager.rename_managed_worktree(worktree, &name) {
+            Ok(renamed) => {
+                if let Err(err) = register_worktree(db, &renamed) {
+                    dlog(&format!("silent worktree registry update failed: {err}"));
+                }
+                workspace_id = Some(renamed.workspace_id);
+                worktree_path = Some(renamed.worktree_path.display().to_string());
+                branch_name = Some(renamed.branch_name.clone());
+                session_record.workspace_id = renamed.workspace_id;
+                if let Err(err) =
+                    db.upsert_workspace(renamed.workspace_id, &renamed.worktree_path, &name)
+                {
+                    dlog(&format!("silent workspace registry update failed: {err}"));
+                }
+                if let Err(err) = db.upsert_session(session_record) {
+                    dlog(&format!("silent app session rebind failed: {err}"));
+                }
+            }
+            Err(err) => dlog(&format!("silent worktree rename failed: {err}")),
+        }
+    }
+
+    Some(SessionEvent::MetadataUpdated {
+        session_id: session_record.id,
+        display_name: Some(name),
+        workspace_id,
+        worktree_path,
+        branch_name,
+    })
+}
+
+fn naming_context(
+    prompt: &str,
+    workspace_path: &Path,
+    worktree: Option<&git::ManagedWorktree>,
+) -> String {
+    let mut context = String::new();
+    context.push_str("User first prompt:\n");
+    context.push_str(&prompt_transcript_text(prompt));
+    context.push_str("\n\nWorkspace path:\n");
+    context.push_str(&workspace_path.display().to_string());
+    if let Some(worktree) = worktree {
+        context.push_str("\n\nCurrent placeholder branch:\n");
+        context.push_str(&worktree.branch_name);
+        context.push_str("\nCurrent placeholder worktree path:\n");
+        context.push_str(&worktree.worktree_path.display().to_string());
+        context.push_str("\nBase branch:\n");
+        context.push_str(&worktree.base_branch);
+    }
+    context
+}
+
 fn stored_message_to_transcript(message: StoredMessage) -> Result<TranscriptMessage, String> {
     let role = message
         .role
@@ -1749,6 +1858,7 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
         | SessionEvent::TerminalOutput { session_id, .. }
         | SessionEvent::Result { session_id, .. }
         | SessionEvent::Usage { session_id, .. }
+        | SessionEvent::MetadataUpdated { session_id, .. }
         | SessionEvent::Error { session_id, .. } => {
             db.append_event(*session_id, event)?;
         }
@@ -3027,25 +3137,8 @@ fn worktree_state_db_path(workspace_id: WorkspaceId) -> Result<PathBuf, String> 
         .join(format!("{workspace_id}.db")))
 }
 
-/// Generate a short (<=3 word) name for a fresh worktree-mode session from its
-/// first prompt, reusing the session-naming model. Returns `None` on any
-/// failure (missing creds, model error) so worktree creation falls back to a
-/// generic slug rather than blocking.
-async fn derive_worktree_name(prompt: &str) -> Option<String> {
-    // The prompt may be wrapped for multimodal payloads; pull the text back out
-    // so the namer sees the user's words, not a JSON blob.
-    let text = prompt
-        .strip_prefix("__MULTIMODAL_MESSAGE__:")
-        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
-        .and_then(|value| value["text"].as_str().map(str::to_string))
-        .unwrap_or_else(|| prompt.to_string());
-
-    match generate_session_name(&[text], Some(SessionNamingConfig::default())).await {
-        Ok(name) if name != "New Session" && !name.trim().is_empty() => Some(name),
-        _ => fallback_worktree_name(prompt),
-    }
-}
-
+/// Generate a short (<=3 word) fallback name for a fresh worktree-mode session
+/// from its first prompt when the silent provider naming call is unavailable.
 fn fallback_worktree_name(prompt: &str) -> Option<String> {
     let text = prompt
         .strip_prefix("__MULTIMODAL_MESSAGE__:")
@@ -3133,6 +3226,7 @@ fn fallback_worktree_name(prompt: &str) -> Option<String> {
 struct WorktreeBinding {
     workspace_id: WorkspaceId,
     worktree_path: PathBuf,
+    created_worktree: Option<git::ManagedWorktree>,
 }
 
 /// Resolve the worktree a worktree-mode `run` should execute in: reuse the one
@@ -3160,7 +3254,8 @@ fn create_worktree_binding(
 
     Ok(WorktreeBinding {
         workspace_id: created.workspace_id,
-        worktree_path: created.worktree_path,
+        worktree_path: created.worktree_path.clone(),
+        created_worktree: Some(created),
     })
 }
 

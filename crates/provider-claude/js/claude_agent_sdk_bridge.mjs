@@ -451,7 +451,13 @@ async function run(request) {
     tools: [],
     mcpServers: { inductor: inductorMcp },
     toolAliases: toolAliases(toolDefinitions),
-    settingSources: [],
+    // Load the user-level setting source so the Claude Code subscription
+    // login/credentials are available for the turn. Without it the SDK has no
+    // usable auth and the API rejects the request with `401 Invalid
+    // authentication credentials`, even though `claude` works in the terminal.
+    // Project/local sources stay excluded so per-project settings don't
+    // override Inductor's own tools, permissions, and system prompt.
+    settingSources: ["user"],
     canUseTool: (toolName, toolInput, opts) =>
       requestPermission(toolName, toolInput, opts, approvalPolicy),
     abortController,
