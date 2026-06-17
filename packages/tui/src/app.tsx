@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
+import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
@@ -1339,22 +1339,54 @@ function TerminalPanel(props: {
   write: (data: string) => void
   cwd: string
 }) {
-  let input!: TextareaRenderable
-  // vt100 screen contents render as a fixed grid; strip trailing blank lines so
-  // the log hugs the bottom instead of padding out the panel.
-  const lines = () => {
+  let surface!: BoxRenderable
+  // The block cursor blinks like a native terminal whenever the shell is live
+  // so the user can always see where input will land, regardless of which pane
+  // currently holds keyboard focus.
+  const [blinkOn, setBlinkOn] = createSignal(true)
+  const blinkTimer = setInterval(() => setBlinkOn((on) => !on), 530)
+  onCleanup(() => clearInterval(blinkTimer))
+  const cursorVisible = () => blinkOn()
+  // vt100 screen contents render as a fixed grid; strip trailing blank rows so
+  // the prompt hugs the bottom instead of padding out the panel.
+  const snapshotLines = () => {
     const snapshot = props.snapshot()
-    if (!snapshot) return []
-    return snapshot.contents.replace(/\s+$/g, "").split("\n")
+    if (!snapshot) return { rows: [] as string[], cursorRow: -1, cursorCol: 0 }
+    const grid = snapshot.contents.split("\n")
+    let end = grid.length
+    while (end > 0 && grid[end - 1].trim() === "") end -= 1
+    // Keep enough rows to still show where the cursor sits, even on a blank line.
+    const visible = Math.max(end, snapshot.cursor_row + 1)
+    return { rows: grid.slice(0, visible), cursorRow: snapshot.cursor_row, cursorCol: snapshot.cursor_col }
   }
   const running = () => !props.error() && props.snapshot()?.is_running !== false
   const status = () => (props.error() ? "unavailable" : running() ? "live" : "exited")
-  const submit = () => {
-    props.write(`${input.plainText}\n`)
-    input.setText("")
+  // Pass typed keys straight through to the PTY as raw bytes so the shell
+  // echoes them itself — the prompt, cursor, and line wrapping all come from
+  // the real terminal, exactly like a native shell.
+  const forwardKey = (event: KeyEvent) => {
+    if (!running()) return
+    const data = event.sequence
+    if (!data) return
+    props.write(data)
+    event.preventDefault()
+    event.stopPropagation()
   }
   return (
-    <box flexGrow={1} minHeight={0} flexDirection="column">
+    <box
+      flexGrow={1}
+      minHeight={0}
+      flexDirection="column"
+      focusable={true}
+      onMouseUp={() => surface.focus()}
+      onKeyDown={forwardKey}
+      ref={(ref: BoxRenderable) => {
+        surface = ref
+        // Reset the blink to "on" when focused so the cursor is solid the
+        // instant the user clicks in, then resumes blinking.
+        ref.on("focused", () => setBlinkOn(true))
+      }}
+    >
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
         <text fg={theme.cyan}>TERMINAL</text>
         <box flexGrow={1} />
@@ -1368,58 +1400,41 @@ function TerminalPanel(props: {
         scrollAcceleration={scrollAcceleration}
         verticalScrollbarOptions={{ visible: false }}
       >
-        <box flexDirection="column">
-          <Show when={lines().length > 0} fallback={<text fg={props.error() ? theme.red : theme.dim}>{props.error() ?? "starting shell…"}</text>}>
-            <For each={lines()}>
-              {(line) => <text fg={theme.muted} wrapMode="none" selectable={true}>{line.length ? line : " "}</text>}
+        <box flexDirection="column" paddingLeft={1} paddingRight={1}>
+          <Show when={snapshotLines().rows.length > 0} fallback={<text fg={props.error() ? theme.red : theme.dim}>{props.error() ?? "starting shell…"}</text>}>
+            <For each={snapshotLines().rows}>
+              {(line, index) => (
+                <TerminalLine
+                  text={line}
+                  cursorCol={running() && cursorVisible() && index() === snapshotLines().cursorRow ? snapshotLines().cursorCol : -1}
+                />
+              )}
             </For>
           </Show>
         </box>
       </scrollbox>
-      <box
-        width="100%"
-        flexDirection="row"
-        alignItems="center"
-        gap={1}
-        paddingLeft={1}
-        marginTop={1}
-        border={["top"]}
-        borderColor={theme.borderSoft}
-        onMouseUp={() => input.focus()}
-      >
-        <text fg={theme.cyan}>$</text>
-        <textarea
-          width="100%"
-          minHeight={1}
-          maxHeight={3}
-          placeholder="run a command…"
-          placeholderColor={theme.dim}
-          textColor={theme.text}
-          focusedTextColor={theme.text}
-          focusedBackgroundColor={theme.surface3}
-          cursorColor={theme.cyan}
-          selectionBg={theme.selectionBg}
-          selectionFg={theme.text}
-          onSubmit={submit}
-          onKeyDown={(event: { key?: string; name?: string; ctrl?: boolean; preventDefault(): void; stopPropagation?: () => void }) => {
-            const key = event.key ?? event.name
-            const normalized = key?.toLowerCase()
-            if (key === "Enter" || key === "enter" || key === "return") {
-              event.preventDefault()
-              event.stopPropagation?.()
-              submit()
-              return
-            }
-            if (Boolean(event.ctrl) && normalized === "d") {
-              event.preventDefault()
-              event.stopPropagation?.()
-              props.write("\x04")
-              return
-            }
-          }}
-          ref={(ref: TextareaRenderable) => (input = ref)}
-        />
-      </box>
+    </box>
+  )
+}
+
+/**
+ * One row of the terminal grid. When `cursorCol >= 0` the cell at that column
+ * is drawn as an inverse block so the cursor sits inline right after the
+ * prompt, matching a native shell.
+ */
+function TerminalLine(props: { text: string; cursorCol: number }) {
+  if (props.cursorCol < 0) {
+    return <text fg={theme.muted} wrapMode="char" selectable={true}>{props.text.length ? props.text : " "}</text>
+  }
+  const padded = props.text.length < props.cursorCol ? props.text.padEnd(props.cursorCol, " ") : props.text
+  const before = padded.slice(0, props.cursorCol)
+  const at = padded.slice(props.cursorCol, props.cursorCol + 1) || " "
+  const after = padded.slice(props.cursorCol + 1)
+  return (
+    <box flexDirection="row">
+      <text fg={theme.muted} wrapMode="none" selectable={true}>{before}</text>
+      <text fg="#0a1014" bg={theme.cyan} attributes={TextAttributes.BOLD}>{at}</text>
+      <text fg={theme.muted} selectable={true}>{after}</text>
     </box>
   )
 }
