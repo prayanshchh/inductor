@@ -1342,7 +1342,7 @@ mod tests {
             id: workspace_id,
             source_repo: PathBuf::from("/tmp/repo"),
             worktree_path: PathBuf::from("/tmp/wt"),
-            branch_name: "inductor/fix-login-abcd1234".to_string(),
+            branch_name: "fix-login-abcd1234".to_string(),
             base_branch: "main".to_string(),
             base_commit: "deadbeef".to_string(),
             status: WorktreeStatus::Active,

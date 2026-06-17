@@ -91,12 +91,13 @@ impl WorktreeManager {
 
         let workspace_id = WorkspaceId::new();
 
-        // Lay worktrees out as `<managed_root>/<repo>/<branch-leaf>` so the
+        // Lay worktrees out as `<managed_root>/<repo>/<branch>` so the
         // on-disk path mirrors the repository and branch it belongs to, e.g.
-        // `~/inductor/workspaces/inductor/fix-login`. The leaf is the work the
-        // session is about (the slug) — no ids or other noise. A numeric suffix
-        // is only appended when a directory or branch of the same name already
-        // exists, so repeated work names stay readable (`fix-login-2`).
+        // `~/inductor/workspaces/inductor/fix-login`. The branch is the work the
+        // session is about (the slug) — no prefix, ids, or other noise. A
+        // numeric suffix is only appended when a directory or branch of the
+        // same name already exists, so repeated work names stay readable
+        // (`fix-login-2`).
         let repo_name = repo_dir_name(&repo.root);
         let parent = self.managed_root.join(&repo_name);
         fs::create_dir_all(&parent).map_err(|source| GitError::Io {
@@ -104,9 +105,8 @@ impl WorktreeManager {
             source: source.to_string(),
         })?;
 
-        let branch_leaf = unique_branch_leaf(&repo.root, &parent, &request.slug)?;
-        let branch_name = format!("inductor/{branch_leaf}");
-        let worktree_path = parent.join(&branch_leaf);
+        let branch_name = unique_branch_leaf(&repo.root, &parent, &request.slug)?;
+        let worktree_path = parent.join(&branch_name);
 
         git_stdout(
             &repo.root,
@@ -165,19 +165,14 @@ impl WorktreeManager {
             source: source.to_string(),
         })?;
 
-        let current_leaf = worktree
-            .branch_name
-            .strip_prefix("inductor/")
-            .unwrap_or(&worktree.branch_name);
-        let branch_leaf = unique_branch_leaf_excluding(
+        let new_branch = unique_branch_leaf_excluding(
             &repo.root,
             &parent,
             slug,
-            Some(current_leaf),
+            Some(&worktree.branch_name),
             Some(&old_path),
         )?;
-        let new_branch = format!("inductor/{branch_leaf}");
-        let new_path = parent.join(&branch_leaf);
+        let new_path = parent.join(&new_branch);
 
         if worktree.branch_name != new_branch {
             git_stdout(
@@ -354,14 +349,10 @@ where
         .collect()
 }
 
-/// Branch name Inductor assigns a managed worktree: `inductor/<slug>-<id8>`.
+/// Branch name Inductor assigns a managed worktree: `<slug>-<id8>`.
 /// Exposed so the harness can recompute it when renaming a placeholder branch.
 pub fn branch_name_for(slug: &str, workspace_id: WorkspaceId) -> String {
-    format!(
-        "inductor/{}-{}",
-        sanitize_slug(slug),
-        short_workspace_id(workspace_id)
-    )
+    format!("{}-{}", sanitize_slug(slug), short_workspace_id(workspace_id))
 }
 
 /// Pick a worktree directory leaf (and matching branch leaf) from the work
@@ -385,11 +376,10 @@ fn unique_branch_leaf_excluding(
     let mut suffix = 2;
     loop {
         let path = parent.join(&candidate);
-        let branch = format!("inductor/{candidate}");
         let path_allowed = allowed_path.is_some_and(|allowed| allowed == path);
         let branch_allowed = allowed_branch_leaf.is_some_and(|allowed| allowed == candidate);
         if (path_allowed || !path.exists())
-            && (branch_allowed || !branch_exists(repo_root, &branch)?)
+            && (branch_allowed || !branch_exists(repo_root, &candidate)?)
         {
             return Ok(candidate);
         }
@@ -534,8 +524,8 @@ mod tests {
         assert_eq!(worktree.source_repo, fs::canonicalize(&repo).unwrap());
         assert!(worktree.worktree_path.starts_with(&managed));
         assert!(worktree.worktree_path.exists());
-        // Branch/leaf is the work name with no id or other suffix.
-        assert_eq!(worktree.branch_name, "inductor/fix-login");
+        // Branch is the work name with no prefix, id, or other suffix.
+        assert_eq!(worktree.branch_name, "fix-login");
 
         // Layout is `<managed>/<repo>/<branch-leaf>`.
         let repo_name = fs::canonicalize(&repo)
@@ -555,10 +545,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(
-            leaf,
-            worktree.branch_name.strip_prefix("inductor/").unwrap()
-        );
+        assert_eq!(leaf, worktree.branch_name);
 
         let list = manager.list_worktrees(&worktree.source_repo).unwrap();
         let created_path = fs::canonicalize(&worktree.worktree_path).unwrap();
@@ -597,8 +584,8 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(first.branch_name, "inductor/fix-terminal");
-        assert_eq!(second.branch_name, "inductor/fix-terminal-2");
+        assert_eq!(first.branch_name, "fix-terminal");
+        assert_eq!(second.branch_name, "fix-terminal-2");
         assert_ne!(first.worktree_path, second.worktree_path);
     }
 
@@ -623,15 +610,15 @@ mod tests {
             .rename_managed_worktree(&created, "Fix Login")
             .unwrap();
 
-        assert_eq!(renamed.branch_name, "inductor/fix-login");
+        assert_eq!(renamed.branch_name, "fix-login");
         assert_eq!(
             renamed.worktree_path.file_name().unwrap().to_str().unwrap(),
             "fix-login"
         );
         assert!(renamed.worktree_path.exists());
         assert!(!old_path.exists());
-        assert!(branch_exists(&renamed.source_repo, "inductor/fix-login").unwrap());
-        assert!(!branch_exists(&renamed.source_repo, "inductor/session").unwrap());
+        assert!(branch_exists(&renamed.source_repo, "fix-login").unwrap());
+        assert!(!branch_exists(&renamed.source_repo, "session").unwrap());
     }
 
     #[test]
