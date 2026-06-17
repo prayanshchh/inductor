@@ -43,6 +43,7 @@ impl ModelEffort {
 pub enum ProviderFamily {
     Claude,
     Codex,
+    Copilot,
     Generic,
 }
 
@@ -63,6 +64,13 @@ pub fn translate_effort(provider: ProviderFamily, effort: ModelEffort) -> Provid
             parameter_name: Some("reasoning_effort".to_string()),
             parameter_value: Some(effort.as_str().to_string()),
             prompt_hint: None,
+        },
+        ProviderFamily::Copilot => ProviderEffort {
+            provider,
+            model_effort: effort,
+            parameter_name: None,
+            parameter_value: None,
+            prompt_hint: Some(format!("Reasoning effort: {}", effort.as_str())),
         },
         ProviderFamily::Claude => ProviderEffort {
             provider,

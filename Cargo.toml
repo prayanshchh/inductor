@@ -4,6 +4,6 @@ members = [
     "crates/harness-core",
     "crates/git",
     "crates/provider-core",
-    "crates/tools", "crates/auth", "crates/provider-codex", "crates/provider-claude", "crates/harness-runtime", "crates/sandbox", "crates/terminal", "crates/diff", "crates/context", "crates/persistence", "crates/session-naming",
+    "crates/tools", "crates/auth", "crates/provider-codex", "crates/provider-claude", "crates/provider-copilot", "crates/harness-runtime", "crates/sandbox", "crates/terminal", "crates/diff", "crates/context", "crates/persistence", "crates/session-naming",
 ]
 resolver = "2"

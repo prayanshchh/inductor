@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use harness_core::{SessionId, TurnRequest};
 use provider_claude::ClaudeProvider;
 use provider_codex::CodexProvider;
+use provider_copilot::CopilotProvider;
 use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +70,11 @@ impl ModelBasedNamer {
             }
             ProviderKind::Codex => {
                 let provider = Box::new(CodexProvider::new()?);
+                let auth = RuntimeCredentialLoader::load(reference)?.into_provider_auth();
+                (provider, auth)
+            }
+            ProviderKind::Copilot => {
+                let provider = Box::new(CopilotProvider::new()?);
                 let auth = RuntimeCredentialLoader::load(reference)?.into_provider_auth();
                 (provider, auth)
             }
