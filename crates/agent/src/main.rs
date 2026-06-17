@@ -1332,19 +1332,24 @@ async fn run_harness_command(
     // Yolo mode is the default: file tools may read/write outside the
     // workspace and bash runs without the macOS workspace sandbox. Users can
     // opt back into workspace-only execution with `--workspace-only`.
-    let workspace_path = workspace.clone();
+    //
+    // For a fresh worktree-mode session this is the *placeholder* worktree
+    // (slug `session`). The silent naming pass below may `git worktree move`
+    // it to a descriptive path, so `workspace_path`/`tools`/`provider_plugin`
+    // are rebound afterwards to the renamed directory.
+    let mut workspace_path = workspace.clone();
 
     // Build the provider as a trait object so the harness loop can drive
     // either backend through `&dyn ProviderPlugin`. Claude's SDK also needs
     // its cwd set to the resolved workspace/worktree, otherwise its built-in
     // environment context and tools point at the source checkout.
-    let provider_plugin: Box<dyn ProviderPlugin> = match provider {
+    let mut provider_plugin: Box<dyn ProviderPlugin> = match provider {
         ProviderKind::Claude => Box::new(ClaudeProvider::with_cwd(workspace_path.clone())),
         ProviderKind::Codex => Box::new(CodexProvider::new().map_err(|err| err.to_string())?),
         ProviderKind::Copilot => Box::new(CopilotProvider::new().map_err(|err| err.to_string())?),
     };
 
-    let tools = if workspace_only {
+    let mut tools = if workspace_only {
         ToolRuntime::sandboxed(workspace_path.clone())
     } else {
         ToolRuntime::unrestricted(workspace_path.clone())
@@ -1482,6 +1487,31 @@ async fn run_harness_command(
         )
         .await
         {
+            // The silent rename may have `git worktree move`d the placeholder
+            // directory out from under us. The tool runtime and Claude's cwd
+            // cached the old path, so rebind them to the new one — otherwise
+            // every bash/read/list/grep runs in a directory that no longer
+            // exists and fails with ENOENT.
+            if let SessionEvent::MetadataUpdated {
+                worktree_path: Some(renamed),
+                ..
+            } = &event
+            {
+                let renamed = PathBuf::from(renamed);
+                if renamed != workspace_path {
+                    workspace_path = renamed;
+                    tools = if workspace_only {
+                        ToolRuntime::sandboxed(workspace_path.clone())
+                    } else {
+                        ToolRuntime::unrestricted(workspace_path.clone())
+                    }
+                    .map_err(|err| err.to_string())?;
+                    if matches!(provider, ProviderKind::Claude) {
+                        provider_plugin =
+                            Box::new(ClaudeProvider::with_cwd(workspace_path.clone()));
+                    }
+                }
+            }
             persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
             println!(
                 "{}",
