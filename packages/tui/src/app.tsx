@@ -16,7 +16,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listWorktrees, showWorkspaceSession, startBackendTurn, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type Worktree } from "./backend"
+import { archiveWorktree, listProviderModels, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -63,14 +63,15 @@ type AgentSlot = {
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
-type PaletteKind = "commands" | "models" | "agents" | "modes" | "permissions" | "files" | undefined
+type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "files" | undefined
 type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "review" | "sessions"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
+type ConnectChoice = { provider: string; label: string; description: string }
 type EffortChoice = { name: string; label: string; description: string; value: EffortValue }
 type AgentChoice = { name: string; description: string }
 type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
-type PaletteItem = Command | ModelChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
+type PaletteItem = Command | ModelChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
 type StopIntent = "interrupt" | "exit"
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
@@ -133,7 +134,7 @@ const commands: Command[] = [
   { name: "/exit", description: "Exit app", action: "exit" },
 ]
 
-const modelChoices: ModelChoice[] = [
+let modelChoices: ModelChoice[] = [
   { group: "Claude", provider: "claude", model: "sonnet", label: "Claude Sonnet", effortName: "Claude effort", efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"] },
   { group: "Claude", provider: "claude", model: "fable", label: "Fable", effortName: "Claude effort", efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"] },
   { group: "Claude", provider: "claude", model: "opus", label: "Opus (1M context)", effortName: "Claude effort", efforts: ["low", "medium", "high", "xhigh", "max", "ultracode"] },
@@ -141,6 +142,15 @@ const modelChoices: ModelChoice[] = [
   { group: "OpenAI", provider: "codex", model: "gpt-5.5", label: "GPT-5.5", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
   { group: "OpenAI", provider: "codex", model: "gpt-5.4", label: "GPT-5.4", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
   { group: "OpenAI", provider: "codex", model: "gpt-5.4-mini", label: "GPT-5.4-Mini", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "GitHub Copilot", provider: "copilot", model: "gpt-4.1", label: "Copilot GPT-4.1", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
+  { group: "GitHub Copilot", provider: "copilot", model: "claude-sonnet-4", label: "Copilot Claude Sonnet 4", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
+  { group: "GitHub Copilot", provider: "copilot", model: "o4-mini", label: "Copilot o4-mini", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
+]
+
+const connectChoices: ConnectChoice[] = [
+  { provider: "claude", label: "Claude", description: "Use Claude Code credentials" },
+  { provider: "codex", label: "OpenAI", description: "Use Codex auth.json credentials" },
+  { provider: "copilot", label: "GitHub Copilot", description: "Start GitHub device login" },
 ]
 
 const agentChoices: AgentChoice[] = [
@@ -289,6 +299,7 @@ export function App(props: AppProps) {
   const [draft, setDraft] = createSignal("")
   const [stopArmed, setStopArmed] = createSignal<StopIntent>()
   const [notice, setNotice] = createSignal<ComposerNotice>()
+  const [copilotDeviceNotice, setCopilotDeviceNotice] = createSignal<ComposerNotice>()
   const [permissionSelected, setPermissionSelected] = createSignal(0)
   const promptHistoryPath = path.join(props.workspace, ".inductor", "prompt-history.json")
   const [promptHistory, setPromptHistory] = createSignal<PromptHistoryState>({ entries: loadPromptHistoryFile(promptHistoryPath), draft: "" })
@@ -302,6 +313,7 @@ export function App(props: AppProps) {
   const [sessionListStatus, setSessionListStatus] = createSignal("")
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
   const [now, setNow] = createSignal(Date.now())
+  const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
   const dimensions = useTerminalDimensions()
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
   const hasTranscript = createMemo(() => fstate().transcript.length > 0)
@@ -371,7 +383,11 @@ export function App(props: AppProps) {
   })
   const paletteItems = createMemo(() => {
     if (palette() === "files") return fileItems()
-    if (palette() === "models") return modelChoices
+    if (palette() === "models") {
+      modelCatalogVersion()
+      return modelChoices
+    }
+    if (palette() === "connect") return connectChoices
     if (palette() === "agents") return agentChoices
     if (palette() === "modes") return effortChoices(selectedModelChoice(provider(), model()))
     if (palette() === "permissions") return permissionChoices
@@ -386,6 +402,7 @@ export function App(props: AppProps) {
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
     void refreshWorktrees()
+    void refreshCopilotModels()
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
@@ -605,6 +622,10 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "connect") {
+      connectProvider(item as ConnectChoice)
+      return
+    }
     if (palette() === "agents") {
       const choice = item as AgentChoice
       setAgent(choice.name)
@@ -644,6 +665,10 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "connect") {
+      connectProvider(item as ConnectChoice)
+      return
+    }
     if (palette() === "agents") {
       const choice = item as AgentChoice
       setAgent(choice.name)
@@ -667,6 +692,65 @@ export function App(props: AppProps) {
     runCommand(item as Command)
   }
 
+  function connectProvider(choice: ConnectChoice) {
+    const nextModel = defaultModel(choice.provider)
+    const nextChoice = selectedModelChoice(choice.provider, nextModel) ?? modelChoices[0]
+    setProvider(choice.provider)
+    setModel(nextModel)
+    if (nextChoice) setMode(coerceEffortForModel(mode(), nextChoice))
+    closePalette()
+    if (choice.provider !== "copilot") {
+      setNotice({ text: `${choice.label.toLowerCase()} selected`, tone: "muted" })
+      return
+    }
+
+    setNotice({ text: "copilot login starting...", tone: "cyan" })
+    setCopilotDeviceNotice(undefined)
+    void startCopilotLogin(props, handleCopilotAuthStatus).catch((error) => {
+      setCopilotDeviceNotice(undefined)
+      setNotice({ text: `copilot login failed: ${String(error?.message ?? error)}`, tone: "red" })
+    })
+  }
+
+  function handleCopilotAuthStatus(event: AuthStatusEvent) {
+    if (event.provider && event.provider !== "copilot") return
+    if (event.status === "device_code") {
+      if (event.verification_uri) {
+        try {
+          Bun.spawn(["open", event.verification_uri], { stdout: "ignore", stderr: "ignore" })
+        } catch {
+          // Keep the code visible when macOS cannot open the browser.
+        }
+      }
+      const deviceNotice = {
+        text: `copilot: enter ${event.user_code ?? "code"} at ${event.verification_uri ?? "github.com/login/device"}`,
+        tone: "cyan",
+      } as const
+      setCopilotDeviceNotice(deviceNotice)
+      setNotice(deviceNotice)
+      return
+    }
+    if (event.status === "waiting") {
+      setNotice(copilotDeviceNotice() ?? { text: "copilot: waiting for browser approval", tone: "cyan" })
+      return
+    }
+    if (event.status === "connected") {
+      setCopilotDeviceNotice(undefined)
+      setNotice({ text: "copilot connected", tone: "cyan" })
+      void refreshCopilotModels()
+      return
+    }
+    if (event.status === "expired") {
+      setCopilotDeviceNotice(undefined)
+      setNotice({ text: "copilot login expired", tone: "red" })
+      return
+    }
+    if (event.status === "failed") {
+      setCopilotDeviceNotice(undefined)
+      setNotice({ text: `copilot login failed: ${event.message ?? "unknown error"}`, tone: "red" })
+    }
+  }
+
   function closePalette() {
     setPalette(undefined)
     setMention(undefined)
@@ -674,6 +758,21 @@ export function App(props: AppProps) {
     input.setText("")
     setDraft("")
     queueMicrotask(() => input.focus())
+  }
+
+  async function refreshCopilotModels() {
+    try {
+      const models = await listProviderModels(props, "copilot")
+      if (models.length === 0) return
+      const next = [
+        ...modelChoices.filter((choice) => choice.provider !== "copilot"),
+        ...models.map(copilotModelChoice),
+      ]
+      modelChoices = next
+      setModelCatalogVersion((version) => version + 1)
+    } catch {
+      // Keep the baked-in Copilot fallback choices when auth is absent or stale.
+    }
   }
 
   function acceptFileChoice(choice: FileChoice, insertDirectory = false) {
@@ -797,6 +896,10 @@ export function App(props: AppProps) {
     }
     if (command.action === "model") {
       openPalette("models")
+      return
+    }
+    if (command.action === "connect") {
+      openPalette("connect")
       return
     }
     if (command.action === "agents") {
@@ -2239,7 +2342,19 @@ function ModifiedFiles(props: { files: ModifiedFile[]; openFile: (file: Modified
 }
 
 function defaultModel(provider: string) {
+  if (provider === "copilot") return "gpt-4.1"
   return provider === "codex" ? "gpt-5.5" : "sonnet"
+}
+
+function copilotModelChoice(model: ProviderModel): ModelChoice {
+  return {
+    group: "GitHub Copilot",
+    provider: "copilot",
+    model: model.id,
+    label: `Copilot ${model.display_name || model.id}`,
+    effortName: "Reasoning",
+    efforts: ["low", "medium", "high", "xhigh"],
+  }
 }
 
 function selectedModelChoice(providerValue = "", modelValue = "") {
@@ -2267,7 +2382,7 @@ function coerceEffortForModel(value: EffortValue, choice: ModelChoice) {
 
 function effortDisplay(value: EffortValue, choice?: ModelChoice) {
   if (choice?.effortLabels?.[value]) return choice.effortLabels[value]
-  if (choice?.provider === "codex") {
+  if (choice?.provider === "codex" || choice?.provider === "copilot") {
     if (value === "xhigh") return "Extra High"
     return titleCase(value)
   }
@@ -2299,6 +2414,7 @@ function visibleStderr(text: string) {
 }
 
 function providerLabel(provider: string) {
+  if (provider === "copilot") return "Copilot"
   return provider === "codex" ? "OpenAI" : "Claude"
 }
 

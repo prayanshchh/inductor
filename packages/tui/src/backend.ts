@@ -85,6 +85,16 @@ export type BackendRun = {
   kill(): void
 }
 
+export type AuthStatusEvent = {
+  type: "auth_status"
+  provider?: string
+  status?: string
+  verification_uri?: string
+  user_code?: string
+  expires_in?: number
+  message?: string
+}
+
 export type StoredSession = {
   id: string
   provider: string
@@ -114,6 +124,12 @@ export type StoredSessionDetail = {
   }
   messages: StoredMessage[]
   events?: SessionEvent[]
+}
+
+export type ProviderModel = {
+  id: string
+  display_name: string
+  context_window?: number | null
 }
 
 const decoder = new TextDecoder()
@@ -238,6 +254,43 @@ export async function archiveWorktree(
   await runBackendJson(options, args)
 }
 
+export async function startCopilotLogin(
+  options: Pick<BackendOptions, "backendBin" | "repoRoot">,
+  onStatus: (event: AuthStatusEvent) => void,
+): Promise<void> {
+  const proc = Bun.spawn([options.backendBin, "auth", "copilot-login"], {
+    cwd: options.repoRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  let stderrText = ""
+  await Promise.all([
+    readAuthStatusLines(proc.stdout, onStatus),
+    readAuthStderr(proc.stderr, (text) => {
+      stderrText += text
+    }),
+    proc.exited.then((code) => {
+      if (code !== 0) {
+        const detail = stderrText.trim()
+        onStatus({
+          type: "auth_status",
+          provider: "copilot",
+          status: "failed",
+          message: detail || `login exited ${code}`,
+        })
+      }
+    }),
+  ])
+}
+
+export async function listProviderModels(
+  options: Pick<BackendOptions, "backendBin" | "repoRoot">,
+  provider: string,
+): Promise<ProviderModel[]> {
+  const output = await runBackendJson(options, ["provider", "models", "--provider", provider])
+  return Array.isArray(output) ? output as ProviderModel[] : []
+}
+
 async function runBackendJson(options: Pick<BackendOptions, "backendBin" | "repoRoot">, args: string[]): Promise<unknown> {
   const proc = Bun.spawn([options.backendBin, ...args], {
     cwd: options.repoRoot,
@@ -289,6 +342,57 @@ async function readStderr(stream: ReadableStream<Uint8Array>, onStderr: (text: s
     }
   } finally {
     reader.releaseLock()
+  }
+}
+
+async function readAuthStatusLines(stream: ReadableStream<Uint8Array>, onStatus: (event: AuthStatusEvent) => void) {
+  let buffer = ""
+  const reader = stream.getReader()
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf("\n")
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).trim()
+        buffer = buffer.slice(newline + 1)
+        if (line) emitAuthLine(line, onStatus)
+        newline = buffer.indexOf("\n")
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const tail = buffer.trim()
+  if (tail) emitAuthLine(tail, onStatus)
+}
+
+async function readAuthStderr(stream: ReadableStream<Uint8Array>, onText: (text: string) => void) {
+  const reader = stream.getReader()
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const text = decoder.decode(value, { stream: true })
+      if (text) onText(text)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function emitAuthLine(line: string, onStatus: (event: AuthStatusEvent) => void) {
+  try {
+    const parsed = JSON.parse(line)
+    if (parsed?.type === "auth_status") onStatus(parsed as AuthStatusEvent)
+  } catch {
+    onStatus({
+      type: "auth_status",
+      provider: "copilot",
+      status: "failed",
+      message: line,
+    })
   }
 }
 
