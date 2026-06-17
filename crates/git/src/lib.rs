@@ -147,6 +147,67 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Rename a managed worktree's branch and on-disk directory from a new
+    /// human-readable slug. Returns updated metadata for persistence/UI.
+    pub fn rename_managed_worktree(
+        &self,
+        worktree: &ManagedWorktree,
+        slug: &str,
+    ) -> Result<ManagedWorktree, GitError> {
+        let repo = self.inspect_repo(&worktree.source_repo)?;
+        let old_path = worktree.worktree_path.clone();
+        let parent = old_path
+            .parent()
+            .ok_or_else(|| GitError::InvalidWorktreePath(old_path.clone()))?
+            .to_path_buf();
+        fs::create_dir_all(&parent).map_err(|source| GitError::Io {
+            path: parent.clone(),
+            source: source.to_string(),
+        })?;
+
+        let current_leaf = worktree
+            .branch_name
+            .strip_prefix("inductor/")
+            .unwrap_or(&worktree.branch_name);
+        let branch_leaf = unique_branch_leaf_excluding(
+            &repo.root,
+            &parent,
+            slug,
+            Some(current_leaf),
+            Some(&old_path),
+        )?;
+        let new_branch = format!("inductor/{branch_leaf}");
+        let new_path = parent.join(&branch_leaf);
+
+        if worktree.branch_name != new_branch {
+            git_stdout(
+                &repo.root,
+                ["branch", "-m", &worktree.branch_name, &new_branch],
+            )?;
+        }
+
+        if old_path != new_path {
+            git_stdout(
+                &repo.root,
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("move"),
+                    old_path.as_os_str(),
+                    new_path.as_os_str(),
+                ],
+            )?;
+        }
+
+        Ok(ManagedWorktree {
+            workspace_id: worktree.workspace_id,
+            source_repo: repo.root,
+            worktree_path: new_path,
+            branch_name: new_branch,
+            base_branch: worktree.base_branch.clone(),
+            base_commit: worktree.base_commit.clone(),
+        })
+    }
+
     pub fn list_worktrees(&self, source_repo: &Path) -> Result<Vec<GitWorktree>, GitError> {
         let repo = self.inspect_repo(source_repo)?;
         let output = git_stdout(&repo.root, ["worktree", "list", "--porcelain"])?;
@@ -199,6 +260,7 @@ pub enum GitError {
     DetachedHead(PathBuf),
     DirtyRepository(PathBuf),
     NonEmptyTarget(PathBuf),
+    InvalidWorktreePath(PathBuf),
     CommandFailed {
         program: String,
         args: Vec<String>,
@@ -226,6 +288,9 @@ impl fmt::Display for GitError {
             }
             Self::NonEmptyTarget(path) => {
                 write!(f, "worktree target path already exists: {}", path.display())
+            }
+            Self::InvalidWorktreePath(path) => {
+                write!(f, "worktree path has no parent: {}", path.display())
             }
             Self::CommandFailed {
                 program,
@@ -305,13 +370,27 @@ pub fn branch_name_for(slug: &str, workspace_id: WorkspaceId) -> String {
 /// directory or branch (archiving removes a worktree's directory but leaves its
 /// branch behind, so both must be checked).
 fn unique_branch_leaf(repo_root: &Path, parent: &Path, slug: &str) -> Result<String, GitError> {
+    unique_branch_leaf_excluding(repo_root, parent, slug, None, None)
+}
+
+fn unique_branch_leaf_excluding(
+    repo_root: &Path,
+    parent: &Path,
+    slug: &str,
+    allowed_branch_leaf: Option<&str>,
+    allowed_path: Option<&Path>,
+) -> Result<String, GitError> {
     let base = sanitize_slug(slug);
     let mut candidate = base.clone();
     let mut suffix = 2;
     loop {
         let path = parent.join(&candidate);
         let branch = format!("inductor/{candidate}");
-        if !path.exists() && !branch_exists(repo_root, &branch)? {
+        let path_allowed = allowed_path.is_some_and(|allowed| allowed == path);
+        let branch_allowed = allowed_branch_leaf.is_some_and(|allowed| allowed == candidate);
+        if (path_allowed || !path.exists())
+            && (branch_allowed || !branch_exists(repo_root, &branch)?)
+        {
             return Ok(candidate);
         }
         candidate = format!("{base}-{suffix}");
@@ -521,6 +600,38 @@ mod tests {
         assert_eq!(first.branch_name, "inductor/fix-terminal");
         assert_eq!(second.branch_name, "inductor/fix-terminal-2");
         assert_ne!(first.worktree_path, second.worktree_path);
+    }
+
+    #[test]
+    fn rename_managed_worktree_updates_branch_and_path() {
+        let temp = TempDir::new("rename-worktree");
+        let repo = temp.path().join("repo");
+        let managed = temp.path().join("managed");
+        init_repo(&repo);
+
+        let manager = WorktreeManager::new(managed);
+        let created = manager
+            .create_worktree(CreateWorktreeRequest {
+                source_repo: repo.clone(),
+                slug: "session".to_string(),
+                allow_dirty: true,
+            })
+            .unwrap();
+        let old_path = created.worktree_path.clone();
+
+        let renamed = manager
+            .rename_managed_worktree(&created, "Fix Login")
+            .unwrap();
+
+        assert_eq!(renamed.branch_name, "inductor/fix-login");
+        assert_eq!(
+            renamed.worktree_path.file_name().unwrap().to_str().unwrap(),
+            "fix-login"
+        );
+        assert!(renamed.worktree_path.exists());
+        assert!(!old_path.exists());
+        assert!(branch_exists(&renamed.source_repo, "inductor/fix-login").unwrap());
+        assert!(!branch_exists(&renamed.source_repo, "inductor/session").unwrap());
     }
 
     #[test]

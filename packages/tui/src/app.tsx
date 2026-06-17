@@ -499,6 +499,10 @@ export function App(props: AppProps) {
           // its work-derived branch) in the sidebar without waiting for exit.
           void refreshWorktrees()
         }
+        if (event.type === "metadata_updated") {
+          if (event.display_name) updateAgentState(key, (next) => ({ ...next, title: event.display_name ?? next.title }))
+          if (event.workspace_id || event.worktree_path || event.branch_name) void refreshWorktrees()
+        }
         if (event.type === "permission_request" && store.focusedKey === key) setPermissionSelected(0)
         if (flags.stopping) {
           if (event.type === "result" || event.type === "error") {

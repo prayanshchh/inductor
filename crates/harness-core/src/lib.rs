@@ -458,6 +458,14 @@ pub enum SessionEvent {
         /// Provider-reported cost in USD, when available (Claude SDK reports it).
         total_cost_usd: Option<f64>,
     },
+    /// Session/worktree metadata changed while the run is still active.
+    MetadataUpdated {
+        session_id: SessionId,
+        display_name: Option<String>,
+        workspace_id: Option<WorkspaceId>,
+        worktree_path: Option<String>,
+        branch_name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

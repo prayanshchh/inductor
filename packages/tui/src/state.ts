@@ -179,6 +179,8 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
       }
     case "terminal_output":
       return appendTerminalOutput(state, event.chunk ?? "")
+    case "metadata_updated":
+      return event.display_name ? { ...state, title: event.display_name } : state
     case "result":
       if (event.stop_reason === "interrupted") return markAgentStopped(state)
       return { ...state, running: false, status: String(event.stop_reason ?? "completed"), pendingPermission: undefined }
