@@ -1339,6 +1339,20 @@ async fn run_harness_command(
     // are rebound afterwards to the renamed directory.
     let mut workspace_path = workspace.clone();
 
+    // Anchor the process working directory to the resolved workspace (the
+    // worktree in worktree mode). The TUI launches this backend with its cwd
+    // at the repo root, but every tool, the environment block we show the
+    // model, and any provider that falls back to `current_dir()` should treat
+    // the worktree as home — otherwise agents drift into editing the original
+    // checkout. This is the *preferred* cwd, not a restriction: bash and file
+    // tools can still reach outside in the default unrestricted mode. Resolve
+    // to an absolute path first so changing cwd never disturbs the relative
+    // path math that follows.
+    workspace_path = workspace_path
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_path.clone());
+    set_process_cwd(&workspace_path);
+
     // Build the provider as a trait object so the harness loop can drive
     // either backend through `&dyn ProviderPlugin`. Claude's SDK also needs
     // its cwd set to the resolved workspace/worktree, otherwise its built-in
@@ -1500,6 +1514,10 @@ async fn run_harness_command(
                 let renamed = PathBuf::from(renamed);
                 if renamed != workspace_path {
                     workspace_path = renamed;
+                    // The directory the process sits in was just moved on disk;
+                    // follow it so cwd-relative work keeps landing in the
+                    // worktree rather than the repo root.
+                    set_process_cwd(&workspace_path);
                     tools = if workspace_only {
                         ToolRuntime::sandboxed(workspace_path.clone())
                     } else {
@@ -3130,6 +3148,23 @@ mod tests {
         assert_eq!(
             fallback_worktree_name(&format!("__MULTIMODAL_MESSAGE__:{payload}")),
             Some("Topbar Overflow Merge".to_string())
+        );
+    }
+}
+
+/// Point the process working directory at `path`, the preferred home for a
+/// session. In worktree mode this is the managed worktree; anchoring cwd here
+/// keeps the environment block we show the model, cwd-relative tool fallbacks,
+/// and providers that inherit `current_dir()` pointed at the worktree instead
+/// of the original checkout. Best-effort: a failure (e.g. the directory was
+/// moved mid-flight) is non-fatal because tools already carry an absolute
+/// workspace root, so we only log to stderr and continue. This never restricts
+/// where tools may go — it just sets the default.
+fn set_process_cwd(path: &Path) {
+    if let Err(err) = std::env::set_current_dir(path) {
+        eprintln!(
+            "warning: could not set working directory to {}: {err}",
+            path.display()
         );
     }
 }
