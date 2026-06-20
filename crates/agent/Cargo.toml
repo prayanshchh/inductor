@@ -26,7 +26,7 @@ provider-copilot = { version = "0.1.0", path = "../provider-copilot" }
 session-naming = { version = "0.1.0", path = "../session-naming" }
 provider-codex = { version = "0.1.0", path = "../provider-codex" }
 provider-core = { version = "0.1.0", path = "../provider-core" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
