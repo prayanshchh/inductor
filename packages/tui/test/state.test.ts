@@ -159,6 +159,76 @@ describe("transcript reducer", () => {
     })
   })
 
+  test("derives apply_patch_freeform tool diffs from unified patch input", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_start",
+      tool_call_id: "call-patch",
+      name: "apply_patch_freeform",
+      input_json: {
+        patch: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n",
+      },
+    })
+
+    expect(state.modifiedFiles).toEqual([
+      expect.objectContaining({ file: "src/main.rs", additions: 1, deletions: 1, diff: expect.stringContaining("+new") }),
+    ])
+    expect(state.transcript.at(-1)).toMatchObject({
+      kind: "tool",
+      name: "apply_patch_freeform",
+      diff: expect.stringContaining("+new"),
+    })
+  })
+
+
+  test("derives multi_edit diffs from all edits", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_start",
+      tool_call_id: "call-multi",
+      name: "multi_edit",
+      input_json: {
+        path: "src/main.ts",
+        edits: [
+          { old: "old one", new: "new one" },
+          { old: "old two", new: "new two" },
+        ],
+      },
+    })
+
+    expect(state.modifiedFiles).toEqual([
+      expect.objectContaining({ file: "src/main.ts", additions: 2, deletions: 2, diff: expect.stringContaining("+new two") }),
+    ])
+    expect(state.transcript.at(-1)).toMatchObject({
+      kind: "tool",
+      name: "multi_edit",
+      diff: expect.stringContaining("+new one"),
+    })
+  })
+
+  test("derives structured patch diffs across multiple paths", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_start",
+      tool_call_id: "call-structured",
+      name: "apply_patch_structured",
+      input_json: {
+        operations: [
+          { type: "edit", path: "a.txt", old: "old", new: "new" },
+          { type: "multi_edit", path: "b.txt", edits: [{ old: "before", new: "after" }] },
+          { type: "rename", from: "old.txt", to: "new.txt" },
+        ],
+      },
+    })
+
+    expect(state.modifiedFiles.map((file) => file.file)).toEqual(["a.txt", "b.txt", "old.txt", "new.txt"])
+    expect(state.transcript.at(-1)).toMatchObject({
+      kind: "tool",
+      name: "apply_patch_structured",
+      diff: expect.stringContaining("+++ b/b.txt"),
+    })
+  })
+
   test("keeps diagnostics metadata out of the transcript", () => {
     let state = createInitialState()
     state = applySessionEvent(state, {

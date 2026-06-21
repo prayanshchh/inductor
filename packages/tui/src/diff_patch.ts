@@ -1,5 +1,12 @@
 import { createTwoFilesPatch } from "diff"
 
+export type PatchFileSummary = {
+  path: string
+  additions: number
+  deletions: number
+  diff: string
+}
+
 export function createUnifiedPatchFromContent(filePath: string, oldText = "", newText = "") {
   if (oldText === newText) return undefined
 
@@ -23,6 +30,73 @@ export function normalizeUnifiedPatch(filePath: string, patch: string) {
   if (trimmed.startsWith("diff --git ") || trimmed.startsWith("--- ") || trimmed.startsWith("Index: ")) return patch
   if (trimmed.startsWith("@@")) return `--- a/${filePath}\n+++ b/${filePath}\n${patch}`
   return patch
+}
+
+export function patchFilesFromUnifiedPatch(patch: string): PatchFileSummary[] {
+  const normalized = normalizeGitPatchForParsing(patch)
+  const lines = normalized.split(/\r?\n/)
+  const files: PatchFileSummary[] = []
+  let index = 0
+
+  while (index < lines.length) {
+    if (!lines[index].startsWith("--- ")) {
+      index += 1
+      continue
+    }
+
+    const oldHeader = lines[index]
+    const newHeader = lines[index + 1]
+    if (!newHeader?.startsWith("+++ ")) {
+      index += 1
+      continue
+    }
+
+    const path = patchPathFromHeaders(oldHeader, newHeader)
+    const start = index
+    index += 2
+    let additions = 0
+    let deletions = 0
+
+    while (index < lines.length && !isFilePatchBoundary(lines[index])) {
+      const line = lines[index]
+      if (line.startsWith("+") && !line.startsWith("+++")) additions += 1
+      if (line.startsWith("-") && !line.startsWith("---")) deletions += 1
+      index += 1
+    }
+
+    const fileDiff = lines.slice(start, index).join("\n")
+    if (path && (additions > 0 || deletions > 0 || fileDiff.includes("@@"))) {
+      files.push({ path, additions, deletions, diff: fileDiff })
+    }
+  }
+
+  return files
+}
+
+function normalizeGitPatchForParsing(patch: string) {
+  const lines = patch.split(/\r?\n/)
+  const out: string[] = []
+  for (const line of lines) {
+    if (line.startsWith("diff --git ") || line.startsWith("index ") || line.startsWith("new file mode ") || line.startsWith("deleted file mode ")) continue
+    out.push(line)
+  }
+  return out.join("\n")
+}
+
+function patchPathFromHeaders(oldHeader: string, newHeader: string) {
+  const oldPath = cleanPatchPath(oldHeader.slice(4).trim())
+  const newPath = cleanPatchPath(newHeader.slice(4).trim())
+  return newPath !== "/dev/null" ? newPath : oldPath
+}
+
+function cleanPatchPath(path: string) {
+  const first = path.split(/\s+/)[0] ?? path
+  if (first === "/dev/null") return first
+  return first.replace(/^[ab]\//, "")
+}
+
+function isFilePatchBoundary(line: string) {
+  return line.startsWith("diff --git ") || line.startsWith("Index: ") || line.startsWith("--- ")
 }
 
 function normalizeDeletedFilePatch(diff: string) {

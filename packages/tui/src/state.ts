@@ -1,6 +1,6 @@
 import type { PermissionDecision, SessionEvent } from "./backend"
 import type { StoredSessionDetail } from "./backend"
-import { createUnifiedPatchFromContent, normalizeUnifiedPatch } from "./diff_patch"
+import { createUnifiedPatchFromContent, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 
 export type TranscriptItem =
   | { id: string; kind: "user"; text: string }
@@ -133,13 +133,19 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
         const permissionApprovals = approval
           ? state.permissionApprovals.filter((item) => item !== approval)
           : state.permissionApprovals
+        const inputFiles = isFileWritingTool(event.name ?? "tool") ? modifiedFilesFromInput(event.input_json) : []
         return {
           ...state,
           permissionApprovals,
-          modifiedFiles: isMutatingTool(event.name ?? "tool")
-            ? mergeModifiedFiles(state.modifiedFiles, modifiedFileFromInput(event.input_json))
-            : state.modifiedFiles,
-          transcript: upsertStartedTool(state.transcript, event.name ?? "tool", input, String(event.tool_call_id ?? nextId("call")), approval?.decision),
+          modifiedFiles: mergeAllModifiedFiles(state.modifiedFiles, inputFiles),
+          transcript: upsertStartedTool(
+            state.transcript,
+            event.name ?? "tool",
+            input,
+            String(event.tool_call_id ?? nextId("call")),
+            approval?.decision,
+            combinedDiff(inputFiles),
+          ),
         }
       }
     case "tool_call_progress":
@@ -213,15 +219,7 @@ function appendStoppedAgent(transcript: TranscriptItem[]): TranscriptItem[] {
 
 function mergePatchFiles(current: ModifiedFile[], files: SessionEvent["files"]): ModifiedFile[] {
   if (!Array.isArray(files)) return current
-  return files.reduce((merged, file) => {
-    if (!file?.path) return merged
-    return mergeModifiedFiles(merged, {
-      file: file.path,
-      additions: Number(file.additions ?? 0),
-      deletions: Number(file.deletions ?? 0),
-      diff: typeof file.diff === "string" ? file.diff : undefined,
-    })
-  }, current)
+  return files.reduce((merged, file) => mergeModifiedFiles(merged, modifiedFileFromPatchEvent(file)), current)
 }
 
 function attachPatchToLatestMutatingTool(transcript: TranscriptItem[], files: SessionEvent["files"]): TranscriptItem[] {
@@ -241,7 +239,7 @@ function attachPatchToLatestMutatingTool(transcript: TranscriptItem[], files: Se
 function patchEventDiff(files: SessionEvent["files"]) {
   if (!Array.isArray(files)) return undefined
   const diffs = files
-    .map((file) => (typeof file?.diff === "string" ? file.diff : undefined))
+    .map((file) => modifiedFileFromPatchEvent(file)?.diff)
     .filter((diff): diff is string => Boolean(diff?.trim()))
   if (diffs.length === 0) return undefined
   return diffs.join("\n")
@@ -320,6 +318,7 @@ function upsertStartedTool(
   input: string,
   toolCallId: string,
   approval?: PermissionDecision,
+  diff?: string,
 ): TranscriptItem[] {
   const index = transcript.findIndex((item) => {
     if (item.kind !== "tool" || item.status !== "running") return false
@@ -337,12 +336,13 @@ function upsertStartedTool(
         input,
         status: "running",
         approval,
+        diff,
       },
     ]
   }
   return transcript.map((item, itemIndex) => {
     if (itemIndex !== index || item.kind !== "tool") return item
-    return { ...item, toolCallId, name, input, status: "running", approval: approval ?? item.approval }
+    return { ...item, toolCallId, name, input, status: "running", approval: approval ?? item.approval, diff: diff ?? item.diff }
   })
 }
 
@@ -455,39 +455,134 @@ function parseRequestedToolText(text: string): { name: string; input: unknown; t
 
 function permissionPreview(value: unknown): { file?: ModifiedFile; diff?: string } {
   if (!value || typeof value !== "object") return {}
-  const record = value as Record<string, unknown>
-  const diff = typeof record.diff === "string" ? record.diff : typeof record.patch === "string" ? record.patch : undefined
-  const path =
-    stringField(record, "path") ??
-    stringField(record, "filepath") ??
-    stringField(record, "file_path") ??
-    stringField(record, "target")
-  if (!path) return {}
-  if (diff) {
-    const normalizedDiff = normalizeUnifiedPatch(path, diff)
-    const file = modifiedFileFromDiff(path, normalizedDiff)
-    return { file, diff: file.diff }
-  }
-  const file = modifiedFileFromInput(value)
-  return { file, diff: file?.diff }
+  const files = modifiedFilesFromInput(value)
+  return { file: files[0], diff: combinedDiff(files) }
 }
 
 function modifiedFileFromInput(value: unknown): ModifiedFile | undefined {
-  if (!value || typeof value !== "object") return undefined
+  return modifiedFilesFromInput(value)[0]
+}
+
+function modifiedFilesFromInput(value: unknown): ModifiedFile[] {
+  if (!value || typeof value !== "object") return []
   const record = value as Record<string, unknown>
-  const path =
-    stringField(record, "path") ??
-    stringField(record, "filepath") ??
-    stringField(record, "file_path") ??
-    stringField(record, "target")
-  if (!path) return undefined
-  const directDiff = typeof record.diff === "string" ? record.diff : typeof record.patch === "string" ? record.patch : undefined
+  const direct = directDiffsFromInput(record)
+  if (direct.length > 0) return direct
+
+  const structuredPatch = structuredPatchFilesFromInput(record)
+  if (structuredPatch.length > 0) return structuredPatch
+
+  const path = inputPath(record)
+  if (!path) return []
+  const edits = editsArray(record)
+  if (edits.length > 0) {
+    const diff = edits
+      .map((edit) => createUnifiedPatchFromContent(path, edit.old, edit.new))
+      .filter((patch): patch is string => Boolean(patch))
+      .join("\n")
+    return [modifiedFileFromDiff(path, diff || undefined)]
+  }
+
   const oldText = stringField(record, "old") ?? stringField(record, "old_text") ?? stringField(record, "before")
   const newText = stringField(record, "new") ?? stringField(record, "new_text") ?? stringField(record, "content") ?? stringField(record, "after")
-  const diff = directDiff
-    ? normalizeUnifiedPatch(path, directDiff)
-    : oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined
-  return modifiedFileFromDiff(path, diff)
+  const diff = oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined
+  return [modifiedFileFromDiff(path, diff)]
+}
+
+function directDiffsFromInput(record: Record<string, unknown>): ModifiedFile[] {
+  const explicitDiff = typeof record.diff === "string" ? record.diff : undefined
+  if (explicitDiff) {
+    const path = inputPath(record) ?? firstPatchFilePath(explicitDiff) ?? "patch"
+    return filesFromDiff(path, explicitDiff)
+  }
+
+  const patch = record.patch
+  if (typeof patch === "string") {
+    const path = inputPath(record) ?? firstPatchFilePath(patch) ?? "patch"
+    return filesFromDiff(path, patch)
+  }
+  if (Array.isArray(patch)) {
+    const files = patch
+      .map((file) => modifiedFileFromPatchEvent(file))
+      .filter((file): file is ModifiedFile => Boolean(file))
+    return files
+  }
+  return []
+}
+
+function filesFromDiff(fallbackPath: string, diff: string): ModifiedFile[] {
+  const normalized = normalizeUnifiedPatch(fallbackPath, diff)
+  const files = patchFilesFromUnifiedPatch(normalized).map((file) => modifiedFileFromDiff(file.path, file.diff))
+  return files.length > 0 ? files : [modifiedFileFromDiff(fallbackPath, normalized)]
+}
+
+function structuredPatchFilesFromInput(record: Record<string, unknown>): ModifiedFile[] {
+  const operations = Array.isArray(record.operations) ? record.operations : []
+  const files: ModifiedFile[] = []
+  for (const operation of operations) {
+    if (!operation || typeof operation !== "object") continue
+    const op = operation as Record<string, unknown>
+    const type = stringField(op, "type")
+    if (type === "rename") {
+      const from = stringField(op, "from")
+      const to = stringField(op, "to")
+      if (from) files.push(modifiedFileFromDiff(from, createUnifiedPatchFromContent(from, `renamed to ${to ?? "new path"}\n`, "")))
+      if (to) files.push(modifiedFileFromDiff(to, createUnifiedPatchFromContent(to, "", `renamed from ${from ?? "old path"}\n`)))
+      continue
+    }
+    const path = inputPath(op)
+    if (!path) continue
+    const opEdits = editsArray(op)
+    if (opEdits.length > 0) {
+      const diff = opEdits
+        .map((edit) => createUnifiedPatchFromContent(path, edit.old, edit.new))
+        .filter((patch): patch is string => Boolean(patch))
+        .join("\n")
+      files.push(modifiedFileFromDiff(path, diff || undefined))
+      continue
+    }
+    const oldText = stringField(op, "old") ?? stringField(op, "old_text") ?? stringField(op, "before")
+    const newText = stringField(op, "new") ?? stringField(op, "new_text") ?? stringField(op, "content") ?? stringField(op, "after")
+    files.push(modifiedFileFromDiff(path, createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "")))
+  }
+  return files
+}
+
+function editsArray(record: Record<string, unknown>) {
+  const edits = Array.isArray(record.edits) ? record.edits : []
+  return edits
+    .map((edit) => {
+      if (!edit || typeof edit !== "object") return undefined
+      const item = edit as Record<string, unknown>
+      return { old: stringField(item, "old") ?? "", new: stringField(item, "new") ?? "" }
+    })
+    .filter((edit): edit is { old: string; new: string } => Boolean(edit))
+}
+
+function inputPath(record: Record<string, unknown>) {
+  return stringField(record, "path") ?? stringField(record, "filepath") ?? stringField(record, "file_path") ?? stringField(record, "target")
+}
+
+function firstPatchFilePath(diff: string) {
+  return patchFilesFromUnifiedPatch(diff)[0]?.path
+}
+
+function modifiedFileFromPatchEvent(file: unknown): ModifiedFile | undefined {
+  if (!file || typeof file !== "object") return undefined
+  const record = file as Record<string, unknown>
+  const path = stringField(record, "path")
+  const diff = typeof record.diff === "string" ? record.diff : undefined
+  if (diff) {
+    const fallbackPath = path ?? firstPatchFilePath(diff) ?? "patch"
+    const normalized = normalizeUnifiedPatch(fallbackPath, diff)
+    return modifiedFileFromDiff(fallbackPath, normalized)
+  }
+  if (!path) return undefined
+  return {
+    file: path,
+    additions: Number(record.additions ?? 0),
+    deletions: Number(record.deletions ?? 0),
+  }
 }
 
 function modifiedFileFromDiff(file: string, diff?: string): ModifiedFile {
@@ -500,6 +595,15 @@ function modifiedFileFromDiff(file: string, diff?: string): ModifiedFile {
     if (line.startsWith("-")) deletions += 1
   }
   return { file, additions, deletions, diff }
+}
+
+function mergeAllModifiedFiles(current: ModifiedFile[], next: ModifiedFile[]): ModifiedFile[] {
+  return next.reduce((merged, file) => mergeModifiedFiles(merged, file), current)
+}
+
+function combinedDiff(files: ModifiedFile[]) {
+  const diffs = files.map((file) => file.diff).filter((diff): diff is string => Boolean(diff?.trim()))
+  return diffs.length > 0 ? diffs.join("\n") : undefined
 }
 
 function mergeModifiedFiles(current: ModifiedFile[], next: ModifiedFile | undefined): ModifiedFile[] {
@@ -551,7 +655,12 @@ function findMatchingApproval(approvals: PermissionApproval[], toolName: string,
 
 function isMutatingTool(name: string) {
   const lower = name.toLowerCase()
-  return lower === "write_file" || lower === "edit_file" || lower === "multi_edit" || lower.startsWith("apply_patch") || lower.includes("edit")
+  return isFileWritingTool(lower) || lower === "bash" || lower === "bash_kill" || lower === "todo_write"
+}
+
+function isFileWritingTool(name: string) {
+  const lower = name.toLowerCase()
+  return lower === "write_file" || lower === "edit_file" || lower === "multi_edit" || lower.startsWith("apply_patch") || lower.includes("edit") || lower.includes("write") || lower.includes("patch")
 }
 
 function stringField(record: Record<string, unknown>, key: string): string | undefined {

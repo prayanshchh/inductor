@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch } from "../src/diff_patch"
+import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "../src/diff_patch"
 
 describe("diff patch helpers", () => {
   test("wraps bare apply-patch hunks in unified file headers", () => {
@@ -30,5 +30,13 @@ describe("diff patch helpers", () => {
 
     expect(patch).toContain("-one")
     expect(patch).toContain("-two")
+  })
+
+  test("extracts file summaries from unified apply patches", () => {
+    const files = patchFilesFromUnifiedPatch("--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-old\n+new\n")
+
+    expect(files).toEqual([
+      expect.objectContaining({ path: "src/main.ts", additions: 1, deletions: 1, diff: expect.stringContaining("+new") }),
+    ])
   })
 })
