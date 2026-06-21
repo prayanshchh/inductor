@@ -1,6 +1,6 @@
 import type { PermissionDecision, SessionEvent } from "./backend"
 import type { StoredSessionDetail } from "./backend"
-import { createUnifiedPatchFromContent } from "./diff_patch"
+import { createUnifiedPatchFromContent, normalizeUnifiedPatch } from "./diff_patch"
 
 export type TranscriptItem =
   | { id: string; kind: "user"; text: string }
@@ -464,7 +464,8 @@ function permissionPreview(value: unknown): { file?: ModifiedFile; diff?: string
     stringField(record, "target")
   if (!path) return {}
   if (diff) {
-    const file = modifiedFileFromDiff(path, diff)
+    const normalizedDiff = normalizeUnifiedPatch(path, diff)
+    const file = modifiedFileFromDiff(path, normalizedDiff)
     return { file, diff: file.diff }
   }
   const file = modifiedFileFromInput(value)
@@ -483,7 +484,9 @@ function modifiedFileFromInput(value: unknown): ModifiedFile | undefined {
   const directDiff = typeof record.diff === "string" ? record.diff : typeof record.patch === "string" ? record.patch : undefined
   const oldText = stringField(record, "old") ?? stringField(record, "old_text") ?? stringField(record, "before")
   const newText = stringField(record, "new") ?? stringField(record, "new_text") ?? stringField(record, "content") ?? stringField(record, "after")
-  const diff = directDiff ?? (oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined)
+  const diff = directDiff
+    ? normalizeUnifiedPatch(path, directDiff)
+    : oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined
   return modifiedFileFromDiff(path, diff)
 }
 

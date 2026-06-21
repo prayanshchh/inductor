@@ -18,7 +18,7 @@ import {
 } from "./state"
 import { archiveWorktree, listProviderModels, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
-import { createUnifiedPatchFromContent, normalizeDiffForRendering } from "./diff_patch"
+import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
@@ -116,9 +116,6 @@ const TELEMETRY_SIDEBAR_WIDTH = 32
 const TELEMETRY_PROGRESS_WIDTH = 24
 const TELEMETRY_FILE_WIDTH = 22
 const TELEMETRY_FOOTER_WIDTH = 24
-const DIFF_VIEWER_MIN_HEIGHT = 8
-const DIFF_VIEWER_MAX_HEIGHT = 28
-
 const commands: Command[] = [
   { name: "/agents", description: "Switch agent", action: "agents" },
   { name: "/connect", description: "Connect provider", action: "connect" },
@@ -1203,11 +1200,9 @@ export function App(props: AppProps) {
           <box
             flexGrow={1}
             minWidth={0}
-            height="100%"
-            flexDirection="column"
+                flexDirection="column"
             backgroundColor={theme.panel}
-            overflow="hidden"
-            border
+                border
             borderStyle="rounded"
             borderColor={theme.border}
           >
@@ -1215,8 +1210,7 @@ export function App(props: AppProps) {
               <scrollbox
                 flexGrow={1}
                 minHeight={0}
-                overflow="hidden"
-                stickyScroll={true}
+                        stickyScroll={true}
                 stickyStart="bottom"
                 scrollAcceleration={scrollAcceleration}
                 viewportCulling={true}
@@ -1858,18 +1852,15 @@ function UserPrompt(props: { text: string }) {
 }
 
 function DiffWithHunkReview(props: { diff: string; path?: string }) {
-  const viewerHeight = createMemo(() => diffViewerHeight(props.diff))
   return (
-    <box width="100%" height={viewerHeight()} minHeight={0} overflow="hidden" flexDirection="column">
+    <box width="100%" minHeight={0} flexDirection="column">
       <diff
         diff={normalizeDiffForRendering(props.diff)}
         view="split"
         syncScroll={true}
         filetype={filetype(props.path)}
         width="100%"
-        height="100%"
         minHeight={0}
-        overflow="hidden"
         wrapMode="word"
         showLineNumbers={true}
         syntaxStyle={syntaxStyle}
@@ -1890,10 +1881,6 @@ function DiffWithHunkReview(props: { diff: string; path?: string }) {
   )
 }
 
-function diffViewerHeight(diff: string) {
-  const lineCount = diff.split("\n").length
-  return Math.min(DIFF_VIEWER_MAX_HEIGHT, Math.max(DIFF_VIEWER_MIN_HEIGHT, lineCount))
-}
 
 function ToolDetails(props: { item: Extract<TranscriptItem, { kind: "tool" }> }) {
   const input = createMemo(() => prettyJson(props.item.input))
@@ -2614,13 +2601,6 @@ function diffFromTool(item: Extract<TranscriptItem, { kind: "tool" }>) {
   const newText = stringField(json, ["new", "new_text", "content", "after"])
   if (!oldText && !newText) return undefined
   return createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "")
-}
-
-function normalizeUnifiedPatch(filePath: string, patch: string) {
-  const trimmed = patch.trimStart()
-  if (trimmed.startsWith("diff --git ") || trimmed.startsWith("--- ") || trimmed.startsWith("Index: ")) return patch
-  if (trimmed.startsWith("@@")) return `--- a/${filePath}\n+++ b/${filePath}\n${patch}`
-  return patch
 }
 
 function prettyJson(value: string) {

@@ -50,6 +50,21 @@ describe("transcript reducer", () => {
     expect(state.pendingPermission?.diff).toContain("+# Inductor")
   })
 
+  test("normalizes permission request patch previews from bare hunks", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "permission_request",
+      request_id: "req-patch",
+      tool_name: "apply_patch_freeform",
+      reason: "mutating tool",
+      input_json: { path: "src/main.rs", patch: "@@ -1 +0,0 @@\n-old\n" },
+    })
+
+    expect(state.pendingPermission?.diff).toContain("--- a/src/main.rs")
+    expect(state.pendingPermission?.diff).toContain("+++ b/src/main.rs")
+    expect(state.pendingPermission?.diff).toContain("-old")
+  })
+
   test("applies permission coloring to the later tool row when approval resolves first", () => {
     let state = createInitialState()
     state = applySessionEvent(state, {
