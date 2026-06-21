@@ -15,7 +15,39 @@ export function createUnifiedPatchFromContent(filePath: string, oldText = "", ne
 }
 
 export function normalizeDiffForRendering(diff: string) {
-  return normalizeHunkCounts(diff)
+  return normalizeHunkCounts(normalizeDeletedFilePatch(diff))
+}
+
+export function normalizeUnifiedPatch(filePath: string, patch: string) {
+  const trimmed = patch.trimStart()
+  if (trimmed.startsWith("diff --git ") || trimmed.startsWith("--- ") || trimmed.startsWith("Index: ")) return patch
+  if (trimmed.startsWith("@@")) return `--- a/${filePath}\n+++ b/${filePath}\n${patch}`
+  return patch
+}
+
+function normalizeDeletedFilePatch(diff: string) {
+  const lines = diff.split("\n")
+  const out: string[] = []
+  let inDeletedFile = false
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      inDeletedFile = false
+    } else if (line.startsWith("deleted file mode ")) {
+      inDeletedFile = true
+    } else if (line.startsWith("new file mode ")) {
+      inDeletedFile = false
+    }
+
+    if (inDeletedFile && line.startsWith("+++ b/")) {
+      const file = line.slice("+++ b/".length).trim()
+      out.push(file ? `+++ /dev/null\t${file}` : "+++ /dev/null")
+    } else {
+      out.push(line)
+    }
+  }
+
+  return out.join("\n")
 }
 
 function normalizeHunkCounts(diff: string) {

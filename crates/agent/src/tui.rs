@@ -2381,8 +2381,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-/// Max diff lines shown in the permission card before truncating.
-const PERMISSION_DIFF_MAX: usize = 24;
+/// Max non-diff lines shown in the permission card for command/JSON previews.
+const PERMISSION_NON_DIFF_MAX: usize = 24;
 
 /// Build a preview of a pending tool call for the permission card: a colored
 /// diff (green adds / red removes, line-numbered) for file writes/edits, the
@@ -2397,7 +2397,7 @@ fn permission_preview_lines(
 
     // Bash / shell command.
     if let Some(cmd) = s("command") {
-        for line in cmd.lines().take(PERMISSION_DIFF_MAX) {
+        for line in cmd.lines().take(PERMISSION_NON_DIFF_MAX) {
             out.push(Line::from(vec![
                 Span::styled("$ ", Style::default().fg(theme::FAINT)),
                 Span::styled(line.to_string(), Style::default().fg(theme::FG)),
@@ -2427,13 +2427,8 @@ fn permission_preview_lines(
         .or_else(|| s("new_string"))
         .or_else(|| s("new"));
 
-    let mut shown = 0usize;
-    let mut push_diff = |out: &mut Vec<Line>, text: &str, kind: DiffRowKind| {
+    let push_diff = |out: &mut Vec<Line>, text: &str, kind: DiffRowKind| {
         for (i, line) in text.lines().enumerate() {
-            if shown >= PERMISSION_DIFF_MAX {
-                return;
-            }
-            shown += 1;
             let bg = match kind {
                 DiffRowKind::Add => Some(theme::ADD_BG),
                 DiffRowKind::Remove => Some(theme::REM_BG),
@@ -2468,23 +2463,13 @@ fn permission_preview_lines(
     // Fall back to JSON when there's no recognizable file content.
     if removed.is_none() && added.is_none() {
         let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
-        for line in pretty.lines().take(PERMISSION_DIFF_MAX) {
+        for line in pretty.lines().take(PERMISSION_NON_DIFF_MAX) {
             out.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(theme::MUTED),
             )));
         }
     }
-
-    let total: usize = removed.map(|r| r.lines().count()).unwrap_or(0)
-        + added.map(|a| a.lines().count()).unwrap_or(0);
-    if total > PERMISSION_DIFF_MAX {
-        out.push(Line::from(Span::styled(
-            format!("  … {} more lines", total - PERMISSION_DIFF_MAX),
-            Style::default().fg(theme::FAINT),
-        )));
-    }
-
     out
 }
 
@@ -4075,9 +4060,6 @@ fn ensure_newline(body: &mut String) {
     }
 }
 
-/// Max embedded diff lines per tool call in the transcript body.
-const BODY_DIFF_MAX: usize = 120;
-
 /// Append a diff block for a file-mutating tool call into the body, with real
 /// line numbers, so the change stays visible in the transcript permanently.
 /// Lines use the `NNNNN + content` / `NNNNN - content` format that the
@@ -4110,25 +4092,11 @@ fn append_tool_diff(
             .unwrap_or(1)
     };
 
-    fn push_block(
-        body: &mut String,
-        text: &str,
-        sign: char,
-        start: usize,
-        shown: &mut usize,
-        truncated: &mut usize,
-    ) {
+    fn push_block(body: &mut String, text: &str, sign: char, start: usize) {
         for (i, line) in text.lines().enumerate() {
-            if *shown >= BODY_DIFF_MAX {
-                *truncated += 1;
-                continue;
-            }
-            *shown += 1;
             body.push_str(&format!("{:>5} {sign} {line}\n", start + i));
         }
     }
-    let mut shown = 0usize;
-    let mut truncated = 0usize;
 
     // Collect (old, new) pairs per tool shape.
     let mut pairs: Vec<(Option<String>, Option<String>)> = Vec::new();
@@ -4175,14 +4143,11 @@ fn append_tool_diff(
     for (old, new) in pairs {
         let start = old.as_deref().map(&start_line_of).unwrap_or(1);
         if let Some(old) = old {
-            push_block(body, &old, '-', start, &mut shown, &mut truncated);
+            push_block(body, &old, '-', start);
         }
         if let Some(new) = new {
-            push_block(body, &new, '+', start, &mut shown, &mut truncated);
+            push_block(body, &new, '+', start);
         }
-    }
-    if truncated > 0 {
-        body.push_str(&format!("        … {truncated} more lines\n"));
     }
 }
 
