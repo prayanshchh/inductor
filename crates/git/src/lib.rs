@@ -352,7 +352,11 @@ where
 /// Branch name Inductor assigns a managed worktree: `<slug>-<id8>`.
 /// Exposed so the harness can recompute it when renaming a placeholder branch.
 pub fn branch_name_for(slug: &str, workspace_id: WorkspaceId) -> String {
-    format!("{}-{}", sanitize_slug(slug), short_workspace_id(workspace_id))
+    format!(
+        "{}-{}",
+        sanitize_slug(slug),
+        short_workspace_id(workspace_id)
+    )
 }
 
 /// Pick a worktree directory leaf (and matching branch leaf) from the work

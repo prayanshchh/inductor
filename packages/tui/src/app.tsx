@@ -2,6 +2,8 @@
 import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 import path from "node:path"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore, produce } from "solid-js/store"
@@ -64,7 +66,7 @@ type AgentSlot = {
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
 type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "review" | "sessions"
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "pr" | "review" | "sessions"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
 type ConnectChoice = { provider: string; label: string; description: string }
@@ -73,6 +75,7 @@ type AgentChoice = { name: string; description: string }
 type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
 type PaletteItem = Command | ModelChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
 type StopIntent = "interrupt" | "exit"
+type PrFlow = { step: "base" | "message"; base: string; worktree: Worktree }
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
@@ -128,6 +131,7 @@ const commands: Command[] = [
   { name: "/model", description: "Switch model", action: "model" },
   { name: "/new", description: "New session", action: "new" },
   { name: "/permissions", description: "Switch agent permissions", action: "permissions" },
+  { name: "/pr", description: "Create pull request", action: "pr" },
   { name: "/review", description: "Review changes", action: "review" },
   { name: "/sessions", description: "Open sessions", action: "sessions" },
   { name: "/clear", description: "Clear transcript", action: "clear" },
@@ -169,6 +173,7 @@ const permissionChoices: PermissionChoice[] = [
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
 const scrollAcceleration = new MacOSScrollAccel({ maxMultiplier: 2.8 })
+const execFileAsync = promisify(execFile)
 const syntaxStyle = SyntaxStyle.fromTheme([
   { scope: ["keyword", "storage.type", "keyword.control"], style: { foreground: theme.red } },
   { scope: ["string", "punctuation.definition.string"], style: { foreground: theme.green } },
@@ -308,6 +313,7 @@ export function App(props: AppProps) {
   const [mention, setMention] = createSignal<MentionState>()
   const [pasteCount, setPasteCount] = createSignal(0)
   const [promptImages, setPromptImages] = createSignal<PromptImageAttachment[]>([])
+  const [prFlow, setPrFlow] = createSignal<PrFlow>()
   const [worktrees, setWorktrees] = createSignal<Worktree[]>([])
   const [worktreeBusy, setWorktreeBusy] = createSignal<string>()
   const [sessionListStatus, setSessionListStatus] = createSignal("")
@@ -402,7 +408,9 @@ export function App(props: AppProps) {
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
     void refreshWorktrees()
+    const worktreeRefreshTimer = setInterval(() => void refreshWorktrees(), 30_000)
     void refreshCopilotModels()
+    onCleanup(() => clearInterval(worktreeRefreshTimer))
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
@@ -440,6 +448,14 @@ export function App(props: AppProps) {
       event.stopPropagation()
       return
     }
+    if (isEscape(event) && prFlow()) {
+      event.preventDefault()
+      event.stopPropagation()
+      setPrFlow(undefined)
+      replacePrompt("")
+      setNotice({ text: "PR creation cancelled", tone: "muted" })
+      return
+    }
     if (isEscape(event) && (fstate().running || runs.has(store.focusedKey))) {
       event.preventDefault()
       event.stopPropagation()
@@ -452,11 +468,16 @@ export function App(props: AppProps) {
   function submit() {
     const visiblePrompt = input.plainText.trim()
     const prompt = promptForSubmit(visiblePrompt, promptImages()).trim()
-    if (!visiblePrompt || fstate().running) return
+    if (fstate().running) return
     if (palette()) {
       acceptPalette()
       return
     }
+    if (prFlow()) {
+      void submitPrFlow(visiblePrompt)
+      return
+    }
+    if (!visiblePrompt) return
 
     // Pin the turn to the currently focused slot so its events route here even
     // after the user switches focus to another running agent.
@@ -837,6 +858,14 @@ export function App(props: AppProps) {
     updateDraft(next)
   }
 
+  function appendAssistantMessage(text: string) {
+    const key = store.focusedKey
+    updateAgentState(key, (next) => ({
+      ...next,
+      transcript: [...next.transcript, { id: `pr-${Date.now()}`, kind: "assistant", text }],
+    }))
+  }
+
   async function normalizeImagePathPaste(value: string) {
     const normalized = attachImagePathTokens(value)
     if (normalized === value) return
@@ -918,6 +947,11 @@ export function App(props: AppProps) {
       openPalette("permissions")
       return
     }
+    if (command.action === "pr") {
+      closePalette()
+      startPullRequestFlow()
+      return
+    }
     if (command.action === "review") {
       input.setText("review current changes")
       setDraft("review current changes")
@@ -926,6 +960,78 @@ export function App(props: AppProps) {
       return
     }
     closePalette()
+  }
+
+  function focusedWorktree() {
+    const agent = focusedAgent()
+    return worktrees().find((w) =>
+      (agent.sessionId && agent.sessionId === w.session_id) ||
+      (agent.workspaceId && agent.workspaceId === w.workspace_id)
+    )
+  }
+
+  function startPullRequestFlow() {
+    const agent = focusedAgent()
+    const worktree = focusedWorktree()
+    if (!worktree) {
+      setNotice({ text: "No worktree yet — send a prompt first", tone: "cyan" })
+      return
+    }
+    if (!worktree.exists) {
+      setNotice({ text: "Cannot create PR for missing worktree", tone: "red" })
+      return
+    }
+    if (runs.has(agent.key) || agent.state.running) {
+      setNotice({ text: "Stop this agent before creating a PR", tone: "cyan" })
+      return
+    }
+    setPrFlow({ step: "base", base: "main", worktree })
+    replacePrompt("main")
+    setNotice({ text: "PR base branch (default main) · edit or press enter", tone: "cyan" })
+  }
+
+  async function submitPrFlow(value: string) {
+    const flow = prFlow()
+    if (!flow) return
+    if (flow.step === "base") {
+      const base = value.trim() || "main"
+      setPrFlow({ ...flow, step: "message", base })
+      replacePrompt("")
+      setNotice({ text: `PR commit message · enter to commit, push, and create PR against ${base}`, tone: "cyan" })
+      return
+    }
+    const message = value.trim()
+    if (!message) {
+      setNotice({ text: "Commit message is required for /pr", tone: "red" })
+      return
+    }
+    input.setText("")
+    setDraft("")
+    setPrFlow(undefined)
+    recordHistory(`/pr ${flow.base} ${message}`)
+    await createPullRequestForWorktree(flow.worktree, flow.base, message)
+  }
+
+  async function createPullRequestForWorktree(worktree: Worktree, base: string, message: string) {
+    setWorktreeBusy(worktree.workspace_id)
+    setNotice({ text: `creating PR for ${worktree.branch_name} against ${base}...`, tone: "cyan" })
+    try {
+      await execFileAsync("git", ["-C", worktree.worktree_path, "add", "-A"], { maxBuffer: 1024 * 1024 * 4 })
+      const { stdout: status } = await execFileAsync("git", ["-C", worktree.worktree_path, "status", "--porcelain"], { maxBuffer: 1024 * 1024 })
+      if (status.trim()) {
+        await execFileAsync("git", ["-C", worktree.worktree_path, "commit", "-m", message], { maxBuffer: 1024 * 1024 * 4 })
+      }
+      await execFileAsync("git", ["-C", worktree.worktree_path, "push", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
+      const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor.", "--json", "url", "--jq", ".url"], { cwd: worktree.worktree_path, maxBuffer: 1024 * 1024 })
+      const url = stdout.trim()
+      setNotice({ text: url ? `PR created: ${url}` : "PR created", tone: "cyan" })
+      if (url) appendAssistantMessage(`✅ Pull request created against ${base}:\n${url}`)
+      await refreshWorktrees()
+    } catch (error) {
+      setNotice({ text: pullRequestErrorMessage(error), tone: "red" })
+    } finally {
+      setWorktreeBusy(undefined)
+    }
   }
 
   function agentForWorktree(worktree: Worktree) {
@@ -1593,6 +1699,7 @@ function WorktreeRow(props: {
   const live = () => props.agent?.state
   const isRunning = () => Boolean(live()?.running)
   const needsApproval = () => Boolean(live()?.pendingPermission)
+  const isMerged = () => wt.status === "merged"
   const rowStatus = () => {
     if (props.busy) return "working..."
     if (isRunning()) return "running"
@@ -1602,8 +1709,8 @@ function WorktreeRow(props: {
   const statusColor = () => {
     if (needsApproval()) return theme.orange
     if (isRunning()) return theme.green
-    if (wt.status === "active") return theme.cyan
-    if (wt.status === "merged") return theme.purple
+    if (wt.status === "active" || wt.status === "pr_open") return theme.cyan
+    if (isMerged()) return theme.purple
     return theme.dim
   }
   return (
@@ -1612,9 +1719,9 @@ function WorktreeRow(props: {
       flexDirection="column"
       paddingLeft={1}
       paddingRight={1}
-      backgroundColor={props.active ? theme.paletteSelected : theme.panelSoft}
+      backgroundColor={isMerged() ? "#24143a" : props.active ? theme.paletteSelected : theme.panelSoft}
       border={["left"]}
-      borderColor={props.active ? theme.cyan : isRunning() ? theme.green : theme.borderSoft}
+      borderColor={isMerged() ? theme.purple : props.active ? theme.cyan : isRunning() ? theme.green : theme.borderSoft}
     >
       <box flexDirection="row" gap={1} onMouseUp={props.load}>
         <text fg={isRunning() ? theme.green : needsApproval() ? theme.orange : theme.dim} selectable={false}>{isRunning() ? "●" : needsApproval() ? "?" : "○"}</text>
@@ -1625,12 +1732,19 @@ function WorktreeRow(props: {
       <box flexDirection="row" gap={1}>
         <text fg={statusColor()}>{rowStatus()}</text>
         <box flexGrow={1} />
-        <Show when={wt.status === "active" && wt.exists && !isRunning()}>
+        <Show when={(wt.status === "active" || wt.status === "pr_open") && wt.exists && !isRunning()}>
           <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
         </Show>
       </box>
     </box>
   )
+}
+
+function pullRequestErrorMessage(error: unknown) {
+  const anyError = error as { message?: string; stderr?: string; stdout?: string; code?: string | number }
+  const detail = String(anyError?.stderr || anyError?.stdout || anyError?.message || error).trim().replace(/\s+/g, " ")
+  if (detail.includes("executable file not found") || detail.includes("ENOENT")) return "PR failed: install/login to GitHub CLI (`gh`)"
+  return truncateRight(`PR failed: ${detail || anyError?.code || "unknown error"}`, 140)
 }
 
 function defaultComposerNotice(status: string, running: boolean, pendingPermission?: AppState["pendingPermission"]): ComposerNotice {

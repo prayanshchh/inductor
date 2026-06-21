@@ -237,6 +237,8 @@ pub struct SessionRecord {
 pub enum WorktreeStatus {
     /// Worktree exists and an agent may still be working in it.
     Active,
+    /// A pull request exists for this worktree branch and has not been merged yet.
+    PrOpen,
     /// Legacy status retained for older databases that recorded local merges.
     Merged,
     /// Worktree was discarded.
@@ -250,6 +252,7 @@ impl WorktreeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             WorktreeStatus::Active => "active",
+            WorktreeStatus::PrOpen => "pr_open",
             WorktreeStatus::Merged => "merged",
             WorktreeStatus::Abandoned => "abandoned",
             WorktreeStatus::Archived => "archived",
@@ -258,6 +261,7 @@ impl WorktreeStatus {
 
     pub fn from_str(value: &str) -> Self {
         match value {
+            "pr_open" => WorktreeStatus::PrOpen,
             "merged" => WorktreeStatus::Merged,
             "abandoned" => WorktreeStatus::Abandoned,
             "archived" => WorktreeStatus::Archived,
