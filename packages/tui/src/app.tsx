@@ -20,7 +20,7 @@ import {
 } from "./state"
 import { archiveWorktree, listProviderModels, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
-import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch } from "./diff_patch"
+import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
 import {
   appendPromptToken,
@@ -2593,6 +2593,7 @@ function toolKind(name: string) {
   if (lower === "read_file" || lower === "read") return "read file"
   if (lower === "write_file" || lower === "write") return "write file"
   if (lower === "edit_file" || lower.includes("edit")) return "edit file"
+  if (lower.startsWith("apply_patch")) return "apply patch"
   if (lower === "bash" || lower.includes("shell")) return "bash"
   if (lower.includes("grep") || lower.includes("search")) return "search"
   if (lower.includes("list") || lower.includes("ls")) return "list dir"
@@ -2631,8 +2632,8 @@ function toolActivity(item: Extract<TranscriptItem, { kind: "tool" }>) {
   if (kind === "read file") {
     return `${toolVerb(item.status, "read")} file ${truncateLeft(path ?? description ?? "file", 82)}`
   }
-  if (kind === "write file" || kind === "edit file") {
-    return `${toolVerb(item.status, "write")} ${truncateLeft(path ?? description ?? "file", 88)}`
+  if (kind === "write file" || kind === "edit file" || kind === "apply patch") {
+    return `${toolVerb(item.status, "write")} ${truncateLeft(path ?? description ?? "patch", 88)}`
   }
   if (kind === "search") {
     return `${toolVerb(item.status, "search")} ${truncateRight(query ?? description ?? path ?? "workspace", 96)}`
@@ -2682,12 +2683,13 @@ function diffStats(diff: string) {
 }
 
 function isWriteTool(name: string) {
-  return name === "write_file" || name === "edit_file" || name.toLowerCase().includes("edit")
+  const lower = name.toLowerCase()
+  return lower === "write_file" || lower === "edit_file" || lower === "multi_edit" || lower.startsWith("apply_patch") || lower.includes("edit") || lower.includes("write") || lower.includes("patch")
 }
 
 function toolPath(item: Extract<TranscriptItem, { kind: "tool" }>) {
   const json = parseMaybeJson(item.input)
-  return stringField(json, ["path", "filepath", "file_path", "target", "filename"])
+  return stringField(json, ["path", "filepath", "file_path", "target", "filename"]) ?? patchPathFromToolInput(json)
 }
 
 function commandFromTool(item: Extract<TranscriptItem, { kind: "tool" }>) {
@@ -2708,13 +2710,83 @@ function toolDescription(item: Extract<TranscriptItem, { kind: "tool" }>) {
 function diffFromTool(item: Extract<TranscriptItem, { kind: "tool" }>) {
   if (item.diff) return item.diff
   const json = parseMaybeJson(item.input)
-  const direct = stringField(json, ["diff", "patch"])
+  const explicitDiff = stringField(json, ["diff"])
   const path = toolPath(item) ?? "file"
-  if (direct) return normalizeUnifiedPatch(path, direct)
+  if (explicitDiff) return normalizeUnifiedPatch(path, explicitDiff)
+  const patchValue = json?.patch
+  if (typeof patchValue === "string") return normalizeUnifiedPatch(path, patchValue)
+  if (Array.isArray(patchValue)) {
+    const diffs = patchValue
+      .map((file) => (file && typeof file === "object" && typeof (file as Record<string, unknown>).diff === "string" ? String((file as Record<string, unknown>).diff) : undefined))
+      .filter((diff): diff is string => Boolean(diff?.trim()))
+    if (diffs.length > 0) return diffs.join("\n")
+  }
+  const operations = Array.isArray(json?.operations) ? json.operations : []
+  if (operations.length > 0) {
+    const diffs = operations
+      .map((operation) => diffFromPatchOperation(operation))
+      .filter((diff): diff is string => Boolean(diff?.trim()))
+    if (diffs.length > 0) return diffs.join("\n")
+  }
+  const edits = editsArray(json)
+  if (edits.length > 0) {
+    const diffs = edits
+      .map((edit) => createUnifiedPatchFromContent(path, edit.old, edit.new))
+      .filter((diff): diff is string => Boolean(diff))
+    if (diffs.length > 0) return diffs.join("\n")
+  }
   const oldText = stringField(json, ["old", "old_text", "before"])
   const newText = stringField(json, ["new", "new_text", "content", "after"])
   if (!oldText && !newText) return undefined
   return createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "")
+}
+
+function diffFromPatchOperation(operation: unknown) {
+  if (!operation || typeof operation !== "object") return undefined
+  const op = operation as Record<string, unknown>
+  const type = stringField(op, ["type"])
+  if (type === "rename") {
+    const from = stringField(op, ["from"])
+    const to = stringField(op, ["to"])
+    const diffs = [
+      from ? createUnifiedPatchFromContent(from, `renamed to ${to ?? "new path"}\n`, "") : undefined,
+      to ? createUnifiedPatchFromContent(to, "", `renamed from ${from ?? "old path"}\n`) : undefined,
+    ].filter((diff): diff is string => Boolean(diff))
+    return diffs.length > 0 ? diffs.join("\n") : undefined
+  }
+  const path = stringField(op, ["path", "filepath", "file_path", "target", "filename"]) ?? "file"
+  const edits = editsArray(op)
+  if (edits.length > 0) {
+    const diffs = edits
+      .map((edit) => createUnifiedPatchFromContent(path, edit.old, edit.new))
+      .filter((diff): diff is string => Boolean(diff))
+    return diffs.length > 0 ? diffs.join("\n") : undefined
+  }
+  const oldText = stringField(op, ["old", "old_text", "before"])
+  const newText = stringField(op, ["new", "new_text", "content", "after"])
+  return oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined
+}
+
+function editsArray(value: Record<string, unknown> | undefined) {
+  const edits = Array.isArray(value?.edits) ? value.edits : []
+  return edits
+    .map((edit) => {
+      if (!edit || typeof edit !== "object") return undefined
+      const item = edit as Record<string, unknown>
+      return { old: stringField(item, ["old"]) ?? "", new: stringField(item, ["new"]) ?? "" }
+    })
+    .filter((edit): edit is { old: string; new: string } => Boolean(edit))
+}
+
+function patchPathFromToolInput(json: Record<string, unknown> | undefined) {
+  const patch = json?.patch
+  if (typeof patch === "string") return patchFilesFromUnifiedPatch(patch)[0]?.path
+  if (Array.isArray(patch)) {
+    const first = patch.find((file) => file && typeof file === "object" && typeof (file as Record<string, unknown>).path === "string") as Record<string, unknown> | undefined
+    return typeof first?.path === "string" ? first.path : undefined
+  }
+  const diff = stringField(json, ["diff"])
+  return diff ? patchFilesFromUnifiedPatch(diff)[0]?.path : undefined
 }
 
 function prettyJson(value: string) {
