@@ -66,7 +66,7 @@ export type Worktree = {
   state_db?: string | null
   branch_name: string
   base_branch: string
-  status: "active" | "merged" | "abandoned" | "archived"
+  status: "active" | "merged" | "abandoned" | "archived" | "pr_open"
   exists: boolean
   display_name?: string | null
   session_id?: string | null

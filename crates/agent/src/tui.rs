@@ -272,6 +272,13 @@ enum PaletteKind {
     Efforts,
     Sessions,
     Permissions,
+    PrActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrFlow {
+    BaseBranch,
+    CommitMessage { base: String },
 }
 
 struct Palette {
@@ -631,6 +638,8 @@ struct App {
     completion_active: bool,
     /// Active `/`-command palette, if any.
     palette: Option<Palette>,
+    /// In-progress `/pr` create flow.
+    pr_flow: Option<PrFlow>,
     /// Current reasoning effort.
     effort: Effort,
     /// Fast mode: forces minimal effort while on, restoring `saved_effort` off.
@@ -710,6 +719,7 @@ impl App {
             completion_index: 0,
             completion_active: false,
             palette: None,
+            pr_flow: None,
             effort: Effort::Medium,
             fast: false,
             saved_effort: Effort::Medium,
@@ -1251,7 +1261,9 @@ impl App {
                     // swallow any other key.
                     if matches!(
                         self.palette.as_ref().map(|p| p.kind),
-                        Some(PaletteKind::Models) | Some(PaletteKind::Efforts)
+                        Some(PaletteKind::Models)
+                            | Some(PaletteKind::Efforts)
+                            | Some(PaletteKind::PrActions)
                     ) {
                         return false;
                     }
@@ -1263,7 +1275,10 @@ impl App {
             // First Esc warns; a second consecutive Esc interrupts the running
             // agent (Ctrl+C quits Inductor entirely).
             KeyCode::Esc => {
-                if self.show_usage {
+                if self.pr_flow.take().is_some() {
+                    self.clear_prompt();
+                    self.status = "PR creation cancelled".to_string();
+                } else if self.show_usage {
                     self.show_usage = false;
                     self.status = "Usage hidden".to_string();
                 } else if self.esc_armed {
@@ -1332,7 +1347,10 @@ impl App {
     /// Re-evaluate which popup should be open after a prompt edit: a `/command`
     /// palette when the prompt is a single `/…` token, otherwise `@` files.
     fn refresh_popups(&mut self) {
-        if self.prompt.starts_with('/') && !self.prompt.contains(char::is_whitespace) {
+        if self.pr_flow.is_some() {
+            self.palette = None;
+            self.completion_active = false;
+        } else if self.prompt.starts_with('/') && !self.prompt.contains(char::is_whitespace) {
             self.completion_active = false;
             self.open_commands();
         } else {
@@ -1350,6 +1368,7 @@ impl App {
             "/sessions",
             "/resume",
             "/permissions",
+            "/pr",
             "/compact",
             "/clear",
             "/help",
@@ -1513,6 +1532,17 @@ impl App {
                             index: 0,
                         });
                     }
+                    "/pr" => {
+                        self.palette = Some(Palette {
+                            kind: PaletteKind::PrActions,
+                            items: vec![
+                                "Create PR against main".to_string(),
+                                "Change base branch".to_string(),
+                            ],
+                            index: 0,
+                        });
+                        self.status = "Create a PR · default base is main".to_string();
+                    }
                     "/compact" => {
                         self.start_compaction();
                     }
@@ -1530,7 +1560,7 @@ impl App {
                         self.status = "Cleared — fresh start".to_string();
                     }
                     _ => {
-                        self.status = "Shortcuts: @ files · / commands (model, effort, usage, fast, resume, permissions, compact, clear) · enter run · ctrl+j newline · esc esc interrupt · ctrl+c quit"
+                        self.status = "Shortcuts: @ files · / commands (model, effort, usage, fast, pr, resume, permissions, compact, clear) · enter run · ctrl+j newline · esc esc interrupt · ctrl+c quit"
                             .to_string();
                     }
                 }
@@ -1585,6 +1615,22 @@ impl App {
                         " — you'll be asked before risky tools run"
                     }
                 );
+            }
+            PaletteKind::PrActions => {
+                self.clear_prompt();
+                self.palette = None;
+                if choice.starts_with("Change base") {
+                    self.pr_flow = Some(PrFlow::BaseBranch);
+                    self.status = "PR base branch · type a branch name, enter to continue (empty = main)"
+                        .to_string();
+                } else {
+                    self.pr_flow = Some(PrFlow::CommitMessage {
+                        base: "main".to_string(),
+                    });
+                    self.status =
+                        "PR commit message · type message, enter to commit/push/create PR (base: main)"
+                            .to_string();
+                }
             }
         }
     }
@@ -1699,6 +1745,10 @@ impl App {
             self.status = "Agent is already running — esc esc to interrupt".to_string();
             return;
         }
+        if self.pr_flow.is_some() {
+            self.submit_pr_flow();
+            return;
+        }
         let prompt = self.prompt.trim().to_string();
         if prompt.is_empty() {
             self.status = "Prompt is empty".to_string();
@@ -1729,6 +1779,54 @@ impl App {
         }
         self.transcript.push(ChatEntry::User(prompt));
         self.start_multimodal_run(multimodal_message, RunKind::Normal);
+    }
+
+    fn submit_pr_flow(&mut self) {
+        let Some(flow) = self.pr_flow.take() else { return };
+        let input = self.prompt.trim().to_string();
+        self.clear_prompt();
+        match flow {
+            PrFlow::BaseBranch => {
+                let base = if input.is_empty() {
+                    "main".to_string()
+                } else {
+                    input
+                };
+                self.pr_flow = Some(PrFlow::CommitMessage { base: base.clone() });
+                self.status = format!(
+                    "PR commit message · type message, enter to commit/push/create PR (base: {base})"
+                );
+            }
+            PrFlow::CommitMessage { base } => {
+                if input.is_empty() {
+                    self.pr_flow = Some(PrFlow::CommitMessage { base });
+                    self.status = "Commit message is required for /pr".to_string();
+                    return;
+                }
+                self.create_pr(&base, &input);
+            }
+        }
+    }
+
+    fn create_pr(&mut self, base: &str, message: &str) {
+        self.status = format!("Creating PR against {base}…");
+        let result = create_pull_request(&self.workspace, base, message);
+        match result {
+            Ok(url) => {
+                self.transcript.push(ChatEntry::Agent(format!(
+                    "✅ Pull request created against `{base}`:
+{url}"
+                )));
+                self.status = "PR created".to_string();
+            }
+            Err(err) => {
+                self.transcript
+                    .push(ChatEntry::Error(format!("PR creation failed: {err}")));
+                self.status = "PR creation failed".to_string();
+            }
+        }
+        self.scroll_to_bottom();
+        self.last_activity = Instant::now();
     }
 
     /// Compact the provider context: summarize the conversation in a background
@@ -2645,6 +2743,7 @@ fn render_palette_popup(frame: &mut Frame<'_>, app: &App, composer: Rect) {
         PaletteKind::Efforts => "select effort · ↑↓ enter",
         PaletteKind::Sessions => "↑↓ select · enter resume · esc new session",
         PaletteKind::Permissions => "approval policy · ↑↓ enter",
+        PaletteKind::PrActions => "create PR · ↑↓ enter",
     };
     let rows = palette.items.len() as u16;
     let height = (rows + 2).min(10);
@@ -2677,7 +2776,7 @@ fn render_palette_popup(frame: &mut Frame<'_>, app: &App, composer: Rect) {
                     .session_id
                     .as_deref()
                     .is_some_and(|id| item.starts_with(id)),
-                PaletteKind::Commands => false,
+                PaletteKind::Commands | PaletteKind::PrActions => false,
             };
             let style = if selected {
                 Style::default()
@@ -3999,6 +4098,73 @@ fn read_workspace_entry(workspace: &std::path::Path, rel: &str) -> Option<Mentio
         }
         Some(MentionContent::File(text))
     }
+}
+
+fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -> Result<String, String> {
+    let branch = git_stdout(workspace, &["branch", "--show-current"])?;
+    if branch.trim().is_empty() {
+        return Err("not on a named git branch".to_string());
+    }
+    if branch.trim() == base {
+        return Err(format!("current branch is `{base}`; switch to a feature branch first"));
+    }
+
+    git_ok(workspace, &["add", "-A"])?;
+    let status = git_stdout(workspace, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Err("no changes to commit".to_string());
+    }
+
+    git_ok(workspace, &["commit", "-m", message])?;
+    git_ok(workspace, &["push", "origin", branch.trim()])?;
+
+    let output = ProcessCommand::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            branch.trim(),
+            "--title",
+            message,
+            "--body",
+            "Created by Inductor.",
+        ])
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| format!("failed to run `gh pr create`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("http"))
+        .map(|line| line.trim().to_string())
+        .ok_or_else(|| format!("gh pr create did not return a URL: {}", stdout.trim()))
+}
+
+fn git_stdout(workspace: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = ProcessCommand::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| format!("failed to run git {args:?}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_ok(workspace: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    git_stdout(workspace, args).map(|_| ())
 }
 
 fn build_diff_rows(summary: diff::DiffSummary) -> Vec<DiffRow> {
