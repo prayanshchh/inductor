@@ -1726,7 +1726,7 @@ function WorktreeRow(props: {
       <box flexDirection="row" gap={1}>
         <text fg={statusColor()}>{rowStatus()}</text>
         <box flexGrow={1} />
-        <Show when={(wt.status === "active" || wt.status === "pr_open") && wt.exists && !isRunning()}>
+        <Show when={wt.status !== "archived" && wt.exists && !isRunning()}>
           <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
         </Show>
       </box>
