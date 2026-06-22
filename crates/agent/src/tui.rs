@@ -4118,6 +4118,13 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
         git_ok(workspace, &["commit", "-m", message])?;
     }
 
+    let ahead = git_stdout(workspace, &["rev-list", "--count", &format!("origin/{base}..HEAD")])?;
+    if ahead.trim() == "0" {
+        return Err(format!(
+            "no changes to commit; current branch `{branch}` has no commits ahead of `origin/{base}`"
+        ));
+    }
+
     git_ok(workspace, &["push", "-u", "origin", branch])?;
 
     let output = ProcessCommand::new("gh")
@@ -4166,17 +4173,40 @@ fn gh_pr_url(workspace: &std::path::Path, branch: &str) -> Result<String, String
         .output()
         .map_err(|err| format!("failed to run `gh pr view`: {err}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "gh pr view failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        Err("gh pr view did not return a URL".to_string())
+        if !gh_supports_json(&output.stderr) {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
     } else {
-        Ok(url)
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
     }
+
+    let fallback = ProcessCommand::new("gh")
+        .args(["pr", "view", branch])
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| format!("failed to run `gh pr view`: {err}"))?;
+    if !fallback.status.success() {
+        let stderr = String::from_utf8_lossy(&fallback.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "gh pr view failed".to_string()
+        } else {
+            format!("gh pr view failed: {stderr}")
+        });
+    }
+    let stdout = String::from_utf8_lossy(&fallback.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(str::to_string)
+        .ok_or_else(|| "gh pr view did not return a URL".to_string())
+}
+
+fn gh_supports_json(stderr: &[u8]) -> bool {
+    !String::from_utf8_lossy(stderr).contains("unknown flag: --json")
 }
 
 fn git_stdout(workspace: &std::path::Path, args: &[&str]) -> Result<String, String> {

@@ -1018,11 +1018,15 @@ export function App(props: AppProps) {
       if (status.trim()) {
         await execFileAsync("git", ["-C", worktree.worktree_path, "commit", "-m", message], { maxBuffer: 1024 * 1024 * 4 })
       }
+      const { stdout: ahead } = await execFileAsync("git", ["-C", worktree.worktree_path, "rev-list", "--count", `origin/${base}..HEAD`], { maxBuffer: 1024 * 1024 })
+      if (ahead.trim() === "0") {
+        throw new Error(`no changes to commit; current branch ${worktree.branch_name} has no commits ahead of origin/${base}`)
+      }
       await execFileAsync("git", ["-C", worktree.worktree_path, "push", "-u", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
       let url = ""
       try {
-        const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor.", "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
-        url = stdout.trim()
+        const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor."], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+        url = findUrl(stdout)
       } catch (error) {
         const existing = await existingPullRequestUrl(worktree)
         if (!existing) throw error
@@ -1745,10 +1749,26 @@ function WorktreeRow(props: {
 async function existingPullRequestUrl(worktree: Worktree) {
   try {
     const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo, "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
-    return stdout.trim()
+    const url = stdout.trim()
+    if (url) return url
+  } catch (error) {
+    if (!ghSupportsJson(error)) return ""
+  }
+  try {
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    return findUrl(stdout)
   } catch {
     return ""
   }
+}
+
+function findUrl(text: string) {
+  return text.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith("http://") || line.startsWith("https://")) || ""
+}
+
+function ghSupportsJson(error: unknown) {
+  const anyError = error as { stderr?: string; stdout?: string; message?: string }
+  return !String(anyError?.stderr || anyError?.stdout || anyError?.message || error).includes("unknown flag: --json")
 }
 
 function pullRequestErrorMessage(error: unknown) {
