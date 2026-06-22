@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use auth::{AuthDetector, ProviderKind, RuntimeCredentialLoader};
@@ -33,14 +32,12 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use session_naming::{SessionNamingConfig, generate_context_name, generate_session_name};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use terminal::{PtyManager, SpawnTerminalRequest, TerminalSize};
 use tokio_util::sync::CancellationToken;
 use tools::{StructuredPatch, TextEdit, ToolRuntime};
 
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const MERGED_WORKTREE_REFRESH_TTL_SECS: u64 = 60;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -2923,7 +2920,7 @@ fn refreshed_worktree_status(registry: &AppDb, worktree: &WorktreeRecord) -> Wor
     ) {
         return worktree.status;
     }
-    let detected = detect_pr_status(worktree).unwrap_or(worktree.status);
+    let detected = detect_pr_status(worktree).unwrap_or(WorktreeStatus::Active);
     if detected != worktree.status {
         let _ = registry.set_worktree_status(worktree.id, detected);
     }
@@ -2931,105 +2928,15 @@ fn refreshed_worktree_status(registry: &AppDb, worktree: &WorktreeRecord) -> Wor
 }
 
 fn refresh_merged_worktrees(registry: &AppDb, worktrees: &[WorktreeRecord]) {
-    let Some(source_repo) = worktrees
-        .first()
-        .map(|worktree| worktree.source_repo.as_path())
-    else {
-        return;
-    };
-    if !should_refresh_merged_worktrees(source_repo) {
-        return;
-    }
-    let Ok(merged_branches) = merged_pr_branches(source_repo) else {
-        return;
-    };
-    if merged_branches.is_empty() {
-        return;
-    }
     for worktree in worktrees {
-        if matches!(
-            worktree.status,
-            WorktreeStatus::Archived | WorktreeStatus::Abandoned | WorktreeStatus::Merged
-        ) {
-            continue;
-        }
-        if merged_branches.contains(&worktree.branch_name) {
-            let _ = registry.set_worktree_status(worktree.id, WorktreeStatus::Merged);
-        }
+        let _ = refreshed_worktree_status(registry, worktree);
     }
-}
-
-fn should_refresh_merged_worktrees(source_repo: &Path) -> bool {
-    static LAST_REFRESH: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Instant>>> =
-        OnceLock::new();
-    let now = Instant::now();
-    let mut map = LAST_REFRESH
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .ok();
-    let Some(map) = map.as_mut() else {
-        return true;
-    };
-    if let Some(last) = map.get(source_repo) {
-        if now.duration_since(*last) < Duration::from_secs(MERGED_WORKTREE_REFRESH_TTL_SECS) {
-            return false;
-        }
-    }
-    map.insert(source_repo.to_path_buf(), now);
-    true
-}
-
-fn merged_pr_branches(source_repo: &Path) -> Result<HashSet<String>, String> {
-    let output = std::process::Command::new("gh")
-        .current_dir(source_repo)
-        .args([
-            "pr",
-            "list",
-            "--state",
-            "merged",
-            "--limit",
-            "1000",
-            "--json",
-            "headRefName",
-        ])
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            row.get("headRefName")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect())
 }
 
 fn detect_pr_status(worktree: &WorktreeRecord) -> Option<WorktreeStatus> {
     let branch = worktree.branch_name.as_str();
-    let head = git_output(&worktree.worktree_path, &["rev-parse", branch]).ok()?;
-    if !head.is_empty() {
-        let base = worktree.base_branch.as_str();
-        let merged = git_output(&worktree.source_repo, &["branch", "--contains", &head])
-            .ok()
-            .is_some_and(|branches| {
-                branches.lines().any(|line| {
-                    let name = line.trim().trim_start_matches("*").trim();
-                    name == base
-                        || name == format!("remotes/origin/{base}")
-                        || name == format!("origin/{base}")
-                })
-            });
-        if merged {
-            return Some(WorktreeStatus::Merged);
-        }
-    }
-
     let pr_state = std::process::Command::new("gh")
-        .current_dir(&worktree.worktree_path)
+        .current_dir(&worktree.source_repo)
         .args(["pr", "view", branch, "--json", "state", "--jq", ".state"])
         .output()
         .ok()
@@ -3038,20 +2945,8 @@ fn detect_pr_status(worktree: &WorktreeRecord) -> Option<WorktreeStatus> {
     match pr_state.as_deref() {
         Some("MERGED") => Some(WorktreeStatus::Merged),
         Some("OPEN") => Some(WorktreeStatus::PrOpen),
-        _ => None,
+        _ => Some(WorktreeStatus::Active),
     }
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> std::io::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Ok(String::new());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn lookup_worktree(registry: &AppDb, workspace_id: WorkspaceId) -> Result<WorktreeRecord, String> {

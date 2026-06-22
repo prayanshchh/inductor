@@ -1018,9 +1018,17 @@ export function App(props: AppProps) {
       if (status.trim()) {
         await execFileAsync("git", ["-C", worktree.worktree_path, "commit", "-m", message], { maxBuffer: 1024 * 1024 * 4 })
       }
-      await execFileAsync("git", ["-C", worktree.worktree_path, "push", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
-      const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor.", "--json", "url", "--jq", ".url"], { cwd: worktree.worktree_path, maxBuffer: 1024 * 1024 })
-      const url = stdout.trim()
+      await execFileAsync("git", ["-C", worktree.worktree_path, "push", "-u", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
+      let url = ""
+      try {
+        const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor.", "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+        url = stdout.trim()
+      } catch (error) {
+        const existing = await existingPullRequestUrl(worktree)
+        if (!existing) throw error
+        url = existing
+      }
+      if (!url) url = await existingPullRequestUrl(worktree)
       setNotice({ text: url ? `PR created: ${url}` : "PR created", tone: "cyan" })
       if (url) appendAssistantMessage(`✅ Pull request created against ${base}:\n${url}`)
       await refreshWorktrees()
@@ -1726,12 +1734,21 @@ function WorktreeRow(props: {
       <box flexDirection="row" gap={1}>
         <text fg={statusColor()}>{rowStatus()}</text>
         <box flexGrow={1} />
-        <Show when={(wt.status === "active" || wt.status === "pr_open") && wt.exists && !isRunning()}>
+        <Show when={wt.status !== "archived" && wt.exists && !isRunning()}>
           <text fg={theme.red} selectable={false} onMouseUp={props.archive}>archive</text>
         </Show>
       </box>
     </box>
   )
+}
+
+async function existingPullRequestUrl(worktree: Worktree) {
+  try {
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo, "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    return stdout.trim()
+  } catch {
+    return ""
+  }
 }
 
 function pullRequestErrorMessage(error: unknown) {
