@@ -4102,21 +4102,23 @@ fn read_workspace_entry(workspace: &std::path::Path, rel: &str) -> Option<Mentio
 
 fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -> Result<String, String> {
     let branch = git_stdout(workspace, &["branch", "--show-current"])?;
-    if branch.trim().is_empty() {
+    let branch = branch.trim();
+    if branch.is_empty() {
         return Err("not on a named git branch".to_string());
     }
-    if branch.trim() == base {
-        return Err(format!("current branch is `{base}`; switch to a feature branch first"));
+    if branch == base {
+        return Err(format!(
+            "current branch is `{base}`; switch to a feature branch first"
+        ));
     }
 
     git_ok(workspace, &["add", "-A"])?;
     let status = git_stdout(workspace, &["status", "--porcelain"])?;
-    if status.trim().is_empty() {
-        return Err("no changes to commit".to_string());
+    if !status.trim().is_empty() {
+        git_ok(workspace, &["commit", "-m", message])?;
     }
 
-    git_ok(workspace, &["commit", "-m", message])?;
-    git_ok(workspace, &["push", "origin", branch.trim()])?;
+    git_ok(workspace, &["push", "-u", "origin", branch])?;
 
     let output = ProcessCommand::new("gh")
         .args([
@@ -4125,7 +4127,7 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
             "--base",
             base,
             "--head",
-            branch.trim(),
+            branch,
             "--title",
             message,
             "--body",
@@ -4135,9 +4137,17 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
         .output()
         .map_err(|err| format!("failed to run `gh pr create`: {err}"))?;
     if !output.status.success() {
+        if let Ok(url) = gh_pr_url(workspace, branch) {
+            return Ok(url);
+        }
         return Err(format!(
-            "gh pr create failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "gh pr create failed: {}{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            if output.stdout.is_empty() {
+                "".to_string()
+            } else {
+                format!("\n{}", String::from_utf8_lossy(&output.stdout).trim())
+            }
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4145,7 +4155,28 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
         .lines()
         .find(|line| line.trim_start().starts_with("http"))
         .map(|line| line.trim().to_string())
+        .or_else(|| gh_pr_url(workspace, branch).ok())
         .ok_or_else(|| format!("gh pr create did not return a URL: {}", stdout.trim()))
+}
+
+fn gh_pr_url(workspace: &std::path::Path, branch: &str) -> Result<String, String> {
+    let output = ProcessCommand::new("gh")
+        .args(["pr", "view", branch, "--json", "url", "--jq", ".url"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| format!("failed to run `gh pr view`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        Err("gh pr view did not return a URL".to_string())
+    } else {
+        Ok(url)
+    }
 }
 
 fn git_stdout(workspace: &std::path::Path, args: &[&str]) -> Result<String, String> {
