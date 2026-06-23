@@ -633,8 +633,18 @@ impl ToolRuntime {
         for edit in edits {
             let old = normalize_edit_text(&edit.old, newline);
             let new = normalize_edit_text(&edit.new, newline);
+            if old.is_empty() {
+                return Err(ToolError::EmptyEdit);
+            }
             let count = content.matches(&old).count();
             if count == 0 {
+                if !new.is_empty() && content.matches(&new).count() == 1 {
+                    // The requested replacement is already present and the target is
+                    // absent. Treat this as an idempotent success: callers can retry
+                    // after transport/UI interruptions without reporting a false
+                    // patch failure for an edit that did land.
+                    continue;
+                }
                 return Err(ToolError::EditTargetNotFound {
                     path: path.clone(),
                     old: edit.old.clone(),
@@ -1558,6 +1568,10 @@ impl ToolRuntime {
 
             let end = start + old_lines.len();
             if end > lines.len() || lines[start..end] != old_lines {
+                if already_applied_hunk(&lines, &new_lines, start) {
+                    offset += new_lines.len() as isize - old_lines.len() as isize;
+                    continue;
+                }
                 return Err(ToolError::PatchApplyFailed {
                     path: path.clone(),
                     message: format!("hunk did not match at line {}", hunk.old_start),
@@ -2077,6 +2091,16 @@ fn parse_hunk_old_start(header: &str) -> Result<usize, ToolError> {
         .map_err(|_| ToolError::InvalidPatch(format!("invalid old range in hunk {header}")))
 }
 
+fn already_applied_hunk(lines: &[String], new_lines: &[String], expected_start: usize) -> bool {
+    if new_lines.is_empty() {
+        return true;
+    }
+    if expected_start <= lines.len() && lines[expected_start..].starts_with(new_lines) {
+        return true;
+    }
+    lines.windows(new_lines.len()).any(|window| window == new_lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2509,6 +2533,17 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_is_idempotent_when_replacement_already_exists() {
+        let temp = TempDir::new("edit-idempotent");
+        fs::write(temp.path().join("file.txt"), "new\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        runtime.edit_file("file.txt", "old", "new", None).unwrap();
+
+        assert_eq!(fs::read_to_string(temp.path().join("file.txt")).unwrap(), "new\n");
+    }
+
+    #[test]
     fn edit_file_rejects_binary_file() {
         let temp = TempDir::new("edit-binary");
         fs::write(temp.path().join("file.bin"), b"abc\0def").unwrap();
@@ -2607,6 +2642,29 @@ mod tests {
     fn freeform_patch_applies_unified_diff() {
         let temp = TempDir::new("freeform");
         fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = "\
+--- a/file.txt
++++ b/file.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+";
+
+        runtime.apply_patch_freeform(patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn freeform_patch_is_idempotent_when_hunk_already_applied() {
+        let temp = TempDir::new("freeform-idempotent");
+        fs::write(temp.path().join("file.txt"), "one\nTWO\nthree\n").unwrap();
         let runtime = ToolRuntime::new(temp.path()).unwrap();
         let patch = "\
 --- a/file.txt
