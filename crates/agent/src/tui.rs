@@ -4127,7 +4127,7 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
 
     git_ok(workspace, &["push", "-u", "origin", branch])?;
 
-    let output = ProcessCommand::new("gh")
+    let output = gh_command(workspace)
         .args([
             "pr",
             "create",
@@ -4140,7 +4140,6 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
             "--body",
             "Created by Inductor.",
         ])
-        .current_dir(workspace)
         .output()
         .map_err(|err| format!("failed to run `gh pr create`: {err}"))?;
     if !output.status.success() {
@@ -4166,10 +4165,20 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
         .ok_or_else(|| format!("gh pr create did not return a URL: {}", stdout.trim()))
 }
 
+fn gh_command(workspace: &std::path::Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new("gh");
+    command.current_dir(workspace);
+    // GH_REPO overrides repository detection in GitHub CLI. Some shells set it
+    // to the workspace path, which makes `gh pr ...` fail with:
+    // expected the "[HOST/]OWNER/REPO" format, got "/path/to/repo".
+    // For /pr, the target repo should be inferred from the workspace's git remote.
+    command.env_remove("GH_REPO");
+    command
+}
+
 fn gh_pr_url(workspace: &std::path::Path, branch: &str) -> Result<String, String> {
-    let output = ProcessCommand::new("gh")
+    let output = gh_command(workspace)
         .args(["pr", "view", branch, "--json", "url", "--jq", ".url"])
-        .current_dir(workspace)
         .output()
         .map_err(|err| format!("failed to run `gh pr view`: {err}"))?;
     if !output.status.success() {
@@ -4183,9 +4192,8 @@ fn gh_pr_url(workspace: &std::path::Path, branch: &str) -> Result<String, String
         }
     }
 
-    let fallback = ProcessCommand::new("gh")
+    let fallback = gh_command(workspace)
         .args(["pr", "view", branch])
-        .current_dir(workspace)
         .output()
         .map_err(|err| format!("failed to run `gh pr view`: {err}"))?;
     if !fallback.status.success() {
