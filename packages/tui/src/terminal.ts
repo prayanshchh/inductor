@@ -2,6 +2,7 @@ import type { BackendOptions } from "./backend"
 
 export type TerminalSnapshot = {
   contents: string
+  screen_rows?: string[]
   cursor_row: number
   cursor_col: number
   rows: number

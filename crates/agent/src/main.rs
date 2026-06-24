@@ -2632,6 +2632,7 @@ fn run_terminal_serve(workspace: PathBuf, rows: u16, cols: u16) -> Result<(), St
             let payload = json!({
                 "type": "snapshot",
                 "contents": snapshot.contents,
+                "screen_rows": snapshot.screen_rows,
                 "cursor_row": snapshot.cursor_row,
                 "cursor_col": snapshot.cursor_col,
                 "rows": snapshot.size.rows,

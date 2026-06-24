@@ -66,6 +66,7 @@ pub struct TerminalSnapshot {
     pub size: TerminalSize,
     pub cursor_row: u16,
     pub cursor_col: u16,
+    pub screen_rows: Vec<String>,
     pub contents: String,
     pub raw_output: String,
     pub is_running: bool,
@@ -333,13 +334,15 @@ impl TerminalState {
     }
 
     fn snapshot(&self, id: TerminalId) -> TerminalSnapshot {
-        let (cursor_row, cursor_col) = self.parser.screen().cursor_position();
+        let screen = self.parser.screen();
+        let (cursor_row, cursor_col) = screen.cursor_position();
         TerminalSnapshot {
             id,
             size: self.size,
             cursor_row,
             cursor_col,
-            contents: self.parser.screen().contents(),
+            screen_rows: screen.rows(0, self.size.cols).collect(),
+            contents: screen.contents(),
             raw_output: String::from_utf8_lossy(&self.raw_output).to_string(),
             is_running: self.is_running,
             exit_code: self.exit_code,
@@ -513,6 +516,18 @@ mod tests {
         assert!(snapshot.contents.contains("hello"));
         assert!(snapshot.contents.contains("world"));
         assert!(snapshot.raw_output.contains("hello"));
+    }
+
+    #[test]
+    fn vt100_snapshot_exposes_physical_rows_for_cursor_rendering() {
+        let mut state = TerminalState::new(TerminalSize::new(4, 5), 10);
+        state.process(b"abcdef");
+
+        let snapshot = state.snapshot(TerminalId(1));
+
+        assert_eq!((snapshot.cursor_row, snapshot.cursor_col), (1, 1));
+        assert_eq!(snapshot.screen_rows[0], "abcde");
+        assert_eq!(snapshot.screen_rows[1], "f");
     }
 
     #[test]

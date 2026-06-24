@@ -1563,19 +1563,16 @@ function TerminalPanel(props: {
   cwd: string
 }) {
   let surface!: BoxRenderable
-  // The block cursor blinks like a native terminal whenever the shell is live
-  // so the user can always see where input will land, regardless of which pane
-  // currently holds keyboard focus.
-  const [blinkOn, setBlinkOn] = createSignal(true)
-  const blinkTimer = setInterval(() => setBlinkOn((on) => !on), 530)
-  onCleanup(() => clearInterval(blinkTimer))
-  const cursorVisible = () => blinkOn()
+  // Draw one block cursor at the PTY cursor position while this panel has
+  // focus. OpenTUI's native cursor belongs to the composer and is hidden below.
+  const [terminalFocused, setTerminalFocused] = createSignal(false)
+  const cursorVisible = () => terminalFocused()
   // vt100 screen contents render as a fixed grid; strip trailing blank rows so
   // the prompt hugs the bottom instead of padding out the panel.
   const snapshotLines = () => {
     const snapshot = props.snapshot()
     if (!snapshot) return { rows: [] as string[], cursorRow: -1, cursorCol: 0 }
-    const grid = snapshot.contents.split("\n")
+    const grid = snapshot.screen_rows ?? snapshot.contents.split("\n")
     let end = grid.length
     while (end > 0 && grid[end - 1].trim() === "") end -= 1
     // Keep enough rows to still show where the cursor sits, even on a blank line.
@@ -1605,9 +1602,14 @@ function TerminalPanel(props: {
       onKeyDown={forwardKey}
       ref={(ref: BoxRenderable) => {
         surface = ref
-        // Reset the blink to "on" when focused so the cursor is solid the
-        // instant the user clicks in, then resumes blinking.
-        ref.on("focused", () => setBlinkOn(true))
+        ref.on("focused", () => {
+          setTerminalFocused(true)
+          // The composer owns OpenTUI's native cursor. Hide its last position
+          // while this custom terminal surface is focused so only the PTY
+          // cursor at the active prompt is visible.
+          ref.ctx.setCursorPosition(0, 0, false)
+        })
+        ref.on("blurred", () => setTerminalFocused(false))
       }}
     >
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
@@ -1646,18 +1648,26 @@ function TerminalPanel(props: {
  * prompt, matching a native shell.
  */
 function TerminalLine(props: { text: string; cursorCol: number }) {
-  if (props.cursorCol < 0) {
-    return <text fg={theme.muted} wrapMode="char" selectable={true}>{props.text.length ? props.text : " "}</text>
-  }
-  const padded = props.text.length < props.cursorCol ? props.text.padEnd(props.cursorCol, " ") : props.text
-  const before = padded.slice(0, props.cursorCol)
-  const at = padded.slice(props.cursorCol, props.cursorCol + 1) || " "
-  const after = padded.slice(props.cursorCol + 1)
+  return (
+    <Show
+      when={props.cursorCol >= 0}
+      fallback={<text fg={theme.muted} wrapMode="none" selectable={true}>{props.text.length ? props.text : " "}</text>}
+    >
+      <TerminalCursorLine text={props.text} cursorCol={props.cursorCol} />
+    </Show>
+  )
+}
+
+function TerminalCursorLine(props: { text: string; cursorCol: number }) {
+  const padded = () => props.text.length < props.cursorCol ? props.text.padEnd(props.cursorCol, " ") : props.text
+  const before = () => padded().slice(0, props.cursorCol)
+  const at = () => padded().slice(props.cursorCol, props.cursorCol + 1) || " "
+  const after = () => padded().slice(props.cursorCol + 1)
   return (
     <box flexDirection="row">
-      <text fg={theme.muted} wrapMode="none" selectable={true}>{before}</text>
-      <text fg="#0a1014" bg={theme.cyan} attributes={TextAttributes.BOLD}>{at}</text>
-      <text fg={theme.muted} selectable={true}>{after}</text>
+      <text fg={theme.muted} wrapMode="none" selectable={true}>{before()}</text>
+      <text fg="#0a1014" bg="#ffffff" attributes={TextAttributes.BOLD}>{at()}</text>
+      <text fg={theme.muted} wrapMode="none" selectable={true}>{after()}</text>
     </box>
   )
 }
