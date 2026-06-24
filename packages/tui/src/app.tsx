@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
+import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, parseColor, type KeyEvent, type OptimizedBuffer } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { execFile } from "node:child_process"
@@ -1318,9 +1318,10 @@ export function App(props: AppProps) {
           <box
             flexGrow={1}
             minWidth={0}
-                flexDirection="column"
+            flexDirection="column"
             backgroundColor={theme.panel}
-                border
+            overflow="hidden"
+            border
             borderStyle="rounded"
             borderColor={theme.border}
           >
@@ -1328,7 +1329,8 @@ export function App(props: AppProps) {
               <scrollbox
                 flexGrow={1}
                 minHeight={0}
-                        stickyScroll={true}
+                overflow="hidden"
+                stickyScroll={true}
                 stickyStart="bottom"
                 scrollAcceleration={scrollAcceleration}
                 viewportCulling={true}
@@ -1889,6 +1891,15 @@ function TimelineItem(props: { item: TranscriptItem; expanded: boolean; toggle: 
   return null
 }
 
+function horizontalFrame(color: () => string, sides: Array<"top" | "bottom"> = ["top", "bottom"]) {
+  return function (this: BoxRenderable, buffer: OptimizedBuffer) {
+    const line = "─".repeat(this.width)
+    const parsed = parseColor(color())
+    if (sides.includes("top")) buffer.drawText(line, this.x, this.y, parsed)
+    if (sides.includes("bottom")) buffer.drawText(line, this.x, this.y + this.height - 1, parsed)
+  }
+}
+
 function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" }>; expanded: boolean; toggle: () => void }) {
   const action = createMemo(() => toolActivity(props.item))
   const diff = createMemo(() => diffFromTool(props.item))
@@ -1907,8 +1918,9 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
         width="100%"
         flexDirection="column"
         backgroundColor={theme.row}
-        border={["top", "bottom"]}
-        borderColor={isOpen() ? theme.borderStrong : theme.borderSoft}
+        paddingTop={1}
+        paddingBottom={1}
+        renderAfter={horizontalFrame(() => isOpen() ? theme.borderStrong : theme.borderSoft)}
       >
         <box
           width="100%"
@@ -1934,11 +1946,10 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border={["top"]}
-            borderColor={isWrite() ? theme.borderStrong : theme.border}
+            paddingTop={2}
+            renderAfter={horizontalFrame(() => isWrite() ? theme.borderStrong : theme.border, ["top"])}
             paddingLeft={1}
             paddingRight={1}
-            paddingTop={1}
             paddingBottom={1}
           >
             <Show when={props.item.approval}>
@@ -2073,12 +2084,11 @@ function TimelineShell(props: { marker: string; color: string; label: string; ch
         flexDirection="row"
         gap={2}
         backgroundColor={theme.row}
-        border={["top", "bottom"]}
-        borderColor={theme.borderSoft}
+        paddingTop={1}
+        paddingBottom={1}
+        renderAfter={horizontalFrame(() => theme.borderSoft)}
         paddingLeft={1}
         paddingRight={1}
-        paddingTop={0}
-        paddingBottom={0}
       >
         <box width={3} alignItems="center">
           <text fg={props.color} selectable={false}>{props.marker}</text>
@@ -2128,7 +2138,14 @@ function PermissionTimelineItem(props: {
           fallback={<code content={props.request.input} filetype="json" syntaxStyle={syntaxStyle} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text} />}
         >
           {(patch) => (
-            <box backgroundColor={theme.panelSoft} border={["top", "bottom"]} borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+            <box
+              backgroundColor={theme.panelSoft}
+              paddingLeft={1}
+              paddingRight={1}
+              paddingTop={2}
+              paddingBottom={2}
+              renderAfter={horizontalFrame(() => theme.borderStrong)}
+            >
               <DiffWithHunkReview diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())} path={props.request.filepath} />
             </box>
           )}
