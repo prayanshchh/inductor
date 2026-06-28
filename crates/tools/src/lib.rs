@@ -2098,7 +2098,9 @@ fn already_applied_hunk(lines: &[String], new_lines: &[String], expected_start: 
     if expected_start <= lines.len() && lines[expected_start..].starts_with(new_lines) {
         return true;
     }
-    lines.windows(new_lines.len()).any(|window| window == new_lines)
+    lines
+        .windows(new_lines.len())
+        .any(|window| window == new_lines)
 }
 
 #[cfg(test)]
@@ -2540,7 +2542,10 @@ mod tests {
 
         runtime.edit_file("file.txt", "old", "new", None).unwrap();
 
-        assert_eq!(fs::read_to_string(temp.path().join("file.txt")).unwrap(), "new\n");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "new\n"
+        );
     }
 
     #[test]
