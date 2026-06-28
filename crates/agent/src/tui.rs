@@ -1811,7 +1811,13 @@ impl App {
 
     fn create_pr(&mut self, base: &str, message: &str) {
         self.status = format!("Creating PR against {base}…");
-        let result = create_pull_request(&self.workspace, base, message);
+        let result = create_pull_request(
+            &self.workspace,
+            base,
+            message,
+            &self.provider,
+            &self.model,
+        );
         match result {
             Ok(url) => {
                 self.transcript.push(ChatEntry::Agent(format!(
@@ -4132,7 +4138,13 @@ fn read_workspace_entry(workspace: &std::path::Path, rel: &str) -> Option<Mentio
     }
 }
 
-fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -> Result<String, String> {
+fn create_pull_request(
+    workspace: &std::path::Path,
+    base: &str,
+    message: &str,
+    provider: &str,
+    model: &str,
+) -> Result<String, String> {
     let branch = git_stdout(workspace, &["branch", "--show-current"])?;
     let branch = branch.trim();
     if branch.is_empty() {
@@ -4159,6 +4171,9 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
 
     git_ok(workspace, &["push", "-u", "origin", branch])?;
 
+    let pr_body = generate_pr_body(workspace, base, message, provider, model)
+        .unwrap_or_else(|_| "Created by Inductor.".to_string());
+
     let output = gh_command(workspace)
         .args([
             "pr",
@@ -4170,7 +4185,7 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
             "--title",
             message,
             "--body",
-            "Created by Inductor.",
+            &pr_body,
         ])
         .output()
         .map_err(|err| format!("failed to run `gh pr create`: {err}"))?;
@@ -4195,6 +4210,50 @@ fn create_pull_request(workspace: &std::path::Path, base: &str, message: &str) -
         .map(|line| line.trim().to_string())
         .or_else(|| gh_pr_url(workspace, branch).ok())
         .ok_or_else(|| format!("gh pr create did not return a URL: {}", stdout.trim()))
+}
+
+fn generate_pr_body(
+    workspace: &std::path::Path,
+    base: &str,
+    message: &str,
+    provider: &str,
+    model: &str,
+) -> Result<String, String> {
+    let diff = git_stdout(workspace, &["diff", "--stat", &format!("origin/{base}...HEAD")])?;
+    let diff = if diff.trim().is_empty() {
+        git_stdout(workspace, &["diff", "--stat", &format!("origin/{base}..HEAD")])?
+    } else {
+        diff
+    };
+    let output = ProcessCommand::new(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("inductor")))
+        .args([
+            "pr-body",
+            "--provider",
+            provider,
+            "--workspace",
+            &workspace.display().to_string(),
+            "--title",
+            message,
+            "--diff",
+            &diff,
+            "--model",
+            model,
+        ])
+        .current_dir(workspace)
+        .output()
+        .map_err(|err| format!("failed to generate PR body: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PR body generation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if body.is_empty() {
+        Err("PR body generation returned an empty response".to_string())
+    } else {
+        Ok(body)
+    }
 }
 
 fn gh_command(workspace: &std::path::Path) -> ProcessCommand {
