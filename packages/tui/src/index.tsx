@@ -16,6 +16,7 @@ type Args = {
 
 const args = parseArgs(process.argv.slice(2))
 let rawCtrlCHandler: (() => void) | undefined
+let selectionTransform: ((text: string) => string) | undefined
 const renderer = await createCliRenderer({
   externalOutputMode: "passthrough",
   targetFps: 60,
@@ -56,6 +57,9 @@ void render(() => (
     registerCtrlCHandler={(handler) => {
       rawCtrlCHandler = handler
     }}
+    registerSelectionTransform={(transform) => {
+      selectionTransform = transform
+    }}
   />
 ), renderer)
 
@@ -68,7 +72,7 @@ type ClipboardSelection = {
 function installSelectionClipboard(renderer: CliRenderer) {
   renderer.on("selection", (selection: ClipboardSelection) => {
     if (selection.anchor.x === selection.focus.x && selection.anchor.y === selection.focus.y) return
-    const text = selection.getSelectedText()
+    const text = selectionTransform?.(selection.getSelectedText()) ?? selection.getSelectedText()
     if (!text.trim()) return
     if (renderer.copyToClipboardOSC52(text)) return
     void import("clipboardy")

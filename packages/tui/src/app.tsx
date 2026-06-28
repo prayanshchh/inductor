@@ -37,12 +37,13 @@ import {
   type PromptImageAttachment,
   type PromptTextAttachment,
 } from "./mentions"
-import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
+import { deletePromptPlaceholderAtCursor, expandPromptPlaceholders, insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
 import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
 
 export type AppProps = BackendOptions & {
   exitApp(): void
   registerCtrlCHandler(handler: (() => void) | undefined): void
+  registerSelectionTransform(transform: ((text: string) => string) | undefined): void
 }
 
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
@@ -406,6 +407,7 @@ export function App(props: AppProps) {
   })
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
+    props.registerSelectionTransform((text) => expandPromptPlaceholders(text, promptPlaceholders()))
     void refreshWorktrees()
     const worktreeRefreshTimer = setInterval(() => void refreshWorktrees(), 30_000)
     void refreshCopilotModels()
@@ -413,6 +415,7 @@ export function App(props: AppProps) {
   })
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
+    props.registerSelectionTransform(undefined)
     clearInterval(timer)
     clearStopArmTimer()
     for (const flags of runFlags.values()) {
@@ -585,6 +588,22 @@ export function App(props: AppProps) {
     if (value.startsWith("/")) openPalette("commands")
     if (!value.startsWith("/") && palette() === "commands") setPalette(undefined)
     void normalizeImagePathPaste(value)
+  }
+
+  function promptPlaceholders() {
+    return [
+      ...promptImages().map((image) => ({ label: image.label, replacement: `${image.label} @${image.path}` })),
+      ...promptPastes().map((paste) => ({ label: paste.label, replacement: paste.text })),
+    ]
+  }
+
+  function deletePromptPlaceholder(direction: "backward" | "forward") {
+    const next = deletePromptPlaceholderAtCursor(input.plainText, input.cursorOffset, promptPlaceholders(), direction)
+    if (!next.deleted) return false
+    input.setText(next.value)
+    input.cursorOffset = next.cursorOffset
+    updateDraft(next.value)
+    return true
   }
 
   function recordHistory(value: string) {
@@ -1393,12 +1412,13 @@ export function App(props: AppProps) {
           acceptPalette={acceptPalette}
           choosePalette={choosePalette}
           openPalette={openPalette}
-          insertPromptNewline={insertPromptNewline}
-          navigatePromptHistory={navigatePromptHistory}
-          notice={composerNotice()}
-          pasteFromClipboard={pasteFromClipboard}
-          insertPromptText={insertPromptText}
-        />
+            insertPromptNewline={insertPromptNewline}
+            navigatePromptHistory={navigatePromptHistory}
+            notice={composerNotice()}
+            pasteFromClipboard={pasteFromClipboard}
+            insertPromptText={insertPromptText}
+            deletePromptPlaceholder={deletePromptPlaceholder}
+          />
       </box>
     </box>
   )
@@ -2198,10 +2218,12 @@ function Composer(props: {
   notice: ComposerNotice
   pasteFromClipboard: () => Promise<void>
   insertPromptText: (text: string) => void
+  deletePromptPlaceholder: (direction: "backward" | "forward") => boolean
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
   const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
+  const inputRows = createMemo(() => Math.max(1, props.draft().split("\n").length))
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
       <Show when={props.palette()}>
@@ -2247,12 +2269,12 @@ function Composer(props: {
         paddingBottom={1}
         onMouseUp={() => textarea.focus()}
       >
-        <box width="100%" height={1} flexDirection="row" alignItems="center">
+        <box width="100%" height={inputRows()} flexDirection="row" alignItems="center">
           <textarea
             width="100%"
             alignSelf="center"
-            minHeight={1}
-            maxHeight={1}
+            minHeight={inputRows()}
+            maxHeight={inputRows()}
             placeholder={composerPlaceholder(props.state)}
             placeholderColor={theme.dim}
             textColor={theme.text}
@@ -2316,6 +2338,20 @@ function Composer(props: {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.insertPromptNewline()
+                return
+              }
+              if (!props.palette() && (key === "Backspace" || key === "backspace")) {
+                if (props.deletePromptPlaceholder("backward")) {
+                  event.preventDefault()
+                  event.stopPropagation?.()
+                }
+                return
+              }
+              if (!props.palette() && (key === "Delete" || key === "delete")) {
+                if (props.deletePromptPlaceholder("forward")) {
+                  event.preventDefault()
+                  event.stopPropagation?.()
+                }
                 return
               }
               if (!props.palette() && (key === "ArrowUp" || key === "up")) {

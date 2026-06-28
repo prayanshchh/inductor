@@ -12,6 +12,34 @@ export function insertTextAtCursor(value: string, insert: string, cursorOffset =
   return { value: next, cursorOffset: offset + insert.length }
 }
 
+export type PromptPlaceholder = { label: string; replacement: string }
+
+export function deletePromptPlaceholderAtCursor(value: string, cursorOffset: number, placeholders: readonly PromptPlaceholder[], direction: "backward" | "forward") {
+  const offset = clampCursor(value, cursorOffset)
+  const spans = placeholderSpans(value, placeholders)
+  for (const span of spans) {
+    if (direction === "backward") {
+      const afterTokenSpace = offset === span.end + 1 && /\s/.test(value[span.end] ?? "")
+      if ((offset > span.start && offset <= span.end) || afterTokenSpace) {
+        const end = afterTokenSpace ? span.end + 1 : span.end
+        return { value: `${value.slice(0, span.start)}${value.slice(end)}`, cursorOffset: span.start, deleted: true }
+      }
+    } else if (offset >= span.start && offset < span.end) {
+      return { value: `${value.slice(0, span.start)}${value.slice(span.end)}`, cursorOffset: span.start, deleted: true }
+    }
+  }
+  return { value, cursorOffset: offset, deleted: false }
+}
+
+export function expandPromptPlaceholders(value: string, placeholders: readonly PromptPlaceholder[]) {
+  if (placeholders.length === 0) return value
+  let expanded = value
+  for (const placeholder of placeholders) {
+    expanded = expanded.split(placeholder.label).join(placeholder.replacement)
+  }
+  return expanded
+}
+
 export function shouldNavigateHistory(value: string, cursorOffset: number, direction: HistoryDirection) {
   const offset = clampCursor(value, cursorOffset)
   if (direction < 0) return value.lastIndexOf("\n", Math.max(0, offset - 1)) === -1
@@ -67,4 +95,17 @@ export function stepPromptHistory(state: PromptHistoryState, currentDraft: strin
 function clampCursor(value: string, cursorOffset: number) {
   if (!Number.isFinite(cursorOffset)) return value.length
   return Math.max(0, Math.min(value.length, cursorOffset))
+}
+
+function placeholderSpans(value: string, placeholders: readonly PromptPlaceholder[]) {
+  const spans: { start: number; end: number }[] = []
+  for (const placeholder of placeholders) {
+    if (!placeholder.label) continue
+    let start = value.indexOf(placeholder.label)
+    while (start >= 0) {
+      spans.push({ start, end: start + placeholder.label.length })
+      start = value.indexOf(placeholder.label, start + placeholder.label.length)
+    }
+  }
+  return spans.sort((a, b) => a.start - b.start)
 }
