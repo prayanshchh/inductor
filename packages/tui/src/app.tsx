@@ -1025,7 +1025,7 @@ export function App(props: AppProps) {
       await execFileAsync("git", ["-C", worktree.worktree_path, "push", "-u", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
       let url = ""
       try {
-        const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor."], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+        const { stdout } = await execFileAsync("gh", ["pr", "create", "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor."], ghExecOptions(worktree.worktree_path))
         url = findUrl(stdout)
       } catch (error) {
         const existing = await existingPullRequestUrl(worktree)
@@ -1760,18 +1760,26 @@ function WorktreeRow(props: {
 
 async function existingPullRequestUrl(worktree: Worktree) {
   try {
-    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo, "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--json", "url", "--jq", ".url"], ghExecOptions(worktree.worktree_path))
     const url = stdout.trim()
     if (url) return url
   } catch (error) {
     if (!ghSupportsJson(error)) return ""
   }
   try {
-    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name], ghExecOptions(worktree.worktree_path))
     return findUrl(stdout)
   } catch {
     return ""
   }
+}
+
+function ghExecOptions(cwd: string) {
+  // GH_REPO overrides repository detection in GitHub CLI. Some shells set it
+  // to the workspace path, and `gh --repo` also rejects filesystem paths; PR
+  // commands should infer the target repository from the worktree's git remote.
+  const { GH_REPO: _ghRepo, ...env } = process.env
+  return { cwd, env, maxBuffer: 1024 * 1024 }
 }
 
 function findUrl(text: string) {

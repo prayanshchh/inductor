@@ -2936,8 +2936,7 @@ fn refresh_merged_worktrees(registry: &AppDb, worktrees: &[WorktreeRecord]) {
 
 fn detect_pr_status(worktree: &WorktreeRecord) -> Option<WorktreeStatus> {
     let branch = worktree.branch_name.as_str();
-    let pr_state = std::process::Command::new("gh")
-        .current_dir(&worktree.source_repo)
+    let pr_state = gh_command(&worktree.worktree_path)
         .args(["pr", "view", branch, "--json", "state", "--jq", ".state"])
         .output()
         .ok()
@@ -2948,6 +2947,17 @@ fn detect_pr_status(worktree: &WorktreeRecord) -> Option<WorktreeStatus> {
         Some("OPEN") => Some(WorktreeStatus::PrOpen),
         _ => Some(WorktreeStatus::Active),
     }
+}
+
+fn gh_command(workspace: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("gh");
+    command.current_dir(workspace);
+    // GH_REPO overrides repository detection in GitHub CLI. Some shells set it
+    // to the workspace path, which makes `gh pr ...` fail with:
+    // expected the "[HOST/]OWNER/REPO" format, got "/path/to/repo".
+    // For Inductor PR/status operations, infer the target repo from git remote.
+    command.env_remove("GH_REPO");
+    command
 }
 
 fn lookup_worktree(registry: &AppDb, workspace_id: WorkspaceId) -> Result<WorktreeRecord, String> {
