@@ -1,4 +1,4 @@
-import type { PermissionDecision, SessionEvent } from "./backend"
+import type { PermissionDecision, QuestionAnswer, QuestionItem, SessionEvent } from "./backend"
 import type { StoredSessionDetail } from "./backend"
 import { createUnifiedPatchFromContent, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 
@@ -41,9 +41,21 @@ export type ModifiedFile = {
   diff?: string
 }
 
+export type PendingQuestions = {
+  toolCallId: string
+  questions: QuestionItem[]
+}
+
+export type AppTodo = {
+  content: string
+  status: "pending" | "in_progress" | "completed" | string
+}
+
 export type AppState = {
   transcript: TranscriptItem[]
   pendingPermission?: PermissionRequest
+  pendingQuestions?: PendingQuestions
+  todos: AppTodo[]
   permissionApprovals: PermissionApproval[]
   modifiedFiles: ModifiedFile[]
   running: boolean
@@ -56,6 +68,7 @@ export type AppState = {
 export function createInitialState(): AppState {
   return {
     transcript: [],
+    todos: [],
     permissionApprovals: [],
     modifiedFiles: [],
     running: false,
@@ -118,7 +131,25 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
     case "reasoning_delta":
       return appendAssistantText(state, event.text ?? event.delta ?? "")
     case "tool_call_requested":
+      if (event.name === "todo_write") return applyTodoWrite(state, event.input_json)
+      if (event.name === "ask_questions") return state
       return appendRequestedTool(state, event.name ?? "tool", event.input_json, event.tool_call_id ? String(event.tool_call_id) : undefined)
+    case "questions_requested":
+      return {
+        ...state,
+        status: "waiting_for_questions",
+        pendingQuestions: {
+          toolCallId: String(event.tool_call_id ?? ""),
+          questions: Array.isArray(event.questions) ? event.questions : [],
+        },
+      }
+    case "questions_answered":
+      return {
+        ...state,
+        pendingQuestions: undefined,
+        status: "running_tools",
+        transcript: [...state.transcript, questionAnswersTranscript(event.answers)],
+      }
     case "permission_resolved":
       return { ...state, pendingPermission: undefined, status: "running_tools" }
     case "context_prepared":
@@ -129,6 +160,7 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
     case "tool_call_start":
       {
         const input = stringify(event.input_json)
+        if ((event.name ?? "") === "todo_write") return { ...applyTodoWrite(state, event.input_json), transcript: state.transcript }
         const approval = findMatchingApproval(state.permissionApprovals, event.name ?? "tool", input)
         const permissionApprovals = approval
           ? state.permissionApprovals.filter((item) => item !== approval)
@@ -189,7 +221,7 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
       return event.display_name ? { ...state, title: event.display_name } : state
     case "result":
       if (event.stop_reason === "interrupted") return markAgentStopped(state)
-      return { ...state, running: false, status: String(event.stop_reason ?? "completed"), pendingPermission: undefined }
+      return { ...state, running: false, status: String(event.stop_reason ?? "completed"), pendingPermission: undefined, pendingQuestions: undefined }
     case "error":
       return {
         ...state,
@@ -207,6 +239,7 @@ export function markAgentStopped(state: AppState): AppState {
     running: false,
     status: "stopped",
     pendingPermission: undefined,
+    pendingQuestions: undefined,
     transcript: appendStoppedAgent(state.transcript),
   }
 }
@@ -254,9 +287,42 @@ export function applyPermissionDecision(state: AppState, decision: PermissionDec
   return {
     ...state,
     pendingPermission: undefined,
+    pendingQuestions: undefined,
     permissionApprovals: matchedExistingTool || !approval ? state.permissionApprovals : [...state.permissionApprovals, approval],
     transcript,
   }
+}
+
+export function applyQuestionAnswers(state: AppState, answers: QuestionAnswer[]): AppState {
+  return {
+    ...state,
+    pendingQuestions: undefined,
+    status: "running_tools",
+    transcript: [...state.transcript, questionAnswersTranscript(answers)],
+  }
+}
+
+function applyTodoWrite(state: AppState, inputJson: unknown): AppState {
+  const record = inputJson && typeof inputJson === "object" ? inputJson as Record<string, unknown> : {}
+  const raw = Array.isArray(record.todos) ? record.todos : []
+  const todos = raw
+    .map((item) => {
+      if (!item || typeof item !== "object") return undefined
+      const record = item as Record<string, unknown>
+      const content = typeof record.content === "string" ? record.content.trim() : ""
+      const status = typeof record.status === "string" ? record.status : "pending"
+      return content ? { content, status } : undefined
+    })
+    .filter((item): item is AppTodo => Boolean(item))
+  return { ...state, todos }
+}
+
+function questionAnswersTranscript(answers: unknown): TranscriptItem {
+  const list = Array.isArray(answers) ? answers as QuestionAnswer[] : []
+  const text = list.length > 0
+    ? list.map((answer, index) => `Q${index + 1}: ${answer.question}\nA${index + 1}: ${answer.answer}`).join("\n\n")
+    : "No question answers submitted"
+  return { id: nextId("questions"), kind: "user", text }
 }
 
 function appendAssistantText(state: AppState, text: string): AppState {

@@ -199,6 +199,8 @@ impl ProviderPlugin for CopilotProvider {
         cancel: CancellationToken,
         _permissions: PermissionResponses,
         mut tool_responses: ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let bearer = self.bearer_token(auth).await?;
         let headers = copilot_headers(&bearer.token)?;
