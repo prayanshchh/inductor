@@ -16,6 +16,7 @@
 //! ```
 
 use std::{
+    collections::HashMap,
     fmt, fs,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -716,6 +717,47 @@ struct LocalToolRunResult {
     status: LocalToolRunStatus,
 }
 
+#[derive(Debug, Default)]
+struct ToolHashCache {
+    hashes_by_path: HashMap<String, String>,
+}
+
+impl ToolHashCache {
+    fn model_visible_call(&self, call: &ParsedToolCall) -> ParsedToolCall {
+        let mut call = call.clone();
+        strip_expected_hashes(&mut call.input);
+        call
+    }
+
+    fn execution_call(&self, tools: &ToolRuntime, call: &ParsedToolCall) -> ParsedToolCall {
+        let mut call = self.model_visible_call(call);
+        attach_cached_hashes(tools, &mut call.input, &call.name, &self.hashes_by_path);
+        call
+    }
+
+    fn record_success(
+        &mut self,
+        tools: &ToolRuntime,
+        call: &ParsedToolCall,
+        result: &tools::ToolResult,
+    ) {
+        if call.name == ToolName::ReadFile.as_str() {
+            if let (Some(path), Some(hash)) = (
+                result.metadata.get("path").and_then(Value::as_str),
+                result.metadata.get("sha256").and_then(Value::as_str),
+            ) {
+                self.hashes_by_path
+                    .insert(path.to_string(), hash.to_string());
+            }
+            return;
+        }
+
+        for path in tool_target_paths(call) {
+            refresh_hash_for_path(tools, &path, &mut self.hashes_by_path);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum LocalToolRunUpdate {
     Event(SessionEvent),
@@ -737,18 +779,22 @@ fn run_local_tool_call<'a>(
     permissions: &'a mut risk::PermissionService<'_>,
     state: &'a mut SessionState,
     call: &'a ParsedToolCall,
+    hash_cache: &'a mut ToolHashCache,
     config: &'a HarnessConfig,
     cancel: CancellationToken,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<LocalToolRunUpdate>> + Send + 'a>> {
     Box::pin(try_stream! {
-    let risk_flags = risk::classify(call);
-    let outside_path = get_outside_path(call);
-    let preview_input = permission_preview_input(tools, call);
+    let display_call = hash_cache.model_visible_call(call);
+    let execution_call = hash_cache.execution_call(tools, call);
+    let risk_flags = risk::classify(&display_call);
+    let outside_path = get_outside_path(&display_call);
+    let preview_input = permission_preview_input(tools, &display_call);
     let mut approved_unlocked_execution =
-        permissions.is_allowed(call) && execution_needs_unlocked_access(call, &risk_flags);
+        permissions.is_allowed(&display_call)
+            && execution_needs_unlocked_access(&display_call, &risk_flags);
 
-    if permissions.is_denied_for_session(call) {
-        let message = format!("tool call denied for this session: {}", call.name);
+    if permissions.is_denied_for_session(&display_call) {
+        let message = format!("tool call denied for this session: {}", display_call.name);
         yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
             session_id,
             tool_call_id,
@@ -768,11 +814,11 @@ fn run_local_tool_call<'a>(
 
     if !matches!(config.approval_policy, ApprovalPolicy::Never)
         && (outside_path.is_some()
-            || permissions.should_request(config.approval_policy, &risk_flags, call))
+            || permissions.should_request(config.approval_policy, &risk_flags, &display_call))
     {
-        let reason = risk_reason(&call.name, &risk_flags, outside_path.as_deref());
+        let reason = risk_reason(&display_call.name, &risk_flags, outside_path.as_deref());
         let pending = permissions.begin_request(
-            call,
+            &display_call,
             preview_input.clone(),
             risk_flags.clone(),
             reason.clone(),
@@ -793,7 +839,7 @@ fn run_local_tool_call<'a>(
             .decide(&ApprovalRequest {
                 session_id,
                 request_id: pending.request_id,
-                tool_name: call.name.clone(),
+                tool_name: display_call.name.clone(),
                 input: preview_input.clone(),
                 risk_flags: risk_flags.clone(),
                 reason,
@@ -806,14 +852,14 @@ fn run_local_tool_call<'a>(
             request_id: pending.request_id,
             decision,
         });
-        permissions.resolve(pending.request_id, decision, call);
+        permissions.resolve(pending.request_id, decision, &display_call);
 
         if matches!(decision, PermissionDecision::Deny) {
             let message = match approver.last_message() {
                 Some(note) if !note.trim().is_empty() => {
-                    format!("tool call denied by user: {} - {note}", call.name)
+                    format!("tool call denied by user: {} - {note}", display_call.name)
                 }
-                _ => format!("tool call denied by user: {}", call.name),
+                _ => format!("tool call denied by user: {}", display_call.name),
             };
             yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
                 session_id,
@@ -832,14 +878,14 @@ fn run_local_tool_call<'a>(
             return;
         }
 
-        approved_unlocked_execution = execution_needs_unlocked_access(call, &risk_flags);
+        approved_unlocked_execution = execution_needs_unlocked_access(&display_call, &risk_flags);
     }
 
-    let targets = ToolTargets::capture(tools, call);
+    let targets = ToolTargets::capture(tools, &display_call);
     yield LocalToolRunUpdate::Event(SessionEvent::ToolInputStart {
         session_id,
         tool_call_id,
-        name: call.name.clone(),
+        name: display_call.name.clone(),
     });
     yield LocalToolRunUpdate::Event(SessionEvent::ToolInputEnd {
         session_id,
@@ -849,7 +895,7 @@ fn run_local_tool_call<'a>(
     yield LocalToolRunUpdate::Event(SessionEvent::ToolCallStart {
         session_id,
         tool_call_id,
-        name: call.name.clone(),
+        name: display_call.name.clone(),
         input_json: preview_input.clone(),
     });
     yield LocalToolRunUpdate::Event(SessionEvent::Status {
@@ -869,14 +915,14 @@ fn run_local_tool_call<'a>(
         session_id,
         tool_call_id,
         execution_tools,
-        call,
+        &execution_call,
         cancel.clone(),
         config.tool_model_checkpoint_after,
     );
     let result = loop {
         let Some(update) = execution.next().await else {
             break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
-                command: call.name.clone(),
+                command: display_call.name.clone(),
             }));
         };
         match update? {
@@ -888,13 +934,13 @@ fn run_local_tool_call<'a>(
 
     match result {
         Ok(mut result) => {
-            if sandbox_denied_result(tools, call, &result) && !approved_unlocked_execution {
+            if sandbox_denied_result(tools, &display_call, &result) && !approved_unlocked_execution {
                 let reason = format!(
                     "{} was blocked by the workspace sandbox; approve to retry without the sandbox for this tool call",
-                    call.name
+                    display_call.name
                 );
                 let pending = permissions.begin_request(
-                    call,
+                    &display_call,
                     preview_input.clone(),
                     risk_flags.clone(),
                     reason.clone(),
@@ -914,7 +960,7 @@ fn run_local_tool_call<'a>(
                     .decide(&ApprovalRequest {
                         session_id,
                         request_id: pending.request_id,
-                        tool_name: call.name.clone(),
+                        tool_name: display_call.name.clone(),
                         input: preview_input.clone(),
                         risk_flags: risk_flags.clone(),
                         reason,
@@ -926,21 +972,21 @@ fn run_local_tool_call<'a>(
                     request_id: pending.request_id,
                     decision,
                 });
-                permissions.resolve(pending.request_id, decision, call);
+                permissions.resolve(pending.request_id, decision, &display_call);
                 if !matches!(decision, PermissionDecision::Deny) {
                     let unlocked = tools.approved_outside_access();
                     let mut retry = execute_tool_call_with_progress(
                         session_id,
                         tool_call_id,
                         &unlocked,
-                        call,
+                        &execution_call,
                         cancel.clone(),
                         config.tool_model_checkpoint_after,
                     );
                     result = loop {
                         let Some(update) = retry.next().await else {
                             break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
-                                command: call.name.clone(),
+                                command: display_call.name.clone(),
                             }))?;
                         };
                         match update? {
@@ -952,6 +998,7 @@ fn run_local_tool_call<'a>(
                     };
                 }
             }
+            hash_cache.record_success(tools, &execution_call, &result);
             let patch = targets.patch(tools);
             let blob_store = config.context.blob_store();
             let stubbed = stub_tool_output(
@@ -969,7 +1016,7 @@ fn run_local_tool_call<'a>(
             });
             state.push(
                 Role::Tool,
-                format!("{} result:\n{}", call.name, stubbed.inline_output),
+                format!("{} result:\n{}", display_call.name, stubbed.inline_output),
             );
             if !patch.files.is_empty() {
                 let diagnostics = diagnostics_for_patch(tools, &patch.files);
@@ -997,13 +1044,13 @@ fn run_local_tool_call<'a>(
             let message = exec_error.to_string();
 
             if matches!(config.approval_policy, ApprovalPolicy::OnFailure)
-                && !permissions.is_allowed(call)
+                && !permissions.is_allowed(&display_call)
             {
                 let pending = permissions.begin_request(
-                    call,
-                    call.input.clone(),
+                    &display_call,
+                    display_call.input.clone(),
                     risk_flags.clone(),
-                    format!("{} failed: {message}", call.name),
+                    format!("{} failed: {message}", display_call.name),
                 );
                 yield LocalToolRunUpdate::Event(SessionEvent::PermissionRequest {
                     session_id,
@@ -1016,11 +1063,11 @@ fn run_local_tool_call<'a>(
                     .decide(&ApprovalRequest {
                         session_id,
                         request_id: pending.request_id,
-                        tool_name: call.name.clone(),
-                        input: call.input.clone(),
+                        tool_name: display_call.name.clone(),
+                        input: display_call.input.clone(),
                         risk_flags: risk_flags.clone(),
                         reason: message.clone(),
-                        outside_path: get_outside_path(call),
+                        outside_path: get_outside_path(&display_call),
                     })
                     .await;
                 yield LocalToolRunUpdate::Event(SessionEvent::PermissionResolved {
@@ -1028,7 +1075,7 @@ fn run_local_tool_call<'a>(
                     request_id: pending.request_id,
                     decision,
                 });
-                permissions.resolve(pending.request_id, decision, call);
+                permissions.resolve(pending.request_id, decision, &display_call);
             }
 
             yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
@@ -1036,7 +1083,7 @@ fn run_local_tool_call<'a>(
                 tool_call_id,
                 message: message.clone(),
             });
-            state.push(Role::Tool, format!("{} error: {message}", call.name));
+            state.push(Role::Tool, format!("{} error: {message}", display_call.name));
             yield LocalToolRunUpdate::Done(LocalToolRunResult {
                 provider_response: ProviderToolResponse {
                     tool_call_id,
@@ -1167,6 +1214,99 @@ fn tool_target_paths(call: &ParsedToolCall) -> Vec<String> {
         "apply_patch_structured" => structured_patch_paths(&call.input),
         _ => Vec::new(),
     }
+}
+
+fn strip_expected_hashes(input: &mut Value) {
+    if let Some(object) = input.as_object_mut() {
+        object.remove("expected_hash");
+        if let Some(operations) = object.get_mut("operations").and_then(Value::as_array_mut) {
+            for operation in operations {
+                strip_expected_hashes(operation);
+            }
+        }
+    }
+}
+
+fn attach_cached_hashes(
+    tools: &ToolRuntime,
+    input: &mut Value,
+    tool_name: &str,
+    hashes_by_path: &HashMap<String, String>,
+) {
+    match tool_name {
+        "edit_file" | "multi_edit" => {
+            let Some(path) = input.get("path").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(hash) = cached_hash_for_path(tools, path, hashes_by_path) else {
+                return;
+            };
+            if let Some(object) = input.as_object_mut() {
+                object.insert("expected_hash".to_string(), Value::String(hash));
+            }
+        }
+        "apply_patch_structured" => {
+            if let Some(operations) = input.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    let Some(object) = operation.as_object_mut() else {
+                        continue;
+                    };
+                    let path = object
+                        .get("path")
+                        .or_else(|| object.get("from"))
+                        .and_then(Value::as_str);
+                    let Some(path) = path else {
+                        continue;
+                    };
+                    let Some(hash) = cached_hash_for_path(tools, path, hashes_by_path) else {
+                        continue;
+                    };
+                    object.insert("expected_hash".to_string(), Value::String(hash));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cached_hash_for_path(
+    tools: &ToolRuntime,
+    path: &str,
+    hashes_by_path: &HashMap<String, String>,
+) -> Option<String> {
+    workspace_relative_key(tools, path).and_then(|key| hashes_by_path.get(&key).cloned())
+}
+
+fn refresh_hash_for_path(
+    tools: &ToolRuntime,
+    path: &str,
+    hashes_by_path: &mut HashMap<String, String>,
+) {
+    let Some(key) = workspace_relative_key(tools, path) else {
+        return;
+    };
+    match tools.read_file(&key) {
+        Ok(result) => {
+            if let Some(hash) = result.metadata.get("sha256").and_then(Value::as_str) {
+                hashes_by_path.insert(key, hash.to_string());
+            }
+        }
+        Err(_) => {
+            hashes_by_path.remove(&key);
+        }
+    }
+}
+
+fn workspace_relative_key(tools: &ToolRuntime, path: &str) -> Option<String> {
+    let input = Path::new(path);
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        tools.workspace_root().join(input)
+    };
+    let canonical = absolute.canonicalize().ok()?;
+    let relative = canonical.strip_prefix(tools.workspace_root()).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn structured_patch_paths(input: &Value) -> Vec<String> {
@@ -1533,6 +1673,7 @@ pub fn run_turn<'a>(
         // rounds get a fresh, empty channel.
         let mut responses = Some(responses);
         let mut permissions = risk::PermissionService::new(allow);
+        let mut hash_cache = ToolHashCache::default();
 
         yield SessionEvent::Status { session_id, status: SessionStatus::Starting };
 
@@ -1708,6 +1849,7 @@ pub fn run_turn<'a>(
                             &mut permissions,
                             state,
                             &call,
+                            &mut hash_cache,
                             &config,
                             cancel.clone(),
                         );
@@ -1838,6 +1980,7 @@ pub fn run_turn<'a>(
                         &mut permissions,
                         state,
                         &call,
+                        &mut hash_cache,
                         &config,
                         cancel.clone(),
                     );
