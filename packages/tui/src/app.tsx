@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, type KeyEvent } from "@opentui/core"
+import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, parseColor, type KeyEvent, type OptimizedBuffer } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { execFile } from "node:child_process"
@@ -186,7 +186,9 @@ const syntaxStyle = SyntaxStyle.fromTheme([
   { scope: ["markup.bold"], style: { foreground: theme.text, bold: true } },
   { scope: ["markup.italic"], style: { foreground: theme.yellow, italic: true } },
   { scope: ["markup.raw", "code"], style: { foreground: theme.green } },
+  { scope: ["inductor.command"], style: { foreground: theme.cyan, bold: true } },
 ])
+const commandHighlightStyle = syntaxStyle.getStyleId("inductor.command")
 
 function loadPromptHistoryFile(filePath: string): string[] {
   try {
@@ -585,8 +587,17 @@ export function App(props: AppProps) {
       setPalette(undefined)
       setSelected(0)
     }
-    if (value.startsWith("/")) openPalette("commands")
-    if (!value.startsWith("/") && palette() === "commands") setPalette(undefined)
+    if (value.startsWith("/") && !/\s/.test(value)) {
+      const hasMatches = commands.some((command) => command.name.startsWith(value))
+      if (hasMatches) openPalette("commands")
+      else if (palette() === "commands") {
+        setPalette(undefined)
+        setSelected(0)
+      }
+    } else if (palette() === "commands") {
+      setPalette(undefined)
+      setSelected(0)
+    }
     void normalizeImagePathPaste(value)
   }
 
@@ -604,6 +615,10 @@ export function App(props: AppProps) {
     input.cursorOffset = next.cursorOffset
     updateDraft(next.value)
     return true
+  function dismissPalette() {
+    setPalette(undefined)
+    setMention(undefined)
+    setSelected(0)
   }
 
   function recordHistory(value: string) {
@@ -1057,7 +1072,7 @@ export function App(props: AppProps) {
       await execFileAsync("git", ["-C", worktree.worktree_path, "push", "-u", "origin", worktree.branch_name], { maxBuffer: 1024 * 1024 * 4 })
       let url = ""
       try {
-        const { stdout } = await execFileAsync("gh", ["pr", "create", "--repo", worktree.source_repo, "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor."], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+        const { stdout } = await execFileAsync("gh", ["pr", "create", "--head", worktree.branch_name, "--base", base, "--title", message, "--body", "Created by Inductor."], ghExecOptions(worktree.worktree_path))
         url = findUrl(stdout)
       } catch (error) {
         const existing = await existingPullRequestUrl(worktree)
@@ -1350,9 +1365,10 @@ export function App(props: AppProps) {
           <box
             flexGrow={1}
             minWidth={0}
-                flexDirection="column"
+            flexDirection="column"
             backgroundColor={theme.panel}
-                border
+            overflow="hidden"
+            border
             borderStyle="rounded"
             borderColor={theme.border}
           >
@@ -1360,7 +1376,8 @@ export function App(props: AppProps) {
               <scrollbox
                 flexGrow={1}
                 minHeight={0}
-                        stickyScroll={true}
+                overflow="hidden"
+                stickyScroll={true}
                 stickyStart="bottom"
                 scrollAcceleration={scrollAcceleration}
                 viewportCulling={true}
@@ -1409,6 +1426,7 @@ export function App(props: AppProps) {
           paletteItems={paletteItems}
           selected={selected}
           moveSelection={moveSelection}
+          dismissPalette={dismissPalette}
           acceptPalette={acceptPalette}
           choosePalette={choosePalette}
           openPalette={openPalette}
@@ -1595,19 +1613,16 @@ function TerminalPanel(props: {
   cwd: string
 }) {
   let surface!: BoxRenderable
-  // The block cursor blinks like a native terminal whenever the shell is live
-  // so the user can always see where input will land, regardless of which pane
-  // currently holds keyboard focus.
-  const [blinkOn, setBlinkOn] = createSignal(true)
-  const blinkTimer = setInterval(() => setBlinkOn((on) => !on), 530)
-  onCleanup(() => clearInterval(blinkTimer))
-  const cursorVisible = () => blinkOn()
+  // Draw one block cursor at the PTY cursor position while this panel has
+  // focus. OpenTUI's native cursor belongs to the composer and is hidden below.
+  const [terminalFocused, setTerminalFocused] = createSignal(false)
+  const cursorVisible = () => terminalFocused()
   // vt100 screen contents render as a fixed grid; strip trailing blank rows so
   // the prompt hugs the bottom instead of padding out the panel.
   const snapshotLines = () => {
     const snapshot = props.snapshot()
     if (!snapshot) return { rows: [] as string[], cursorRow: -1, cursorCol: 0 }
-    const grid = snapshot.contents.split("\n")
+    const grid = snapshot.screen_rows ?? snapshot.contents.split("\n")
     let end = grid.length
     while (end > 0 && grid[end - 1].trim() === "") end -= 1
     // Keep enough rows to still show where the cursor sits, even on a blank line.
@@ -1637,9 +1652,14 @@ function TerminalPanel(props: {
       onKeyDown={forwardKey}
       ref={(ref: BoxRenderable) => {
         surface = ref
-        // Reset the blink to "on" when focused so the cursor is solid the
-        // instant the user clicks in, then resumes blinking.
-        ref.on("focused", () => setBlinkOn(true))
+        ref.on("focused", () => {
+          setTerminalFocused(true)
+          // The composer owns OpenTUI's native cursor. Hide its last position
+          // while this custom terminal surface is focused so only the PTY
+          // cursor at the active prompt is visible.
+          ref.ctx.setCursorPosition(0, 0, false)
+        })
+        ref.on("blurred", () => setTerminalFocused(false))
       }}
     >
       <box flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} marginBottom={1}>
@@ -1678,18 +1698,26 @@ function TerminalPanel(props: {
  * prompt, matching a native shell.
  */
 function TerminalLine(props: { text: string; cursorCol: number }) {
-  if (props.cursorCol < 0) {
-    return <text fg={theme.muted} wrapMode="char" selectable={true}>{props.text.length ? props.text : " "}</text>
-  }
-  const padded = props.text.length < props.cursorCol ? props.text.padEnd(props.cursorCol, " ") : props.text
-  const before = padded.slice(0, props.cursorCol)
-  const at = padded.slice(props.cursorCol, props.cursorCol + 1) || " "
-  const after = padded.slice(props.cursorCol + 1)
+  return (
+    <Show
+      when={props.cursorCol >= 0}
+      fallback={<text fg={theme.muted} wrapMode="none" selectable={true}>{props.text.length ? props.text : " "}</text>}
+    >
+      <TerminalCursorLine text={props.text} cursorCol={props.cursorCol} />
+    </Show>
+  )
+}
+
+function TerminalCursorLine(props: { text: string; cursorCol: number }) {
+  const padded = () => props.text.length < props.cursorCol ? props.text.padEnd(props.cursorCol, " ") : props.text
+  const before = () => padded().slice(0, props.cursorCol)
+  const at = () => padded().slice(props.cursorCol, props.cursorCol + 1) || " "
+  const after = () => padded().slice(props.cursorCol + 1)
   return (
     <box flexDirection="row">
-      <text fg={theme.muted} wrapMode="none" selectable={true}>{before}</text>
-      <text fg="#0a1014" bg={theme.cyan} attributes={TextAttributes.BOLD}>{at}</text>
-      <text fg={theme.muted} selectable={true}>{after}</text>
+      <text fg={theme.muted} wrapMode="none" selectable={true}>{before()}</text>
+      <text fg="#0a1014" bg="#ffffff" attributes={TextAttributes.BOLD}>{at()}</text>
+      <text fg={theme.muted} wrapMode="none" selectable={true}>{after()}</text>
     </box>
   )
 }
@@ -1782,18 +1810,26 @@ function WorktreeRow(props: {
 
 async function existingPullRequestUrl(worktree: Worktree) {
   try {
-    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo, "--json", "url", "--jq", ".url"], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--json", "url", "--jq", ".url"], ghExecOptions(worktree.worktree_path))
     const url = stdout.trim()
     if (url) return url
   } catch (error) {
     if (!ghSupportsJson(error)) return ""
   }
   try {
-    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name, "--repo", worktree.source_repo], { cwd: worktree.source_repo, maxBuffer: 1024 * 1024 })
+    const { stdout } = await execFileAsync("gh", ["pr", "view", worktree.branch_name], ghExecOptions(worktree.worktree_path))
     return findUrl(stdout)
   } catch {
     return ""
   }
+}
+
+function ghExecOptions(cwd: string) {
+  // GH_REPO overrides repository detection in GitHub CLI. Some shells set it
+  // to the workspace path, and `gh --repo` also rejects filesystem paths; PR
+  // commands should infer the target repository from the worktree's git remote.
+  const { GH_REPO: _ghRepo, ...env } = process.env
+  return { cwd, env, maxBuffer: 1024 * 1024 }
 }
 
 function findUrl(text: string) {
@@ -1923,6 +1959,15 @@ function TimelineItem(props: { item: TranscriptItem; expanded: boolean; toggle: 
   return null
 }
 
+function horizontalFrame(color: () => string, sides: Array<"top" | "bottom"> = ["top", "bottom"]) {
+  return function (this: BoxRenderable, buffer: OptimizedBuffer) {
+    const line = "─".repeat(this.width)
+    const parsed = parseColor(color())
+    if (sides.includes("top")) buffer.drawText(line, this.x, this.y, parsed)
+    if (sides.includes("bottom")) buffer.drawText(line, this.x, this.y + this.height - 1, parsed)
+  }
+}
+
 function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" }>; expanded: boolean; toggle: () => void }) {
   const action = createMemo(() => toolActivity(props.item))
   const diff = createMemo(() => diffFromTool(props.item))
@@ -1941,8 +1986,9 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
         width="100%"
         flexDirection="column"
         backgroundColor={theme.row}
-        border={["top", "bottom"]}
-        borderColor={isOpen() ? theme.borderStrong : theme.borderSoft}
+        paddingTop={1}
+        paddingBottom={1}
+        renderAfter={horizontalFrame(() => isOpen() ? theme.borderStrong : theme.borderSoft)}
       >
         <box
           width="100%"
@@ -1968,11 +2014,10 @@ function ToolTimelineItem(props: { item: Extract<TranscriptItem, { kind: "tool" 
           <box
             flexDirection="column"
             backgroundColor={theme.panelSoft}
-            border={["top"]}
-            borderColor={isWrite() ? theme.borderStrong : theme.border}
+            paddingTop={2}
+            renderAfter={horizontalFrame(() => isWrite() ? theme.borderStrong : theme.border, ["top"])}
             paddingLeft={1}
             paddingRight={1}
-            paddingTop={1}
             paddingBottom={1}
           >
             <Show when={props.item.approval}>
@@ -2107,12 +2152,11 @@ function TimelineShell(props: { marker: string; color: string; label: string; ch
         flexDirection="row"
         gap={2}
         backgroundColor={theme.row}
-        border={["top", "bottom"]}
-        borderColor={theme.borderSoft}
+        paddingTop={1}
+        paddingBottom={1}
+        renderAfter={horizontalFrame(() => theme.borderSoft)}
         paddingLeft={1}
         paddingRight={1}
-        paddingTop={0}
-        paddingBottom={0}
       >
         <box width={3} alignItems="center">
           <text fg={props.color} selectable={false}>{props.marker}</text>
@@ -2162,7 +2206,14 @@ function PermissionTimelineItem(props: {
           fallback={<code content={props.request.input} filetype="json" syntaxStyle={syntaxStyle} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text} />}
         >
           {(patch) => (
-            <box backgroundColor={theme.panelSoft} border={["top", "bottom"]} borderColor={theme.borderStrong} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+            <box
+              backgroundColor={theme.panelSoft}
+              paddingLeft={1}
+              paddingRight={1}
+              paddingTop={2}
+              paddingBottom={2}
+              renderAfter={horizontalFrame(() => theme.borderStrong)}
+            >
               <DiffWithHunkReview diff={normalizeUnifiedPatch(props.request.filepath ?? "file", patch())} path={props.request.filepath} />
             </box>
           )}
@@ -2210,6 +2261,7 @@ function Composer(props: {
   paletteItems: () => readonly PaletteItem[]
   selected: () => number
   moveSelection: (delta: number) => void
+  dismissPalette: () => void
   acceptPalette: (insertDirectory?: boolean) => void
   choosePalette: (index: number) => void
   openPalette: (kind: PaletteKind) => void
@@ -2310,6 +2362,12 @@ function Composer(props: {
               const meta = Boolean(event.metaKey || event.meta || event.super)
               const permissionNav = key === "ArrowUp" || key === "up" || key === "ArrowDown" || key === "down" || key === "Enter" || key === "enter" || key === "return"
               if (props.state.pendingPermission && permissionNav) return
+              if (props.palette() && (key === "Escape" || key === "Esc" || key === "escape" || key === "esc")) {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.dismissPalette()
+                return
+              }
               if (props.palette() && (key === "ArrowUp" || key === "up")) {
                 event.preventDefault()
                 event.stopPropagation?.()
@@ -2326,6 +2384,12 @@ function Composer(props: {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.acceptPalette(Boolean(meta || ctrl))
+                return
+              }
+              if (props.palette() === "models") {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.dismissPalette()
                 return
               }
               if (!props.palette() && (meta || ctrl) && normalized === "v") {
@@ -2408,6 +2472,15 @@ function Palette(props: {
   selected: number
   choose: (index: number) => void
 }) {
+  const maxRows = () => props.kind === "models" ? 10 : 14
+  const startIndex = () => {
+    const rows = maxRows()
+    if (props.items.length <= rows) return 0
+    return Math.min(Math.max(0, props.selected - Math.floor(rows / 2)), props.items.length - rows)
+  }
+  const visibleItems = () => props.items.slice(startIndex(), startIndex() + maxRows())
+  const hiddenBefore = () => startIndex()
+  const hiddenAfter = () => Math.max(0, props.items.length - startIndex() - visibleItems().length)
   return (
     <box
       width="100%"
@@ -2421,15 +2494,19 @@ function Palette(props: {
       paddingBottom={1}
       marginBottom={1}
     >
-      <For each={props.items}>
+      <Show when={hiddenBefore() > 0}>
+        <text fg={theme.dim}>  ↑ {hiddenBefore()} more</text>
+      </Show>
+      <For each={visibleItems()}>
         {(item, index) => {
-          const selected = () => index() === props.selected
+          const absoluteIndex = () => startIndex() + index()
+          const selected = () => absoluteIndex() === props.selected
           return (
             <box
               flexDirection="row"
               backgroundColor={selected() ? theme.paletteSelected : theme.palette}
               paddingLeft={1}
-              onMouseUp={() => props.choose(index())}
+              onMouseUp={() => props.choose(absoluteIndex())}
             >
               <text width={18} fg={selected() ? theme.cyan : theme.text} attributes={selected() ? TextAttributes.BOLD : undefined}>
                 {paletteItemLabel(item)}
@@ -2441,6 +2518,9 @@ function Palette(props: {
           )
         }}
       </For>
+      <Show when={hiddenAfter() > 0}>
+        <text fg={theme.dim}>  ↓ {hiddenAfter()} more · use ↑↓ to scroll</text>
+      </Show>
     </box>
   )
 }

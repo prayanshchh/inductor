@@ -125,14 +125,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::EditFile,
-            description: "Replace an exact substring in an existing file.",
+            description: "Replace an exact substring in an existing file. The runtime validates freshness; do not provide hashes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path" },
                     "old": { "type": "string", "description": "Exact text to replace. Must be unique." },
-                    "new": { "type": "string", "description": "Replacement text" },
-                    "expected_hash": { "type": "string", "description": "Optional sha256 of the current file contents" }
+                    "new": { "type": "string", "description": "Replacement text" }
                 },
                 "required": ["path", "old", "new"]
             }),
@@ -140,7 +139,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::MultiEdit,
-            description: "Apply multiple exact substring replacements to one existing file in order.",
+            description: "Apply multiple exact substring replacements to one existing file in order. The runtime validates freshness; do not provide hashes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -155,8 +154,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             },
                             "required": ["old", "new"]
                         }
-                    },
-                    "expected_hash": { "type": "string", "description": "Optional sha256 of the current file contents" }
+                    }
                 },
                 "required": ["path", "edits"]
             }),
@@ -199,8 +197,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                         },
                                         "required": ["old", "new"]
                                     }
-                                },
-                                "expected_hash": { "type": "string" }
+                                }
                             },
                             "required": ["type"]
                         }
@@ -524,6 +521,7 @@ impl ToolRuntime {
     pub fn read_file(&self, path: impl AsRef<Path>) -> Result<ToolResult, ToolError> {
         let path = self.resolve_existing_path(path.as_ref())?;
         let output = fs::read_to_string(&path).map_err(|err| ToolError::io(&path, err))?;
+        let sha256 = sha256_hex(output.as_bytes());
         let bytes = output.len();
 
         Ok(ToolResult::success(
@@ -534,6 +532,7 @@ impl ToolRuntime {
             result.with_metadata(json!({
                 "path": self.relative_path(&path),
                 "bytes": bytes,
+                "sha256": sha256,
             }))
         })
     }
@@ -633,8 +632,18 @@ impl ToolRuntime {
         for edit in edits {
             let old = normalize_edit_text(&edit.old, newline);
             let new = normalize_edit_text(&edit.new, newline);
+            if old.is_empty() {
+                return Err(ToolError::EmptyEdit);
+            }
             let count = content.matches(&old).count();
             if count == 0 {
+                if !new.is_empty() && content.matches(&new).count() == 1 {
+                    // The requested replacement is already present and the target is
+                    // absent. Treat this as an idempotent success: callers can retry
+                    // after transport/UI interruptions without reporting a false
+                    // patch failure for an edit that did land.
+                    continue;
+                }
                 return Err(ToolError::EditTargetNotFound {
                     path: path.clone(),
                     old: edit.old.clone(),
@@ -712,7 +721,12 @@ impl ToolRuntime {
     }
 
     pub fn apply_patch_freeform(&self, patch: impl AsRef<str>) -> Result<ToolResult, ToolError> {
-        let files = parse_unified_patch(patch.as_ref())?;
+        let patch = patch.as_ref();
+        if patch.trim_start().starts_with("*** Begin Patch") {
+            return self.apply_begin_patch(patch);
+        }
+
+        let files = parse_unified_patch(patch)?;
         if files.is_empty() {
             return Err(ToolError::EmptyPatch);
         }
@@ -726,6 +740,38 @@ impl ToolRuntime {
             CappedOutput::complete(format!("applied unified patch to {} file(s)", files.len())),
         ))
         .map(|result| result.with_metadata(json!({ "files": files.len() })))
+    }
+
+    fn apply_begin_patch(&self, patch: &str) -> Result<ToolResult, ToolError> {
+        let operations = parse_begin_patch(patch)?;
+        if operations.is_empty() {
+            return Err(ToolError::EmptyPatch);
+        }
+
+        let mut changed = 0usize;
+        for operation in operations {
+            match operation {
+                BeginPatchOperation::Update { path, edits } => {
+                    self.multi_edit(path, &edits, None)?;
+                    changed += 1;
+                }
+                BeginPatchOperation::Add { path, content } => {
+                    self.write_file(path, content)?;
+                    changed += 1;
+                }
+                BeginPatchOperation::Delete { path } => {
+                    let path = self.resolve_existing_path(&path)?;
+                    fs::remove_file(&path).map_err(|err| ToolError::io(&path, err))?;
+                    changed += 1;
+                }
+            }
+        }
+
+        Ok(ToolResult::success(
+            ToolName::ApplyPatchFreeform,
+            CappedOutput::complete(format!("applied begin patch to {changed} file(s)")),
+        ))
+        .map(|result| result.with_metadata(json!({ "files": changed })))
     }
 
     pub fn grep(&self, pattern: impl AsRef<str>) -> Result<ToolResult, ToolError> {
@@ -1478,7 +1524,7 @@ impl ToolRuntime {
         }
 
         let actual_hash = sha256_hex(&bytes);
-        if let Some(expected_hash) = expected_hash {
+        if let Some(expected_hash) = expected_hash.filter(|hash| !hash.trim().is_empty()) {
             if !hashes_equal(expected_hash, &actual_hash) {
                 return Err(ToolError::StaleFile {
                     path: path.to_path_buf(),
@@ -1558,6 +1604,10 @@ impl ToolRuntime {
 
             let end = start + old_lines.len();
             if end > lines.len() || lines[start..end] != old_lines {
+                if already_applied_hunk(&lines, &new_lines, start) {
+                    offset += new_lines.len() as isize - old_lines.len() as isize;
+                    continue;
+                }
                 return Err(ToolError::PatchApplyFailed {
                     path: path.clone(),
                     message: format!("hunk did not match at line {}", hunk.old_start),
@@ -1976,6 +2026,143 @@ enum HunkLineKind {
     Add,
 }
 
+#[derive(Debug)]
+enum BeginPatchOperation {
+    Update { path: PathBuf, edits: Vec<TextEdit> },
+    Add { path: PathBuf, content: String },
+    Delete { path: PathBuf },
+}
+
+fn parse_begin_patch(patch: &str) -> Result<Vec<BeginPatchOperation>, ToolError> {
+    let lines = patch.lines().collect::<Vec<_>>();
+    if !matches!(
+        lines.first().map(|line| line.trim()),
+        Some("*** Begin Patch")
+    ) {
+        return Err(ToolError::InvalidPatch(
+            "begin patch must start with *** Begin Patch".to_string(),
+        ));
+    }
+
+    let mut operations = Vec::new();
+    let mut index = 1usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim() == "*** End Patch" {
+            return Ok(operations);
+        }
+
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            index += 1;
+            let mut edits = Vec::new();
+            let mut old = String::new();
+            let mut new = String::new();
+
+            while index < lines.len() && !lines[index].starts_with("*** ") {
+                let raw = lines[index];
+                if raw.starts_with("@@") {
+                    push_begin_patch_edit(&mut edits, &mut old, &mut new)?;
+                    index += 1;
+                    continue;
+                }
+                if raw == "*** End of File" || raw == r"\ No newline at end of file" {
+                    index += 1;
+                    continue;
+                }
+
+                let Some(prefix) = raw.as_bytes().first().copied() else {
+                    return Err(ToolError::InvalidPatch(
+                        "empty line in begin patch hunk must be prefixed with a space, +, or -"
+                            .to_string(),
+                    ));
+                };
+                let text = format!("{}\n", &raw[1..]);
+                match prefix {
+                    b' ' => {
+                        old.push_str(&text);
+                        new.push_str(&text);
+                    }
+                    b'-' => old.push_str(&text),
+                    b'+' => new.push_str(&text),
+                    _ => {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "invalid begin patch hunk line: {raw}"
+                        )));
+                    }
+                }
+                index += 1;
+            }
+            push_begin_patch_edit(&mut edits, &mut old, &mut new)?;
+            if edits.is_empty() {
+                return Err(ToolError::InvalidPatch(format!(
+                    "update patch for {path} has no edits"
+                )));
+            }
+            operations.push(BeginPatchOperation::Update {
+                path: PathBuf::from(path.trim()),
+                edits,
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            index += 1;
+            let mut content = String::new();
+            while index < lines.len() && !lines[index].starts_with("*** ") {
+                let raw = lines[index];
+                if !raw.starts_with('+') {
+                    return Err(ToolError::InvalidPatch(format!(
+                        "add file patch line must start with +: {raw}"
+                    )));
+                }
+                content.push_str(&raw[1..]);
+                content.push('\n');
+                index += 1;
+            }
+            operations.push(BeginPatchOperation::Add {
+                path: PathBuf::from(path.trim()),
+                content,
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            operations.push(BeginPatchOperation::Delete {
+                path: PathBuf::from(path.trim()),
+            });
+            index += 1;
+            continue;
+        }
+
+        return Err(ToolError::InvalidPatch(format!(
+            "unsupported begin patch directive: {line}"
+        )));
+    }
+
+    Err(ToolError::InvalidPatch(
+        "begin patch is missing *** End Patch".to_string(),
+    ))
+}
+
+fn push_begin_patch_edit(
+    edits: &mut Vec<TextEdit>,
+    old: &mut String,
+    new: &mut String,
+) -> Result<(), ToolError> {
+    if old == new {
+        old.clear();
+        new.clear();
+        return Ok(());
+    }
+    if old.is_empty() {
+        return Err(ToolError::InvalidPatch(
+            "update hunks must include context or removed lines".to_string(),
+        ));
+    }
+    edits.push(TextEdit::new(std::mem::take(old), std::mem::take(new)));
+    Ok(())
+}
+
 fn parse_unified_patch(patch: &str) -> Result<Vec<UnifiedFilePatch>, ToolError> {
     let lines = patch.lines().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -2077,6 +2264,18 @@ fn parse_hunk_old_start(header: &str) -> Result<usize, ToolError> {
         .map_err(|_| ToolError::InvalidPatch(format!("invalid old range in hunk {header}")))
 }
 
+fn already_applied_hunk(lines: &[String], new_lines: &[String], expected_start: usize) -> bool {
+    if new_lines.is_empty() {
+        return true;
+    }
+    if expected_start <= lines.len() && lines[expected_start..].starts_with(new_lines) {
+        return true;
+    }
+    lines
+        .windows(new_lines.len())
+        .any(|window| window == new_lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2094,6 +2293,7 @@ mod tests {
         assert_eq!(result.output, "hello");
         assert_eq!(result.metadata["path"], "hello.txt");
         assert_eq!(result.metadata["bytes"], 5);
+        assert_eq!(result.metadata["sha256"], sha256_hex(b"hello"));
     }
 
     #[test]
@@ -2509,6 +2709,20 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_is_idempotent_when_replacement_already_exists() {
+        let temp = TempDir::new("edit-idempotent");
+        fs::write(temp.path().join("file.txt"), "new\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        runtime.edit_file("file.txt", "old", "new", None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
     fn edit_file_rejects_binary_file() {
         let temp = TempDir::new("edit-binary");
         fs::write(temp.path().join("file.bin"), b"abc\0def").unwrap();
@@ -2532,6 +2746,22 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::StaleFile { .. }));
+    }
+
+    #[test]
+    fn edit_file_ignores_empty_expected_hash() {
+        let temp = TempDir::new("edit-empty-hash");
+        fs::write(temp.path().join("file.txt"), "current").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        runtime
+            .edit_file("file.txt", "current", "new", Some(""))
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -2624,6 +2854,75 @@ mod tests {
             fs::read_to_string(temp.path().join("file.txt")).unwrap(),
             "one\nTWO\nthree\n"
         );
+    }
+
+    #[test]
+    fn freeform_patch_is_idempotent_when_hunk_already_applied() {
+        let temp = TempDir::new("freeform-idempotent");
+        fs::write(temp.path().join("file.txt"), "one\nTWO\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = "\
+--- a/file.txt
++++ b/file.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+";
+
+        runtime.apply_patch_freeform(patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn freeform_patch_accepts_begin_patch_update() {
+        let temp = TempDir::new("begin-patch-update");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = "\
+*** Begin Patch
+*** Update File: file.txt
+@@
+ one
+-two
++TWO
+ three
+*** End Patch
+";
+
+        runtime.apply_patch_freeform(patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn freeform_patch_accepts_begin_patch_add_and_delete() {
+        let temp = TempDir::new("begin-patch-add-delete");
+        fs::write(temp.path().join("old.txt"), "old\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = "\
+*** Begin Patch
+*** Add File: new.txt
++new
+*** Delete File: old.txt
+*** End Patch
+";
+
+        runtime.apply_patch_freeform(patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("new.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(!temp.path().join("old.txt").exists());
     }
 
     struct TempDir {

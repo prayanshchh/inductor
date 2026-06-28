@@ -800,6 +800,56 @@ async fn loop_executes_tool_then_finishes() {
 }
 
 #[tokio::test]
+async fn loop_uses_cached_read_hash_instead_of_model_expected_hash() {
+    let temp = TempDir::new("loop-cached-hash-edit");
+    fs::write(temp.path().join("hello.txt"), "hello world").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "Read first.\n<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\"}}</inductor_tool_call>",
+        "Now edit.\n<inductor_tool_call>{\"name\":\"edit_file\",\"input\":{\"path\":\"hello.txt\",\"old\":\"world\",\"new\":\"inductor\",\"expected_hash\":\"bogus\"}}</inductor_tool_call>",
+        "Done.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "edit hello.txt".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+    ))
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "hello inductor"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallResult { output, .. } if output.contains("applied 1 edit")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallStart { name, input_json, .. }
+            if name == "edit_file"
+                && input_json.get("expected_hash").is_none()
+                && input_json["path"] == "hello.txt"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallError { message, .. } if message.contains("stale edit")
+    )));
+}
+
+#[tokio::test]
 async fn provider_start_error_becomes_terminal_error_result() {
     let temp = TempDir::new("provider-start-error");
     let runtime = ToolRuntime::new(temp.path()).unwrap();
