@@ -227,6 +227,131 @@ pub async fn generate_context_name(
     namer.generate_name(&[context.to_string()]).await
 }
 
+/// Generate a concise pull-request description with the selected provider/model.
+///
+/// The caller supplies the commit/PR title plus a git diff summary. The model is
+/// asked for only the PR body so the result can be passed directly to
+/// `gh pr create --body`.
+pub async fn generate_pull_request_description(
+    title: &str,
+    diff_summary: &str,
+    config: Option<SessionNamingConfig>,
+) -> Result<String> {
+    let config = config.unwrap_or_default();
+    if !config.enabled || diff_summary.trim().is_empty() {
+        return Ok(fallback_pr_description(title, diff_summary));
+    }
+
+    let namer = ModelBasedNamer::new(config.clone());
+    let (provider, auth) = namer.get_provider_and_auth().await?;
+    let request = TurnRequest {
+        session_id: SessionId::new(),
+        model: config.model,
+        prompt: pr_description_prompt(title, diff_summary),
+        system_prompt: None,
+        messages: Vec::new(),
+        tool_names: Vec::new(),
+        metadata: serde_json::Value::Null,
+        images: Vec::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+    let tool_rx = provider_core::empty_tool_responses();
+    let mut stream = provider
+        .stream_turn(&auth, request, cancel, perm_rx, tool_rx)
+        .await?;
+    let mut response_text = String::new();
+
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        if let harness_core::SessionEvent::TextDelta { text, .. } = event {
+            response_text.push_str(&text);
+        } else if let harness_core::SessionEvent::Result { .. } = event {
+            break;
+        }
+    }
+
+    let body = clean_pr_description(&response_text);
+    if body.is_empty() {
+        Ok(fallback_pr_description(title, diff_summary))
+    } else {
+        Ok(body)
+    }
+}
+
+fn pr_description_prompt(title: &str, diff_summary: &str) -> String {
+    let diff_summary = truncate_chars(diff_summary, 12_000);
+    format!(
+        "You are writing a GitHub pull request description. Output ONLY the PR body.\n\n\
+Rules:\n\
+- Be concise and accurate.\n\
+- Describe what changed, not implementation speculation.\n\
+- Use this exact structure:\n\
+Summary:\n\
+- <1-3 short bullets>\n\n\
+Testing:\n\
+- Not run (not requested)\n\n\
+- Do not include a title, code fences, or extra commentary.\n\n\
+PR title / commit message:\n{title}\n\n\
+Git diff summary:\n{diff_summary}"
+    )
+}
+
+fn clean_pr_description(response: &str) -> String {
+    let mut body = response
+        .trim()
+        .trim_matches('`')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if body.starts_with("```") {
+        body = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+    }
+    truncate_chars(&body, 4_000).trim().to_string()
+}
+
+fn fallback_pr_description(title: &str, diff_summary: &str) -> String {
+    let mut changed = diff_summary
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("diff --git ") {
+                line.split_whitespace()
+                    .nth(3)
+                    .map(|path| path.trim_start_matches("b/"))
+            } else {
+                None
+            }
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    changed.dedup();
+
+    let summary = if changed.is_empty() {
+        format!("- {title}")
+    } else {
+        format!("- {title}\n- Updates {}", changed.join(", "))
+    };
+    format!("Summary:\n{summary}\n\nTesting:\n- Not run (not requested)")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        out.push_str("\n… [truncated]");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

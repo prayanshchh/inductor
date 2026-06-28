@@ -31,7 +31,10 @@ use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use session_naming::{SessionNamingConfig, generate_context_name, generate_session_name};
+use session_naming::{
+    SessionNamingConfig, generate_context_name, generate_pull_request_description,
+    generate_session_name,
+};
 use std::time::{Duration, Instant};
 use terminal::{PtyManager, SpawnTerminalRequest, TerminalSize};
 use tokio_util::sync::CancellationToken;
@@ -165,6 +168,22 @@ enum Command {
         /// Stable workspace id to record with new sessions.
         #[arg(long)]
         workspace_id: Option<WorkspaceId>,
+    },
+    PrBody {
+        #[arg(long)]
+        provider: ProviderArg,
+
+        #[arg(long)]
+        workspace: PathBuf,
+
+        #[arg(long)]
+        title: String,
+
+        #[arg(long)]
+        diff: String,
+
+        #[arg(long)]
+        model: Option<String>,
     },
     Session {
         #[command(subcommand)]
@@ -690,6 +709,13 @@ async fn main() {
             )
             .await
         }
+        Some(Command::PrBody {
+            provider,
+            workspace,
+            title,
+            diff,
+            model,
+        }) => run_pr_body_command(provider, workspace, title, diff, model).await,
         Some(Command::Session { command }) => run_session_command(command).await,
         Some(Command::Tool { command }) => run_tool_command(command).await,
         Some(Command::Terminal { command }) => run_terminal_command(command).await,
@@ -963,6 +989,14 @@ async fn run_opentui_command(
     if let Some(model) = model {
         command.arg("--model").arg(model);
     }
+
+    // GH_REPO overrides GitHub CLI repository detection for all descendants.
+    // If a user's shell exports it as a local path, `/pr` eventually fails with:
+    // expected the "[HOST/]OWNER/REPO" format, got "/path/to/repo".
+    // The PR helpers also scrub it before invoking `gh`, but clearing it at the
+    // frontend boundary keeps any future/indirect `gh` calls from inheriting a
+    // bad repository override.
+    command.env_remove("GH_REPO");
 
     let status = command
         .status()
@@ -2423,6 +2457,31 @@ fn redact_auth_body(body: &str) -> String {
         .collect::<String>()
         .replace("access_token", "access_token_redacted")
         .replace("oauth_token", "oauth_token_redacted")
+}
+
+async fn run_pr_body_command(
+    provider: ProviderArg,
+    workspace: PathBuf,
+    title: String,
+    diff: String,
+    model: Option<String>,
+) -> Result<(), String> {
+    let provider = ProviderKind::from(provider);
+    let model = model.unwrap_or_else(|| default_provider_model(provider).to_string());
+    let body = generate_pull_request_description(
+        &title,
+        &diff,
+        Some(SessionNamingConfig {
+            provider,
+            model,
+            enabled: true,
+            cwd: Some(workspace),
+        }),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    println!("{body}");
+    Ok(())
 }
 
 async fn run_session_command(command: SessionCommand) -> Result<(), String> {
