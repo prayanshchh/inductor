@@ -35,8 +35,9 @@ import {
   type FileChoice,
   type MentionState,
   type PromptImageAttachment,
+  type PromptTextAttachment,
 } from "./mentions"
-import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
+import { insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
 import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
 
 export type AppProps = BackendOptions & {
@@ -310,6 +311,7 @@ export function App(props: AppProps) {
   const [mention, setMention] = createSignal<MentionState>()
   const [pasteCount, setPasteCount] = createSignal(0)
   const [promptImages, setPromptImages] = createSignal<PromptImageAttachment[]>([])
+  const [promptPastes, setPromptPastes] = createSignal<PromptTextAttachment[]>([])
   const [prFlow, setPrFlow] = createSignal<PrFlow>()
   const [worktrees, setWorktrees] = createSignal<Worktree[]>([])
   const [worktreeBusy, setWorktreeBusy] = createSignal<string>()
@@ -464,7 +466,7 @@ export function App(props: AppProps) {
 
   function submit() {
     const visiblePrompt = input.plainText.trim()
-    const prompt = promptForSubmit(visiblePrompt, promptImages()).trim()
+    const prompt = promptForSubmit(visiblePrompt, promptImages(), promptPastes()).trim()
     if (fstate().running) return
     if (palette()) {
       acceptPalette()
@@ -491,6 +493,7 @@ export function App(props: AppProps) {
     setDraft("")
     recordHistory(visiblePrompt)
     setPromptImages([])
+    setPromptPastes([])
     setPalette(undefined)
     disarmStopWarning()
     setNotice(undefined)
@@ -850,9 +853,19 @@ export function App(props: AppProps) {
   }
 
   function insertPromptText(text: string) {
-    const next = `${input.plainText}${text}`
-    input.setText(next)
-    updateDraft(next)
+    const compact = shouldCompactPastedText(text)
+    const insert = compact ? addPastedText(text) : text
+    const next = insertTextAtCursor(input.plainText, insert, input.cursorOffset)
+    input.setText(next.value)
+    input.cursorOffset = next.cursorOffset
+    updateDraft(next.value)
+  }
+
+  function addPastedText(text: string) {
+    const nextIndex = promptPastes().length + 1
+    const label = `[Pasted text #${nextIndex}]`
+    setPromptPastes((current) => [...current, { label, text }])
+    return label
   }
 
   function appendAssistantMessage(text: string) {
@@ -1384,6 +1397,7 @@ export function App(props: AppProps) {
           navigatePromptHistory={navigatePromptHistory}
           notice={composerNotice()}
           pasteFromClipboard={pasteFromClipboard}
+          insertPromptText={insertPromptText}
         />
       </box>
     </box>
@@ -2183,9 +2197,11 @@ function Composer(props: {
   navigatePromptHistory: (direction: HistoryDirection) => boolean
   notice: ComposerNotice
   pasteFromClipboard: () => Promise<void>
+  insertPromptText: (text: string) => void
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
+  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
       <Show when={props.palette()}>
@@ -2229,22 +2245,29 @@ function Composer(props: {
         paddingRight={1}
         paddingTop={1}
         paddingBottom={1}
+        onMouseUp={() => textarea.focus()}
       >
-        <box width="100%" flexDirection="row" alignItems="center" gap={1}>
-          <text fg={theme.cyan}>›</text>
+        <box width="100%" height={1} flexDirection="row" alignItems="center">
           <textarea
             width="100%"
+            alignSelf="center"
             minHeight={1}
-            maxHeight={5}
-            placeholder={props.state.pendingPermission ? "approval required: press 1, 2, or 3" : props.state.running ? "agent running..." : "Ask INDUCTOR..."}
+            maxHeight={1}
+            placeholder={composerPlaceholder(props.state)}
             placeholderColor={theme.dim}
             textColor={theme.text}
             focusedTextColor={theme.text}
             focusedBackgroundColor={theme.surface3}
             cursorColor={theme.cyan}
+            cursorStyle={{ style: "block", blinking: true }}
             selectionBg={theme.selectionBg}
             selectionFg={theme.text}
-            keyBindings={[{ name: "j", ctrl: true, action: "newline" }]}
+            keyBindings={[
+              { name: "return", action: "submit" },
+              { name: "kpenter", action: "submit" },
+              { name: "linefeed", action: "submit" },
+              { name: "j", ctrl: true, action: "newline" },
+            ]}
             onContentChange={() => props.setDraft(textarea.plainText)}
             onSubmit={props.submit}
             onPaste={async (event: { bytes?: Uint8Array; preventDefault(): void }) => {
@@ -2256,9 +2279,7 @@ function Composer(props: {
               }
 
               event.preventDefault()
-              const next = `${textarea.plainText}${text}`
-              textarea.setText(next)
-              props.setDraft(next)
+              props.insertPromptText(text)
             }}
             onKeyDown={(event: { key?: string; name?: string; ctrl?: boolean; meta?: boolean; super?: boolean; ctrlKey?: boolean; metaKey?: boolean; preventDefault(): void; stopPropagation?: () => void; sequence?: string }) => {
               const key = event.key ?? event.name
@@ -2291,7 +2312,7 @@ function Composer(props: {
                 void props.pasteFromClipboard()
                 return
               }
-              if (!props.palette() && ((ctrl && (normalized === "j" || normalized === "linefeed")) || key === "\n" || event.sequence === "\n")) {
+              if (!props.palette() && ctrl && normalized === "j") {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.insertPromptNewline()

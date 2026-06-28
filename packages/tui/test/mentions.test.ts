@@ -56,4 +56,12 @@ describe("file mention helpers", () => {
 
     expect(prompt).toBe("compare [Image #1] @.inductor/attachments/pasted-image-1.png with [Image #2] @.inductor/attachments/pasted-image-2.png")
   })
+
+  test("expands visible paste placeholders to original pasted text on submit", () => {
+    const prompt = promptForSubmit("summarize [Pasted text #1]", [], [
+      { label: "[Pasted text #1]", text: "line 1\nline 2" },
+    ])
+
+    expect(prompt).toBe("summarize line 1\nline 2")
+  })
 })

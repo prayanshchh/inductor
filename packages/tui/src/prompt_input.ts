@@ -19,6 +19,12 @@ export function shouldNavigateHistory(value: string, cursorOffset: number, direc
 }
 
 export const PROMPT_HISTORY_LIMIT = 500
+const COMPACT_PASTE_LENGTH = 500
+const COMPACT_PASTE_LINES = 8
+
+export function shouldCompactPastedText(text: string) {
+  return text.length > COMPACT_PASTE_LENGTH || text.split("\n").length > COMPACT_PASTE_LINES
+}
 
 export function recordPromptHistory(entries: string[], value: string) {
   const item = value.trim()
