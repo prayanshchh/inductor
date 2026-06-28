@@ -30,6 +30,7 @@ pub enum ToolName {
     WriteFile,
     EditFile,
     MultiEdit,
+    ApplyPatch,
     ApplyPatchFreeform,
     ApplyPatchStructured,
     Glob,
@@ -49,6 +50,7 @@ impl ToolName {
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
             Self::MultiEdit => "multi_edit",
+            Self::ApplyPatch => "apply_patch",
             Self::ApplyPatchFreeform => "apply_patch_freeform",
             Self::ApplyPatchStructured => "apply_patch_structured",
             Self::Glob => "glob",
@@ -68,6 +70,7 @@ impl ToolName {
             Self::WriteFile => "Write File",
             Self::EditFile => "Edit File",
             Self::MultiEdit => "Multi Edit",
+            Self::ApplyPatch => "Apply Patch",
             Self::ApplyPatchFreeform => "Apply Patch",
             Self::ApplyPatchStructured => "Apply Patch",
             Self::Glob => "Find Files",
@@ -111,99 +114,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             read_only: true,
         },
         ToolDefinition {
-            name: ToolName::WriteFile,
-            description: "Create or overwrite a file with the given contents. Parent directories are created.",
+            name: ToolName::ApplyPatch,
+            description: "Apply a patch to files in the workspace. Prefer this for all file writes. Supports unified diff and the *** Begin Patch format, including *** Add File for creating new files, *** Update File for editing existing files, and *** Delete File for deleting files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path" },
-                    "content": { "type": "string", "description": "Full file contents" }
-                },
-                "required": ["path", "content"]
-            }),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: ToolName::EditFile,
-            description: "Replace an exact substring in an existing file. The runtime validates freshness; do not provide hashes.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path" },
-                    "old": { "type": "string", "description": "Exact text to replace. Must be unique." },
-                    "new": { "type": "string", "description": "Replacement text" }
-                },
-                "required": ["path", "old", "new"]
-            }),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: ToolName::MultiEdit,
-            description: "Apply multiple exact substring replacements to one existing file in order. The runtime validates freshness; do not provide hashes.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path" },
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old": { "type": "string", "description": "Exact text to replace" },
-                                "new": { "type": "string", "description": "Replacement text" }
-                            },
-                            "required": ["old", "new"]
-                        }
+                    "patch": {
+                        "type": "string",
+                        "description": "Patch text. For new files use: *** Begin Patch\\n*** Add File: path\\n+contents\\n*** End Patch"
                     }
                 },
-                "required": ["path", "edits"]
-            }),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: ToolName::ApplyPatchFreeform,
-            description: "Apply a unified diff patch to files in the workspace.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "patch": { "type": "string", "description": "Unified diff patch" } },
                 "required": ["patch"]
-            }),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: ToolName::ApplyPatchStructured,
-            description: "Apply a structured patch containing edit, multi-edit, or rename operations.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "operations": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "type": { "type": "string", "enum": ["edit", "multi_edit", "rename"] },
-                                "path": { "type": "string" },
-                                "from": { "type": "string" },
-                                "to": { "type": "string" },
-                                "old": { "type": "string" },
-                                "new": { "type": "string" },
-                                "edits": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "old": { "type": "string" },
-                                            "new": { "type": "string" }
-                                        },
-                                        "required": ["old", "new"]
-                                    }
-                                }
-                            },
-                            "required": ["type"]
-                        }
-                    }
-                },
-                "required": ["operations"]
             }),
             read_only: false,
         },
@@ -647,6 +568,7 @@ impl ToolRuntime {
                 return Err(ToolError::EditTargetNotFound {
                     path: path.clone(),
                     old: edit.old.clone(),
+                    hint: edit_target_hint(&content, &old),
                 });
             }
             if count > 1 {
@@ -654,6 +576,7 @@ impl ToolRuntime {
                     path: path.clone(),
                     old: edit.old.clone(),
                     count,
+                    hint: edit_target_hint(&content, &old),
                 });
             }
             content = content.replacen(&old, &new, 1);
@@ -740,6 +663,13 @@ impl ToolRuntime {
             CappedOutput::complete(format!("applied unified patch to {} file(s)", files.len())),
         ))
         .map(|result| result.with_metadata(json!({ "files": files.len() })))
+    }
+
+    pub fn apply_patch(&self, patch: impl AsRef<str>) -> Result<ToolResult, ToolError> {
+        let mut result = self.apply_patch_freeform(patch)?;
+        result.name = ToolName::ApplyPatch;
+        result.title = ToolName::ApplyPatch.title().to_string();
+        Ok(result)
     }
 
     fn apply_begin_patch(&self, patch: &str) -> Result<ToolResult, ToolError> {
@@ -1728,11 +1658,13 @@ pub enum ToolError {
     EditTargetNotFound {
         path: PathBuf,
         old: String,
+        hint: Option<String>,
     },
     EditTargetNotUnique {
         path: PathBuf,
         old: String,
         count: usize,
+        hint: Option<String>,
     },
     EmptyEdit,
     EmptyPatch,
@@ -1844,13 +1776,24 @@ impl fmt::Display for ToolError {
                 "refusing stale edit for {}: expected hash {expected_hash}, current hash {actual_hash}",
                 path.display()
             ),
-            Self::EditTargetNotFound { path, .. } => {
-                write!(f, "edit target was not found in {}", path.display())
-            }
-            Self::EditTargetNotUnique { path, count, .. } => write!(
+            Self::EditTargetNotFound { path, old, hint } => write!(
                 f,
-                "edit target is not unique in {}: matched {count} times",
-                path.display()
+                "edit target was not found in {}. Target preview: {}{}",
+                path.display(),
+                edit_preview(old),
+                format_edit_hint(hint)
+            ),
+            Self::EditTargetNotUnique {
+                path,
+                old,
+                count,
+                hint,
+            } => write!(
+                f,
+                "edit target is not unique in {}: matched {count} times. Use a larger unique old string. Target preview: {}{}",
+                path.display(),
+                edit_preview(old),
+                format_edit_hint(hint)
             ),
             Self::EmptyEdit => f.write_str("edit list is empty"),
             Self::EmptyPatch => f.write_str("patch contains no operations"),
@@ -1948,6 +1891,39 @@ fn normalize_edit_text(text: &str, newline: NewlineStyle) -> String {
         NewlineStyle::Lf => text.replace("\r\n", "\n"),
         NewlineStyle::Crlf => text.replace("\r\n", "\n").replace('\n', "\r\n"),
     }
+}
+
+fn edit_preview(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 120 {
+        return format!("{compact:?}");
+    }
+    let preview = compact.chars().take(117).collect::<String>();
+    format!("{preview}...").escape_debug().to_string()
+}
+
+fn edit_target_hint(content: &str, old: &str) -> Option<String> {
+    let probe = old
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() >= 12)
+        .or_else(|| old.lines().map(str::trim).find(|line| !line.is_empty()))?;
+    let probe = probe.chars().take(80).collect::<String>();
+
+    content.lines().enumerate().find_map(|(index, line)| {
+        if !line.contains(&probe) {
+            return None;
+        }
+        Some(format!(
+            " Nearby candidate at line {}: {}",
+            index + 1,
+            edit_preview(line)
+        ))
+    })
+}
+
+fn format_edit_hint(hint: &Option<String>) -> &str {
+    hint.as_deref().unwrap_or("")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2294,6 +2270,18 @@ mod tests {
         assert_eq!(result.metadata["path"], "hello.txt");
         assert_eq!(result.metadata["bytes"], 5);
         assert_eq!(result.metadata["sha256"], sha256_hex(b"hello"));
+    }
+
+    #[test]
+    fn advertised_tools_use_apply_patch_as_canonical_write_tool() {
+        let names = tool_names();
+
+        assert!(names.contains(&"apply_patch".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"multi_edit".to_string()));
+        assert!(!names.contains(&"apply_patch_freeform".to_string()));
+        assert!(!names.contains(&"apply_patch_structured".to_string()));
     }
 
     #[test]
@@ -2709,6 +2697,30 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_error_includes_recovery_context() {
+        let temp = TempDir::new("edit-context");
+        fs::write(
+            temp.path().join("file.txt"),
+            "alpha\nlet value = current_call(foo);\nomega\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let error = runtime
+            .edit_file(
+                "file.txt",
+                "let value = previous_call(foo);",
+                "let value = next_call(foo);",
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Target preview"));
+        assert!(error.contains("previous_call"));
+    }
+
+    #[test]
     fn edit_file_is_idempotent_when_replacement_already_exists() {
         let temp = TempDir::new("edit-idempotent");
         fs::write(temp.path().join("file.txt"), "new\n").unwrap();
@@ -2923,6 +2935,28 @@ mod tests {
             "new\n"
         );
         assert!(!temp.path().join("old.txt").exists());
+    }
+
+    #[test]
+    fn apply_patch_creates_new_file() {
+        let temp = TempDir::new("canonical-apply-patch-add");
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = "\
+*** Begin Patch
+*** Add File: src/new_file.rs
++fn main() {
++    println!(\"hello\");
++}
+*** End Patch
+";
+
+        let result = runtime.apply_patch(patch).unwrap();
+
+        assert_eq!(result.name, ToolName::ApplyPatch);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("src/new_file.rs")).unwrap(),
+            "fn main() {\n    println!(\"hello\");\n}\n"
+        );
     }
 
     struct TempDir {

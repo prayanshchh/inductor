@@ -449,6 +449,26 @@ fn execute_tool_call_dispatches_structured_patch() {
     );
 }
 
+#[test]
+fn execute_tool_call_dispatches_apply_patch() {
+    let temp = TempDir::new("dispatch-apply-patch");
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let call = ParsedToolCall {
+        name: "apply_patch".to_string(),
+        input: json!({
+            "patch": "*** Begin Patch\n*** Add File: hello.txt\n+hello inductor\n*** End Patch\n"
+        }),
+    };
+    let result = execute_tool_call(&runtime, &call).unwrap();
+
+    assert_eq!(result.name.as_str(), "apply_patch");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "hello inductor\n"
+    );
+}
+
 #[tokio::test]
 async fn execute_tool_call_cancels_bash() {
     let temp = TempDir::new("dispatch-cancel-bash");

@@ -112,10 +112,12 @@ You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your 
 Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
-- Prefer edit_file or multi_edit over write_file when changing existing files.\n\
-- Exact edit tools reject binary files, stale expected_hash values, and non-unique matches.\n\
+- Use apply_patch for all file changes, including creating new files with *** Add File.\n\
+- Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
 - Emit at most one envelope per reply. After a tool result is returned, continue.\n\
-- When you have the final answer and need no more tools, reply with prose and NO envelope.",
+- Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.\n\
+- In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.\n\
+- When you have the final answer and need no more tools, reply with concise prose and NO envelope.",
         tools::tool_prompt_docs()
     )
 }
@@ -335,6 +337,9 @@ pub fn execute_tool_call(
                 }
             })?;
             tools.multi_edit(path, &edits, optional_string_field(input, "expected_hash"))
+        }
+        name if name == ToolName::ApplyPatch.as_str() => {
+            tools.apply_patch(string_field(input, "patch", name)?)
         }
         name if name == ToolName::ApplyPatchFreeform.as_str() => {
             tools.apply_patch_freeform(string_field(input, "patch", name)?)
@@ -1211,6 +1216,12 @@ fn tool_target_paths(call: &ParsedToolCall) -> Vec<String> {
         "write_file" | "edit_file" | "multi_edit" => optional_string_field(&call.input, "path")
             .map(|path| vec![path.to_string()])
             .unwrap_or_default(),
+        "apply_patch" | "apply_patch_freeform" => call
+            .input
+            .get("patch")
+            .and_then(Value::as_str)
+            .map(patch_paths_from_text)
+            .unwrap_or_default(),
         "apply_patch_structured" => structured_patch_paths(&call.input),
         _ => Vec::new(),
     }
@@ -1374,6 +1385,15 @@ fn get_outside_path(call: &ParsedToolCall) -> Option<String> {
                 .filter(|path| path.starts_with('/') || path.contains(".."))
                 .map(str::to_string)
         }
+        "apply_patch" | "apply_patch_freeform" => call
+            .input
+            .get("patch")
+            .and_then(Value::as_str)
+            .and_then(|patch| {
+                patch_paths_from_text(patch)
+                    .into_iter()
+                    .find(|path| path.starts_with('/') || path.contains(".."))
+            }),
         "apply_patch_structured" => {
             if let Some(operations) = call.input.get("operations").and_then(Value::as_array) {
                 for operation in operations {
@@ -1392,6 +1412,22 @@ fn get_outside_path(call: &ParsedToolCall) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn patch_paths_from_text(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("*** Add File: ")
+                .or_else(|| line.strip_prefix("*** Update File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "))
+                .or_else(|| line.strip_prefix("--- a/"))
+                .or_else(|| line.strip_prefix("+++ b/"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && *path != "/dev/null")
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn execution_needs_unlocked_access(call: &ParsedToolCall, risk_flags: &[RiskFlag]) -> bool {
@@ -2073,16 +2109,18 @@ fn parse_multimodal_prompt(prompt: &str) -> MultimodalPrompt {
 const NATIVE_TOOLS_PREAMBLE: &str = "\
 You are an Inductor coding agent working directly in the user's workspace. Use \
 your tools to read, edit, and create files and run commands. Don't ask for \
-permission to use tools or mention any tool-call format — just do the work. Keep \
-explanations concise.
+permission to use tools or mention any tool-call format — just do the work.
 
 Working rules:
 - Inspect relevant files before changing code; do not guess codebase structure.
 - Prefer the smallest correct change that follows existing local patterns.
 - Never revert or overwrite unrelated user changes.
 - Continue after tool results until the task is complete, blocked, or clearly needs user input.
-- Use precise edits for existing files and run focused verification when practical.
-- Final responses should state the outcome and any verification performed without extra preamble.";
+- Use apply_patch for all file changes, including creating new files with *** Add File. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Run focused verification when practical.
+- Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.
+- In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.
+- Final responses should state the outcome, changed files, and verification performed.";
 
 #[derive(Debug, Clone)]
 struct SystemEnvironment {

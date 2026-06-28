@@ -615,6 +615,8 @@ export function App(props: AppProps) {
     input.cursorOffset = next.cursorOffset
     updateDraft(next.value)
     return true
+  }
+
   function dismissPalette() {
     setPalette(undefined)
     setMention(undefined)
@@ -2333,7 +2335,7 @@ function Composer(props: {
             focusedTextColor={theme.text}
             focusedBackgroundColor={theme.surface3}
             cursorColor={theme.cyan}
-            cursorStyle={{ style: "block", blinking: true }}
+            cursorStyle={{ style: "block", blinking: false }}
             selectionBg={theme.selectionBg}
             selectionFg={theme.text}
             keyBindings={[

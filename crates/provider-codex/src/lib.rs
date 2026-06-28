@@ -58,7 +58,11 @@ impl CodexProvider {
             "model": normalize_codex_model(&req.model),
             "instructions": req.system_prompt.as_deref().unwrap_or("You are an Inductor coding agent working in the user's workspace. \
                 Use the provided tools to read, edit, and create files and run commands. Don't \
-                describe a tool-call format — just call the tools. Keep explanations concise."),
+                describe a tool-call format — just call the tools. Keep the user informed with \
+                brief milestone updates, especially before new phases, after tool failures, and \
+                before verification. In progress updates, share a concise public reasoning \
+                summary: what you are checking, what evidence you found, why the next step \
+                follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought."),
             "input": input,
             "tools": codex_tools(),
             "tool_choice": "auto",
@@ -1172,11 +1176,13 @@ data: [DONE]
         let provider = CodexProvider::with_base_url("https://example.test").unwrap();
         let body = provider.request_body(&text_request("hi"));
         let tools = body["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|t| t["name"] == "write_file"));
         assert!(tools.iter().any(|t| t["name"] == "list_dir"));
         assert!(tools.iter().any(|t| t["name"] == "glob"));
-        assert!(tools.iter().any(|t| t["name"] == "multi_edit"));
-        assert!(tools.iter().any(|t| t["name"] == "apply_patch_structured"));
+        assert!(tools.iter().any(|t| t["name"] == "apply_patch"));
+        assert!(!tools.iter().any(|t| t["name"] == "write_file"));
+        assert!(!tools.iter().any(|t| t["name"] == "edit_file"));
+        assert!(!tools.iter().any(|t| t["name"] == "multi_edit"));
+        assert!(!tools.iter().any(|t| t["name"] == "apply_patch_structured"));
         assert!(tools.iter().any(|t| t["name"] == "web_fetch"));
         assert!(tools.iter().any(|t| t["name"] == "todo_write"));
         assert!(tools.iter().any(|t| t["name"] == "bash"));
