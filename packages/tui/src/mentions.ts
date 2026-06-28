@@ -16,6 +16,7 @@ export type FileChoice = {
 }
 
 export type PromptImageAttachment = { label: string; path: string }
+export type PromptTextAttachment = { label: string; text: string }
 
 const ignoredDirs = new Set([".git", "node_modules", "target"])
 const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"])
@@ -90,9 +91,12 @@ export function pastedImageName(index: number, extension = ".png") {
   return `pasted-image-${index}${extension}`
 }
 
-export function promptForSubmit(value: string, images: PromptImageAttachment[]) {
-  if (images.length === 0) return value
+export function promptForSubmit(value: string, images: PromptImageAttachment[], pastedTexts: PromptTextAttachment[] = []) {
+  if (images.length === 0 && pastedTexts.length === 0) return value
   let prompt = value
+  for (const paste of pastedTexts) {
+    prompt = prompt.replace(paste.label, paste.text)
+  }
   for (const image of images) {
     prompt = prompt.replace(image.label, `${image.label} @${image.path}`)
   }

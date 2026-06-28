@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { insertTextAtCursor, parsePromptHistory, PROMPT_HISTORY_LIMIT, recordPromptHistory, serializePromptHistory, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
+import { insertTextAtCursor, parsePromptHistory, PROMPT_HISTORY_LIMIT, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
 
 describe("prompt input helpers", () => {
   test("inserts ctrl-j newline at the cursor", () => {
@@ -57,5 +57,11 @@ describe("prompt input helpers", () => {
     const restored = parsePromptHistory(serializePromptHistory(entries))
     expect(restored.length).toBe(PROMPT_HISTORY_LIMIT)
     expect(restored.at(-1)).toBe(`cmd ${PROMPT_HISTORY_LIMIT + 49}`)
+  })
+
+  test("compacts only medium-long pasted text", () => {
+    expect(shouldCompactPastedText("short paste")).toBe(false)
+    expect(shouldCompactPastedText("x".repeat(501))).toBe(true)
+    expect(shouldCompactPastedText(Array.from({ length: 9 }, (_, i) => `line ${i}`).join("\n"))).toBe(true)
   })
 })
