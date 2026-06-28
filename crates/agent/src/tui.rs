@@ -287,6 +287,25 @@ struct Palette {
     index: usize,
 }
 
+const COMMANDS: [&str; 11] = [
+    "/model",
+    "/effort",
+    "/usage",
+    "/fast",
+    "/sessions",
+    "/resume",
+    "/permissions",
+    "/pr",
+    "/compact",
+    "/clear",
+    "/help",
+];
+
+fn is_command_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    prompt.starts_with('/') && !prompt.contains(char::is_whitespace) && COMMANDS.contains(&trimmed)
+}
+
 /// All `(provider, model)` pairs offered by `/model` — Claude and OpenAI
 /// models together. The model string passes straight to `--model`.
 fn model_catalog() -> Vec<(&'static str, &'static str)> {
@@ -1256,18 +1275,12 @@ impl App {
                     self.palette = None;
                     return false;
                 }
-                _ => {
-                    // Value pickers (models/efforts) are not text-filtered, so
-                    // swallow any other key.
-                    if matches!(
-                        self.palette.as_ref().map(|p| p.kind),
-                        Some(PaletteKind::Models)
-                            | Some(PaletteKind::Efforts)
-                            | Some(PaletteKind::PrActions)
-                    ) {
-                        return false;
+                KeyCode::Char(_) if self.palette.is_some() => {
+                    if matches!(self.palette.as_ref().map(|p| p.kind), Some(PaletteKind::Models)) {
+                        self.palette = None;
                     }
                 }
+                _ => {}
             }
         }
 
@@ -1360,23 +1373,11 @@ impl App {
     }
 
     fn open_commands(&mut self) {
-        let items: Vec<String> = [
-            "/model",
-            "/effort",
-            "/usage",
-            "/fast",
-            "/sessions",
-            "/resume",
-            "/permissions",
-            "/pr",
-            "/compact",
-            "/clear",
-            "/help",
-        ]
-        .iter()
-        .filter(|c| c.starts_with(self.prompt.as_str()))
-        .map(|c| c.to_string())
-        .collect();
+        let items: Vec<String> = COMMANDS
+            .iter()
+            .filter(|c| c.starts_with(self.prompt.as_str()))
+            .map(|c| c.to_string())
+            .collect();
         self.palette = (!items.is_empty()).then_some(Palette {
             kind: PaletteKind::Commands,
             items,
@@ -2745,8 +2746,10 @@ fn render_palette_popup(frame: &mut Frame<'_>, app: &App, composer: Rect) {
         PaletteKind::Permissions => "approval policy · ↑↓ enter",
         PaletteKind::PrActions => "create PR · ↑↓ enter",
     };
-    let rows = palette.items.len() as u16;
-    let height = (rows + 2).min(10);
+    let visible_rows = palette.items.len().min(8);
+    let extra_rows = usize::from(palette.index > 0)
+        + usize::from(palette.index + visible_rows < palette.items.len());
+    let height = (visible_rows + extra_rows + 2).min(12) as u16;
     // Session rows carry a preview, so give them more room.
     let cap = if palette.kind == PaletteKind::Sessions {
         100
@@ -2761,10 +2764,30 @@ fn render_palette_popup(frame: &mut Frame<'_>, app: &App, composer: Rect) {
         height,
     };
 
-    let items = palette
+    let start = if palette.items.len() <= visible_rows {
+        0
+    } else {
+        palette
+            .index
+            .saturating_sub(visible_rows / 2)
+            .min(palette.items.len() - visible_rows)
+    };
+    let hidden_before = start;
+    let hidden_after = palette.items.len().saturating_sub(start + visible_rows);
+
+    let mut items = Vec::new();
+    if hidden_before > 0 {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  ↑ {hidden_before} more"),
+            Style::default().fg(theme::MUTED),
+        ))));
+    }
+    items.extend(palette
         .items
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible_rows)
         .map(|(i, item)| {
             let selected = i == palette.index;
             // Mark the current model/effort/permission.
@@ -2792,8 +2815,13 @@ fn render_palette_popup(frame: &mut Frame<'_>, app: &App, composer: Rect) {
                 ),
                 Span::styled(item.clone(), style),
             ]))
-        })
-        .collect::<Vec<_>>();
+        }));
+    if hidden_after > 0 {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  ↓ {hidden_after} more"),
+            Style::default().fg(theme::MUTED),
+        ))));
+    }
 
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -3730,7 +3758,11 @@ fn render_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 if w > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let style = if word.starts_with('@') {
+                let style = if is_command_prompt(&app.prompt) && i == 0 && word == app.prompt.trim() {
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else if word.starts_with('@') {
                     let path = word.trim_start_matches('@');
                     if is_image_file(path) {
                         // Style image mentions differently (e.g., with a different color)
@@ -4895,10 +4927,65 @@ mod tests {
     fn slash_opens_command_palette() {
         let ws = workspace_with_files();
         let mut app = app_in(&ws);
-        type_str(&mut app, "/mod");
+        type_str(&mut app, "/");
         let palette = app.palette.as_ref().unwrap();
         assert_eq!(palette.kind, PaletteKind::Commands);
         assert!(palette.items.iter().any(|c| c == "/model"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn slash_palette_filters_while_typing() {
+        let ws = workspace_with_files();
+        let mut app = app_in(&ws);
+        type_str(&mut app, "/mo");
+        let palette = app.palette.as_ref().unwrap();
+        assert_eq!(palette.kind, PaletteKind::Commands);
+        assert_eq!(palette.items, vec!["/model".to_string()]);
+
+        type_str(&mut app, "del");
+        let palette = app.palette.as_ref().unwrap();
+        assert_eq!(palette.items, vec!["/model".to_string()]);
+        assert!(is_command_prompt(&app.prompt));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn slash_palette_closes_when_no_commands_match_or_escape() {
+        let ws = workspace_with_files();
+        let mut app = app_in(&ws);
+        type_str(&mut app, "/");
+        assert_eq!(app.palette.as_ref().unwrap().kind, PaletteKind::Commands);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.palette.is_none());
+
+        app.clear_prompt();
+        type_str(&mut app, "/");
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.palette.is_none());
+        assert!(!app.esc_armed);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn model_picker_closes_on_text_or_escape() {
+        let ws = workspace_with_files();
+        let mut app = app_in(&ws);
+        type_str(&mut app, "/");
+        app.popup_accept();
+        assert_eq!(app.palette.as_ref().unwrap().kind, PaletteKind::Models);
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.palette.is_none());
+
+        app.clear_prompt();
+        type_str(&mut app, "/");
+        app.popup_accept();
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.palette.is_none());
+        assert!(!app.esc_armed);
         let _ = std::fs::remove_dir_all(&ws);
     }
 

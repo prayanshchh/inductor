@@ -184,7 +184,9 @@ const syntaxStyle = SyntaxStyle.fromTheme([
   { scope: ["markup.bold"], style: { foreground: theme.text, bold: true } },
   { scope: ["markup.italic"], style: { foreground: theme.yellow, italic: true } },
   { scope: ["markup.raw", "code"], style: { foreground: theme.green } },
+  { scope: ["inductor.command"], style: { foreground: theme.cyan, bold: true } },
 ])
+const commandHighlightStyle = syntaxStyle.getStyleId("inductor.command")
 
 function loadPromptHistoryFile(filePath: string): string[] {
   try {
@@ -579,9 +581,24 @@ export function App(props: AppProps) {
       setPalette(undefined)
       setSelected(0)
     }
-    if (value.startsWith("/")) openPalette("commands")
-    if (!value.startsWith("/") && palette() === "commands") setPalette(undefined)
+    if (value.startsWith("/") && !/\s/.test(value)) {
+      const hasMatches = commands.some((command) => command.name.startsWith(value))
+      if (hasMatches) openPalette("commands")
+      else if (palette() === "commands") {
+        setPalette(undefined)
+        setSelected(0)
+      }
+    } else if (palette() === "commands") {
+      setPalette(undefined)
+      setSelected(0)
+    }
     void normalizeImagePathPaste(value)
+  }
+
+  function dismissPalette() {
+    setPalette(undefined)
+    setMention(undefined)
+    setSelected(0)
   }
 
   function recordHistory(value: string) {
@@ -1379,6 +1396,7 @@ export function App(props: AppProps) {
           paletteItems={paletteItems}
           selected={selected}
           moveSelection={moveSelection}
+          dismissPalette={dismissPalette}
           acceptPalette={acceptPalette}
           choosePalette={choosePalette}
           openPalette={openPalette}
@@ -2203,6 +2221,7 @@ function Composer(props: {
   paletteItems: () => readonly PaletteItem[]
   selected: () => number
   moveSelection: (delta: number) => void
+  dismissPalette: () => void
   acceptPalette: (insertDirectory?: boolean) => void
   choosePalette: (index: number) => void
   openPalette: (kind: PaletteKind) => void
@@ -2271,8 +2290,18 @@ function Composer(props: {
             cursorColor={theme.cyan}
             selectionBg={theme.selectionBg}
             selectionFg={theme.text}
+            syntaxStyle={syntaxStyle}
             keyBindings={[{ name: "j", ctrl: true, action: "newline" }]}
-            onContentChange={() => props.setDraft(textarea.plainText)}
+            onContentChange={() => {
+              const value = textarea.plainText
+              const trimmed = value.trim()
+              textarea.clearAllHighlights()
+              if (commandHighlightStyle !== null && commands.some((command) => command.name === trimmed)) {
+                const start = value.indexOf(trimmed)
+                textarea.addHighlightByCharRange({ start, end: start + trimmed.length, styleId: commandHighlightStyle, priority: 10 })
+              }
+              props.setDraft(value)
+            }}
             onSubmit={props.submit}
             onPaste={async (event: { bytes?: Uint8Array; preventDefault(): void }) => {
               const text = decodePasteBytes(event.bytes).replace(/\r\n/g, "\n").replace(/\r/g, "\n")
@@ -2294,6 +2323,12 @@ function Composer(props: {
               const meta = Boolean(event.metaKey || event.meta || event.super)
               const permissionNav = key === "ArrowUp" || key === "up" || key === "ArrowDown" || key === "down" || key === "Enter" || key === "enter" || key === "return"
               if (props.state.pendingPermission && permissionNav) return
+              if (props.palette() && (key === "Escape" || key === "Esc" || key === "escape" || key === "esc")) {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.dismissPalette()
+                return
+              }
               if (props.palette() && (key === "ArrowUp" || key === "up")) {
                 event.preventDefault()
                 event.stopPropagation?.()
@@ -2310,6 +2345,12 @@ function Composer(props: {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.acceptPalette(Boolean(meta || ctrl))
+                return
+              }
+              if (props.palette() === "models") {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.dismissPalette()
                 return
               }
               if (!props.palette() && (meta || ctrl) && normalized === "v") {
@@ -2378,6 +2419,15 @@ function Palette(props: {
   selected: number
   choose: (index: number) => void
 }) {
+  const maxRows = () => props.kind === "models" ? 10 : 14
+  const startIndex = () => {
+    const rows = maxRows()
+    if (props.items.length <= rows) return 0
+    return Math.min(Math.max(0, props.selected - Math.floor(rows / 2)), props.items.length - rows)
+  }
+  const visibleItems = () => props.items.slice(startIndex(), startIndex() + maxRows())
+  const hiddenBefore = () => startIndex()
+  const hiddenAfter = () => Math.max(0, props.items.length - startIndex() - visibleItems().length)
   return (
     <box
       width="100%"
@@ -2391,15 +2441,19 @@ function Palette(props: {
       paddingBottom={1}
       marginBottom={1}
     >
-      <For each={props.items}>
+      <Show when={hiddenBefore() > 0}>
+        <text fg={theme.dim}>  ↑ {hiddenBefore()} more</text>
+      </Show>
+      <For each={visibleItems()}>
         {(item, index) => {
-          const selected = () => index() === props.selected
+          const absoluteIndex = () => startIndex() + index()
+          const selected = () => absoluteIndex() === props.selected
           return (
             <box
               flexDirection="row"
               backgroundColor={selected() ? theme.paletteSelected : theme.palette}
               paddingLeft={1}
-              onMouseUp={() => props.choose(index())}
+              onMouseUp={() => props.choose(absoluteIndex())}
             >
               <text width={18} fg={selected() ? theme.cyan : theme.text} attributes={selected() ? TextAttributes.BOLD : undefined}>
                 {paletteItemLabel(item)}
@@ -2411,6 +2465,9 @@ function Palette(props: {
           )
         }}
       </For>
+      <Show when={hiddenAfter() > 0}>
+        <text fg={theme.dim}>  ↓ {hiddenAfter()} more · use ↑↓ to scroll</text>
+      </Show>
     </box>
   )
 }
