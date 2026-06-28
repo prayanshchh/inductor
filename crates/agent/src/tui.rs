@@ -2455,14 +2455,18 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
     // The composer grows with the prompt so long / multi-line input wraps onto
     // additional rows instead of being clipped.
-    let prompt_rows = prompt_visual_rows(&app.prompt, prompt_text_width(frame.area().width));
+    let prompt_rows = prompt_visual_rows(
+        &app.prompt,
+        prompt_text_width(frame.area().width),
+        max_prompt_rows(frame.area().height),
+    );
     let composer_height = 2 /* borders */ + prompt_rows as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(3),
+            Constraint::Min(MIN_CONVERSATION_ROWS),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -3659,24 +3663,33 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     render_prompt(frame, app, area);
 }
 
-/// Max visible rows the prompt box grows to before scrolling within itself.
-const MAX_PROMPT_ROWS: usize = 8;
+/// Max visible rows reserved for conversation while the prompt grows.
+const MIN_CONVERSATION_ROWS: u16 = 3;
 /// Columns reserved for the `› ` prompt prefix on each row.
 const PROMPT_PREFIX_COLS: u16 = 2;
+/// Horizontal columns consumed by prompt borders and padding before text starts.
+const PROMPT_HORIZONTAL_CHROME: u16 = 2 /* block borders */ + 2 /* horizontal padding */;
+
+/// Maximum prompt rows that can fit while keeping the header, conversation, and status visible.
+fn max_prompt_rows(frame_height: u16) -> usize {
+    frame_height
+        .saturating_sub(1 /* header */ + MIN_CONVERSATION_ROWS + 1 /* status */ + 2 /* prompt borders */)
+        .max(1) as usize
+}
 
 /// Usable text width inside the prompt box for a given frame width.
 fn prompt_text_width(frame_width: u16) -> usize {
     frame_width
-        .saturating_sub(2 /* block borders */ + PROMPT_PREFIX_COLS)
+        .saturating_sub(PROMPT_HORIZONTAL_CHROME + PROMPT_PREFIX_COLS)
         .max(1) as usize
 }
 
-/// Number of visual rows the prompt occupies once wrapped (clamped to the box).
-fn prompt_visual_rows(text: &str, width: usize) -> usize {
+/// Number of visual rows the prompt occupies once wrapped (clamped to available space).
+fn prompt_visual_rows(text: &str, width: usize, max_rows: usize) -> usize {
     layout_prompt(text, 0, width)
         .0
         .len()
-        .clamp(1, MAX_PROMPT_ROWS)
+        .clamp(1, max_rows.max(1))
 }
 
 /// Wrap `text` into visual rows of at most `width` columns, breaking on explicit
@@ -4973,9 +4986,11 @@ mod tests {
     #[test]
     fn long_prompt_wraps_to_multiple_rows() {
         let text = "a".repeat(25);
-        assert_eq!(prompt_visual_rows(&text, 10), 3);
+        assert_eq!(prompt_text_width(14), 10);
+        assert_eq!(prompt_visual_rows(&text, 10, 99), 3);
+        assert_eq!(prompt_visual_rows(&text, 10, 2), 2);
         // Explicit newlines also add rows.
-        assert_eq!(prompt_visual_rows("a\nb\nc", 80), 3);
+        assert_eq!(prompt_visual_rows("a\nb\nc", 80, 99), 3);
         // Cursor at end of a full row lands on the right coordinates.
         let (rows, (r, c)) = layout_prompt("abcde", 5, 5);
         assert_eq!(rows.len(), 1);
