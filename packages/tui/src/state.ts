@@ -148,7 +148,9 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
         ...state,
         pendingQuestions: undefined,
         status: "running_tools",
-        transcript: [...state.transcript, questionAnswersTranscript(event.answers)],
+        transcript: hasQuestionAnswersTranscript(state.transcript, event.answers)
+          ? state.transcript
+          : [...state.transcript, questionAnswersTranscript(event.answers)],
       }
     case "permission_resolved":
       return { ...state, pendingPermission: undefined, status: "running_tools" }
@@ -298,7 +300,9 @@ export function applyQuestionAnswers(state: AppState, answers: QuestionAnswer[])
     ...state,
     pendingQuestions: undefined,
     status: "running_tools",
-    transcript: [...state.transcript, questionAnswersTranscript(answers)],
+    transcript: hasQuestionAnswersTranscript(state.transcript, answers)
+      ? state.transcript
+      : [...state.transcript, questionAnswersTranscript(answers)],
   }
 }
 
@@ -319,10 +323,20 @@ function applyTodoWrite(state: AppState, inputJson: unknown): AppState {
 
 function questionAnswersTranscript(answers: unknown): TranscriptItem {
   const list = Array.isArray(answers) ? answers as QuestionAnswer[] : []
-  const text = list.length > 0
+  const text = questionAnswersText(list)
+  return { id: nextId("questions"), kind: "user", text }
+}
+
+function hasQuestionAnswersTranscript(transcript: TranscriptItem[], answers: unknown) {
+  const last = transcript.at(-1)
+  return last?.kind === "user" && last.text === questionAnswersText(answers)
+}
+
+function questionAnswersText(answers: unknown) {
+  const list = Array.isArray(answers) ? answers as QuestionAnswer[] : []
+  return list.length > 0
     ? list.map((answer, index) => `Q${index + 1}: ${answer.question}\nA${index + 1}: ${answer.answer}`).join("\n\n")
     : "No question answers submitted"
-  return { id: nextId("questions"), kind: "user", text }
 }
 
 function appendAssistantText(state: AppState, text: string): AppState {

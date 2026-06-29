@@ -309,6 +309,7 @@ export function App(props: AppProps) {
   const [permissionSelected, setPermissionSelected] = createSignal(0)
   const [questionIndex, setQuestionIndex] = createSignal(0)
   const [questionAnswers, setQuestionAnswers] = createStore<Record<string, string>>({})
+  const [questionCustomDrafts, setQuestionCustomDrafts] = createStore<Record<string, string>>({})
   const [questionSelected, setQuestionSelected] = createStore<Record<string, number>>({})
   const [questionWarning, setQuestionWarning] = createSignal("")
   const promptHistoryPath = path.join(props.workspace, ".inductor", "prompt-history.json")
@@ -328,7 +329,7 @@ export function App(props: AppProps) {
   const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
   const dimensions = useTerminalDimensions()
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
-  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || Boolean(fstate().pendingPermission))
+  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
   // Full filesystem path the focused agent runs in: its managed worktree when
   // one exists, otherwise the workspace Inductor was opened in.
   const focusedWorktreePath = createMemo(() => {
@@ -1263,6 +1264,7 @@ export function App(props: AppProps) {
     setQuestionIndex(0)
     setQuestionWarning("")
     for (const key of Object.keys(questionAnswers)) setQuestionAnswers(key, undefined as unknown as string)
+    for (const key of Object.keys(questionCustomDrafts)) setQuestionCustomDrafts(key, undefined as unknown as string)
     for (const key of Object.keys(questionSelected)) setQuestionSelected(key, undefined as unknown as number)
     ;(questions ?? []).forEach((question, index) => {
       const recommended = question.recommended
@@ -1280,42 +1282,76 @@ export function App(props: AppProps) {
     const key = permissionKey(event)
     const current = pending.questions[questionIndex()]
     const options = current?.options ?? []
-    if (key === "arrowright" || key === "right") {
+    const customIndex = options.length
+    const optionCount = options.length + 1
+    const selectedForCurrent = () => Math.min(questionSelected[String(questionIndex())] ?? 0, optionCount - 1)
+    if (key === "arrowright" || key === "right" || key === "tab") {
       setQuestionIndex((index) => Math.min(pending.questions.length - 1, index + 1))
       setQuestionWarning("")
       return true
     }
-    if (key === "arrowleft" || key === "left") {
+    if (key === "arrowleft" || key === "left" || key === "shifttab") {
       setQuestionIndex((index) => Math.max(0, index - 1))
       setQuestionWarning("")
       return true
     }
     if (key === "arrowup" || key === "up" || key === "k") {
-      const total = options.length + 1
-      setQuestionSelected(String(questionIndex()), (((questionSelected[String(questionIndex())] ?? 0) + total - 1) % total))
+      setQuestionSelected(String(questionIndex()), (selectedForCurrent() + optionCount - 1) % optionCount)
+      setQuestionWarning("")
       return true
     }
     if (key === "arrowdown" || key === "down" || key === "j") {
-      const total = options.length + 1
-      setQuestionSelected(String(questionIndex()), ((questionSelected[String(questionIndex())] ?? 0) + 1) % total)
+      setQuestionSelected(String(questionIndex()), (selectedForCurrent() + 1) % optionCount)
+      setQuestionWarning("")
       return true
     }
-    if (/^[1-9]$/.test(key)) {
-      const selected = Number(key) - 1
-      if (selected < options.length) {
-        setQuestionSelected(String(questionIndex()), selected)
-        setQuestionAnswers(String(questionIndex()), options[selected]?.label ?? "")
-      } else if (selected === options.length) {
-        setQuestionSelected(String(questionIndex()), selected)
+    const typed = questionPrintableKey(event, key)
+    if (typed) {
+      const selected = selectedForCurrent()
+      if (selected === customIndex) {
+        setQuestionCustomDrafts(String(questionIndex()), `${questionCustomDrafts[String(questionIndex())] ?? ""}${typed}`)
+        setQuestionWarning("")
       }
       return true
     }
-    if ((key === "enter" || key === "return" || key === "\r" || key === "\n") && questionIndex() < pending.questions.length - 1) {
-      setQuestionIndex((index) => index + 1)
+    if (key === "backspace" || key === "delete") {
+      const selected = selectedForCurrent()
+      if (selected === customIndex) {
+        const currentDraft = questionCustomDrafts[String(questionIndex())] ?? ""
+        setQuestionCustomDrafts(String(questionIndex()), key === "delete" ? "" : currentDraft.slice(0, -1))
+        setQuestionWarning("")
+        return true
+      }
+    }
+    if (/^[1-9]$/.test(key)) {
+      const selected = Number(key) - 1
+      if (selected < optionCount) {
+        setQuestionSelected(String(questionIndex()), selected)
+        if (selected < options.length) setQuestionAnswers(String(questionIndex()), options[selected]?.label ?? "")
+        setQuestionWarning("")
+      }
       return true
     }
     if (key === "enter" || key === "return" || key === "\r" || key === "\n") {
-      submitQuestions()
+      const index = questionIndex()
+      const selected = selectedForCurrent()
+      const customAnswer = (questionCustomDrafts[String(index)] ?? "").trim()
+      if (selected === customIndex) {
+        if (!customAnswer) {
+          setQuestionWarning("Write a custom answer in the box below Custom answer, or choose an option")
+          return true
+        }
+        setQuestionAnswers(String(index), customAnswer)
+      } else {
+        const optionAnswer = options[selected]?.label ?? ""
+        if (optionAnswer) setQuestionAnswers(String(index), optionAnswer)
+      }
+      if (index < pending.questions.length - 1) {
+        setQuestionIndex((currentIndex) => currentIndex + 1)
+        setQuestionWarning("")
+      } else {
+        submitQuestions()
+      }
       return true
     }
     return false
@@ -1325,10 +1361,22 @@ export function App(props: AppProps) {
     const pending = fstate().pendingQuestions
     const run = runs.get(store.focusedKey)
     if (!pending || !run) return
-    const answers = pending.questions.map((question, index) => ({
-      question: question.question ?? `Question ${index + 1}`,
-      answer: (questionAnswers[String(index)] ?? "").trim(),
-    }))
+    const focusedIndex = questionIndex()
+    const focusedOptions = pending.questions[focusedIndex]?.options ?? []
+    if ((questionSelected[String(focusedIndex)] ?? 0) === focusedOptions.length) {
+      const custom = (questionCustomDrafts[String(focusedIndex)] ?? "").trim()
+      if (custom) setQuestionAnswers(String(focusedIndex), custom)
+    }
+    const answers = pending.questions.map((question, index) => {
+      const options = question.options ?? []
+      const selected = Math.min(questionSelected[String(index)] ?? 0, options.length)
+      const optionAnswer = selected < options.length ? options[selected]?.label ?? "" : ""
+      const customAnswer = selected === options.length ? (questionCustomDrafts[String(index)] ?? "").trim() : ""
+      return {
+        question: question.question ?? `Question ${index + 1}`,
+        answer: (questionAnswers[String(index)] || customAnswer || optionAnswer).trim(),
+      }
+    })
     const missing = answers.findIndex((answer) => !answer.answer)
     if (missing >= 0) {
       setQuestionIndex(missing)
@@ -1481,11 +1529,22 @@ export function App(props: AppProps) {
                 <Timeline
                   items={fstate().transcript}
                   pendingPermission={fstate().pendingPermission}
+                  pendingQuestions={fstate().pendingQuestions}
                   running={fstate().running}
                   runningStatus={fstate().status}
                   activityGlyph={runningGlyph(now())}
                   permissionSelected={permissionSelected()}
                   selectPermission={setPermissionSelected}
+                  questionIndex={questionIndex()}
+                  questionAnswers={questionAnswers}
+                  questionCustomDrafts={questionCustomDrafts}
+                  questionSelected={questionSelected}
+                  questionWarning={questionWarning()}
+                  setQuestionAnswer={(index, value) => setQuestionAnswers(String(index), value)}
+                  setQuestionCustomDraft={(index, value) => setQuestionCustomDrafts(String(index), value)}
+                  setQuestionSelected={(index, value) => setQuestionSelected(String(index), value)}
+                  setQuestionIndex={setQuestionIndex}
+                  submitQuestions={submitQuestions}
                   expanded={expanded()}
                   toggleExpanded={toggleExpanded}
                   decide={decide}
@@ -1502,14 +1561,6 @@ export function App(props: AppProps) {
             contextPercent={contextPercent()}
             mode={mode()}
             branch={activeBranch()}
-            questionIndex={questionIndex()}
-            questionAnswers={questionAnswers}
-            questionSelected={questionSelected}
-            questionWarning={questionWarning()}
-            setQuestionAnswer={(index, value) => setQuestionAnswers(String(index), value)}
-            setQuestionSelected={(index, value) => setQuestionSelected(String(index), value)}
-            setQuestionIndex={setQuestionIndex}
-            submitQuestions={submitQuestions}
             openModifiedFile={openModifiedFile}
           />
         </box>
@@ -1981,6 +2032,14 @@ function permissionKey(event: KeyEvent) {
   return (event.name || event.sequence || "").toLowerCase()
 }
 
+function questionPrintableKey(event: KeyEvent, key: string) {
+  if (event.ctrl || event.meta) return ""
+  if (event.sequence && event.sequence.length === 1 && event.sequence >= " " && event.sequence !== "\x7f") return event.sequence
+  if (key.length === 1 && key >= " " && key !== "\x7f") return key
+  if (key === "space") return " "
+  return ""
+}
+
 function StartScreen(_props: { height: number }) {
   return (
     <box flexGrow={1} height="100%" flexDirection="column" alignItems="center" justifyContent="center">
@@ -2006,11 +2065,22 @@ function StartScreen(_props: { height: number }) {
 function Timeline(props: {
   items: TranscriptItem[]
   pendingPermission?: AppState["pendingPermission"]
+  pendingQuestions?: AppState["pendingQuestions"]
   running: boolean
   runningStatus: string
   activityGlyph: string
   permissionSelected: number
   selectPermission: (index: number) => void
+  questionIndex: number
+  questionAnswers: Record<string, string>
+  questionCustomDrafts: Record<string, string>
+  questionSelected: Record<string, number>
+  questionWarning: string
+  setQuestionAnswer: (index: number, value: string) => void
+  setQuestionCustomDraft: (index: number, value: string) => void
+  setQuestionSelected: (index: number, value: number) => void
+  setQuestionIndex: (index: number) => void
+  submitQuestions: () => void
   expanded: Set<string>
   toggleExpanded: (id: string) => void
   decide: (decision: PermissionDecision) => void
@@ -2026,10 +2096,27 @@ function Timeline(props: {
           />
         )}
       </For>
+      <Show when={props.pendingQuestions}>
+        {(pending) => (
+          <QuestionTimelineItem
+            questions={pending().questions}
+            index={props.questionIndex}
+            answers={props.questionAnswers}
+            customDrafts={props.questionCustomDrafts}
+            selected={props.questionSelected}
+            warning={props.questionWarning}
+            setAnswer={props.setQuestionAnswer}
+            setCustomDraft={props.setQuestionCustomDraft}
+            setSelected={props.setQuestionSelected}
+            setIndex={props.setQuestionIndex}
+            submit={props.submitQuestions}
+          />
+        )}
+      </Show>
       <Show when={props.pendingPermission}>
         {(request) => <PermissionTimelineItem request={request()} selected={props.permissionSelected} select={props.selectPermission} decide={props.decide} />}
       </Show>
-      <Show when={props.running && !props.pendingPermission}>
+      <Show when={props.running && !props.pendingPermission && !props.pendingQuestions}>
         <AgentWorkingTimelineItem glyph={props.activityGlyph} status={props.runningStatus} />
       </Show>
     </box>
@@ -2285,6 +2372,26 @@ function AgentWorkingTimelineItem(props: { glyph: string; status: string }) {
   )
 }
 
+function QuestionTimelineItem(props: {
+  questions: QuestionItem[]
+  index: number
+  answers: Record<string, string>
+  customDrafts: Record<string, string>
+  selected: Record<string, number>
+  warning: string
+  setAnswer: (index: number, value: string) => void
+  setCustomDraft: (index: number, value: string) => void
+  setSelected: (index: number, value: number) => void
+  setIndex: (index: number) => void
+  submit: () => void
+}) {
+  return (
+    <box width="100%" justifyContent="center" paddingLeft={1} paddingRight={1}>
+      <QuestionPanel {...props} />
+    </box>
+  )
+}
+
 function PermissionTimelineItem(props: {
   request: NonNullable<AppState["pendingPermission"]>
   selected: number
@@ -2375,7 +2482,7 @@ function Composer(props: {
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
-  const composerPlaceholder = (state: AppState) => state.pendingQuestions ? "answer questions in sidebar" : state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
+  const composerPlaceholder = (state: AppState) => state.pendingQuestions ? "answer questions above" : state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
   const inputRows = createMemo(() => Math.max(1, props.draft().split("\n").length))
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
@@ -2462,7 +2569,7 @@ function Composer(props: {
               const ctrl = Boolean(event.ctrlKey || event.ctrl)
               const meta = Boolean(event.metaKey || event.meta || event.super)
               const permissionNav = key === "ArrowUp" || key === "up" || key === "ArrowDown" || key === "down" || key === "Enter" || key === "enter" || key === "return"
-              if (props.state.pendingPermission && permissionNav) return
+              if ((props.state.pendingPermission || props.state.pendingQuestions) && permissionNav) return
               if (props.palette() && (key === "Escape" || key === "Esc" || key === "escape" || key === "esc")) {
                 event.preventDefault()
                 event.stopPropagation?.()
@@ -2645,14 +2752,6 @@ function TelemetrySidebar(props: {
   contextPercent: number
   mode: EffortValue
   branch: string
-  questionIndex: number
-  questionAnswers: Record<string, string>
-  questionSelected: Record<string, number>
-  questionWarning: string
-  setQuestionAnswer: (index: number, value: string) => void
-  setQuestionSelected: (index: number, value: number) => void
-  setQuestionIndex: (index: number) => void
-  submitQuestions: () => void
   openModifiedFile: (file: ModifiedFile) => void
 }) {
   return (
@@ -2672,21 +2771,6 @@ function TelemetrySidebar(props: {
       <scrollbox flexGrow={1} scrollAcceleration={scrollAcceleration} verticalScrollbarOptions={{ visible: false }}>
         <box flexDirection="column" gap={2}>
           <text fg={theme.text} attributes={TextAttributes.BOLD}>{props.state.title}</text>
-          <Show when={props.state.pendingQuestions}>
-            {(pending) => (
-              <QuestionPanel
-                questions={pending().questions}
-                index={props.questionIndex}
-                answers={props.questionAnswers}
-                selected={props.questionSelected}
-                warning={props.questionWarning}
-                setAnswer={props.setQuestionAnswer}
-                setSelected={props.setQuestionSelected}
-                setIndex={props.setQuestionIndex}
-                submit={props.submitQuestions}
-              />
-            )}
-          </Show>
           <TodosPanel todos={props.state.todos} />
           <SectionDivider />
           <WorktreePathSection path={props.worktreePath} />
@@ -2714,16 +2798,45 @@ function TodosPanel(props: { todos: AppState["todos"] }) {
       <Show when={props.todos.length > 0} fallback={<text fg={theme.dim}>No todos yet</text>}>
         <For each={props.todos}>
           {(todo) => (
-            <box flexDirection="row" gap={1}>
-              <text fg={todo.status === "completed" ? theme.green : todo.status === "in_progress" ? theme.cyan : theme.muted}>
+            <box flexDirection="row" gap={1} alignItems="flex-start">
+              <text width={2} flexShrink={0} fg={todo.status === "completed" ? theme.green : todo.status === "in_progress" ? theme.cyan : theme.muted}>
                 {todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "●" : "○"}
               </text>
-              <text fg={todo.status === "completed" ? theme.dim : theme.text} wrapMode="word">
-                {todo.content}
-              </text>
+              <box flexGrow={1} minWidth={0}>
+                <text fg={todo.status === "completed" ? theme.dim : theme.text} wrapMode="word">
+                  {todo.content}
+                </text>
+              </box>
             </box>
           )}
         </For>
+      </Show>
+    </box>
+  )
+}
+
+function CustomAnswerInput(props: { text: string; active: boolean }) {
+  return (
+    <box flexDirection="row" minHeight={1}>
+      <Show
+        when={props.text}
+        fallback={
+          <>
+            <Show when={props.active}>
+              <text fg={theme.cyan} bg={theme.cyan}> </text>
+            </Show>
+            <text fg={theme.dim} wrapMode="none">Type custom answer...</text>
+          </>
+        }
+      >
+        {(text) => (
+          <>
+            <text fg={theme.text} wrapMode="none">{text()}</text>
+            <Show when={props.active}>
+              <text fg={theme.cyan} bg={theme.cyan}> </text>
+            </Show>
+          </>
+        )}
       </Show>
     </box>
   )
@@ -2733,22 +2846,23 @@ function QuestionPanel(props: {
   questions: QuestionItem[]
   index: number
   answers: Record<string, string>
+  customDrafts: Record<string, string>
   selected: Record<string, number>
   warning: string
   setAnswer: (index: number, value: string) => void
+  setCustomDraft: (index: number, value: string) => void
   setSelected: (index: number, value: number) => void
   setIndex: (index: number) => void
   submit: () => void
 }) {
   const current = () => props.questions[Math.min(props.index, Math.max(0, props.questions.length - 1))]
   const options = () => current()?.options ?? []
-  const customIndex = () => options().length
-  const selected = () => props.selected[String(props.index)] ?? 0
+  const selected = () => Math.min(props.selected[String(props.index)] ?? 0, Math.max(0, options().length))
   return (
-    <box flexDirection="column" gap={1} border borderStyle="rounded" borderColor={theme.cyan} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+    <box width="88%" flexDirection="column" gap={1} border borderStyle="rounded" borderColor={theme.cyan} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} backgroundColor={theme.panelSoft}>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.cyan} attributes={TextAttributes.BOLD}>QUESTION {props.index + 1}/{props.questions.length}</text>
-        <text fg={theme.muted}>← → switch</text>
+        <text fg={theme.muted}>←/→ switch · ↑/↓ option · type custom below</text>
       </box>
       <text fg={theme.text} wrapMode="word">Q{props.index + 1} {current()?.question ?? "Question"}</text>
       <For each={options()}>
@@ -2756,35 +2870,43 @@ function QuestionPanel(props: {
           const active = () => selected() === optionIndex()
           const label = () => String.fromCharCode(97 + optionIndex())
           return (
-            <box flexDirection="column" backgroundColor={active() ? theme.paletteSelected : theme.panelSoft} paddingLeft={1} onMouseUp={() => { props.setSelected(props.index, optionIndex()); props.setAnswer(props.index, option.label ?? "") }}>
-              <text fg={active() ? theme.cyan : theme.text}>{label()}) {option.label}{current()?.recommended === option.label ? " (recommended)" : ""}</text>
-              <text fg={theme.muted} wrapMode="word">{option.description ?? ""}</text>
-              <text fg={theme.green} wrapMode="word">pro: {option.pros ?? ""}</text>
-              <text fg={theme.red} wrapMode="word">con: {option.cons ?? ""}</text>
+            <box flexDirection="column" backgroundColor={active() ? theme.paletteSelected : theme.row} paddingLeft={1} paddingRight={1} onMouseUp={() => { props.setSelected(props.index, optionIndex()); props.setAnswer(props.index, option.label ?? "") }}>
+              <text fg={active() ? theme.cyan : theme.text} attributes={active() ? TextAttributes.BOLD : undefined}>{active() ? "› " : "  "}{label()}) {option.label}{current()?.recommended === option.label ? " (recommended)" : ""}</text>
+              <Show when={option.description}><text fg={theme.muted} wrapMode="word">{option.description}</text></Show>
+              <Show when={option.pros}><text fg={theme.green} wrapMode="word">pro: {option.pros}</text></Show>
+              <Show when={option.cons}><text fg={theme.red} wrapMode="word">con: {option.cons}</text></Show>
             </box>
           )
         }}
       </For>
-      <box flexDirection="column" backgroundColor={selected() === customIndex() ? theme.paletteSelected : theme.panelSoft} paddingLeft={1} onMouseUp={() => props.setSelected(props.index, customIndex())}>
-        <text fg={selected() === customIndex() ? theme.cyan : theme.text}>last) custom answer</text>
-        <text fg={theme.muted}>Type your answer in the input below</text>
-        <textarea
+      <box
+        flexDirection="column"
+        backgroundColor={selected() === options().length ? theme.paletteSelected : theme.row}
+        paddingLeft={1}
+        paddingRight={1}
+        onMouseUp={() => props.setSelected(props.index, options().length)}
+      >
+        <text fg={selected() === options().length ? theme.cyan : theme.text} attributes={selected() === options().length ? TextAttributes.BOLD : undefined}>
+          {selected() === options().length ? "› " : "  "}{String.fromCharCode(97 + options().length)}) Custom answer
+        </text>
+        <text fg={theme.muted} wrapMode="word">Select this, then type your answer here:</text>
+        <box
           width="100%"
-          minHeight={1}
-          maxHeight={2}
-          placeholder="write your own answer..."
-          placeholderColor={theme.dim}
-          textColor={theme.text}
-          focusedTextColor={theme.text}
-          focusedBackgroundColor={theme.surface3}
-          cursorColor={theme.cyan}
-          selectionBg={theme.selectionBg}
-          selectionFg={theme.text}
-          onContentChange={(ref: TextareaRenderable) => { props.setSelected(props.index, customIndex()); props.setAnswer(props.index, ref.plainText) }}
-        />
+          border
+          borderStyle="rounded"
+          borderColor={selected() === options().length ? theme.cyan : theme.border}
+          paddingLeft={1}
+          paddingRight={1}
+          paddingTop={1}
+          paddingBottom={1}
+          marginTop={1}
+          onMouseUp={() => props.setSelected(props.index, options().length)}
+        >
+          <CustomAnswerInput text={props.customDrafts[String(props.index)] ?? ""} active={selected() === options().length} />
+        </box>
       </box>
       <Show when={props.warning}><text fg={theme.red}>{props.warning}</text></Show>
-      <text fg={theme.muted}>Enter submits on last question; answer all questions first.</text>
+      <text fg={theme.muted}>Enter accepts the highlighted choice and advances; on the last question, Enter submits.</text>
     </box>
   )
 }
