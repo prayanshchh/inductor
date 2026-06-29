@@ -116,6 +116,7 @@ Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - Use apply_patch for all file changes, including creating new files with *** Add File.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
+- If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.\n\
 - Emit at most one envelope per reply. After a tool result is returned, continue.\n\
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.\n\
 - In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.\n\
@@ -311,6 +312,10 @@ pub fn execute_tool_call(
         }
         name if name == ToolName::ListDir.as_str() => {
             tools.list_dir(optional_string_field(input, "path"))
+        }
+        name if name == ToolName::ReadMemory.as_str() => tools.read_memory(),
+        name if name == ToolName::WriteMemory.as_str() => {
+            tools.write_memory(string_field(input, "content", name)?)
         }
         name if name == ToolName::WriteFile.as_str() => tools.write_file(
             string_field(input, "path", name)?,
@@ -650,8 +655,11 @@ struct ProviderRequestInput<'a> {
 impl ProviderRequestPreparer {
     fn prepare(input: ProviderRequestInput<'_>) -> anyhow::Result<PreparedProviderTurn> {
         let counter = ApproxTokenCounter;
-        let environment =
-            SystemEnvironment::capture(&input.config.model, input.tools.workspace_root());
+        let environment = SystemEnvironment::capture(
+            &input.config.model,
+            input.tools.workspace_root(),
+            input.tools.memory_file(),
+        );
         let system_preamble = PromptComposer::compose(
             input.config.provider_family,
             input.config.model_effort,
@@ -1225,6 +1233,7 @@ impl ToolTargets {
 
 fn tool_target_paths(call: &ParsedToolCall) -> Vec<String> {
     match call.name.as_str() {
+        "write_memory" => Vec::new(),
         "write_file" | "edit_file" | "multi_edit" => optional_string_field(&call.input, "path")
             .map(|path| vec![path.to_string()])
             .unwrap_or_default(),
@@ -1353,6 +1362,7 @@ fn predicted_after(call: &ParsedToolCall, target: &ToolTarget) -> Option<String>
     let before = target.before.as_deref().unwrap_or("");
     match call.name.as_str() {
         "write_file" => call.input.get("content")?.as_str().map(str::to_string),
+        "write_memory" => call.input.get("content")?.as_str().map(str::to_string),
         "edit_file" => {
             let old = call.input.get("old")?.as_str()?;
             let new = call.input.get("new")?.as_str()?;
@@ -2184,6 +2194,7 @@ Todo and question rules:
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
 - Use apply_patch for all file changes, including creating new files with *** Add File. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.
 - In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.
@@ -2194,17 +2205,19 @@ struct SystemEnvironment {
     model: String,
     cwd: PathBuf,
     workspace_root: PathBuf,
+    memory_file: Option<PathBuf>,
     is_git_repo: bool,
     platform: &'static str,
     date_utc: String,
 }
 
 impl SystemEnvironment {
-    fn capture(model: &str, workspace_root: &Path) -> Self {
+    fn capture(model: &str, workspace_root: &Path, memory_file: Option<&Path>) -> Self {
         Self {
             model: model.to_string(),
             cwd: std::env::current_dir().unwrap_or_else(|_| workspace_root.to_path_buf()),
             workspace_root: workspace_root.to_path_buf(),
+            memory_file: memory_file.map(Path::to_path_buf),
             is_git_repo: is_git_repo(workspace_root),
             platform: std::env::consts::OS,
             date_utc: OffsetDateTime::now_utc().date().to_string(),
@@ -2213,11 +2226,15 @@ impl SystemEnvironment {
 
     fn render(&self) -> String {
         format!(
-            "Environment:\n<env>\n  Model: {}\n  Working directory: {}\n  Workspace root: {}\n  Is workspace a git repo: {}\n  Platform: {}\n  Current date (UTC): {}\n</env>",
+            "Environment:\n<env>\n  Model: {}\n  Working directory: {}\n  Workspace root: {}\n  Is workspace a git repo: {}\n  Repo memory file: {}\n  Platform: {}\n  Current date (UTC): {}\n</env>",
             self.model,
             self.cwd.display(),
             self.workspace_root.display(),
             if self.is_git_repo { "yes" } else { "no" },
+            self.memory_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
             self.platform,
             self.date_utc,
         )
