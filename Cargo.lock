@@ -2089,6 +2089,7 @@ dependencies = [
 name = "tools"
 version = "0.1.0"
 dependencies = [
+ "harness-core",
  "libc",
  "reqwest",
  "sandbox",

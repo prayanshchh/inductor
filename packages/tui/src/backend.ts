@@ -36,6 +36,27 @@ export type SessionEvent = {
   workspace_id?: string | null
   worktree_path?: string | null
   branch_name?: string | null
+  questions?: QuestionItem[]
+  answers?: QuestionAnswer[]
+}
+
+export type QuestionOption = {
+  label?: string
+  description?: string
+  pros?: string
+  cons?: string
+}
+
+export type QuestionItem = {
+  id?: string | null
+  question?: string
+  recommended?: string | null
+  options?: QuestionOption[]
+}
+
+export type QuestionAnswer = {
+  question: string
+  answer: string
 }
 
 export type DevMode = "in-place" | "worktree"
@@ -85,6 +106,7 @@ export type BackendCallbacks = {
 export type BackendRun = {
   exited: Promise<number | null>
   respond(requestId: string, decision: PermissionDecision, message?: string): void
+  respondQuestions(toolCallId: string, answers: QuestionAnswer[]): void
   interrupt(): void
   kill(): void
 }
@@ -200,6 +222,14 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
         request_id: requestId,
         decision,
         ...(message ? { message } : {}),
+      })
+      proc.stdin.write(encoder.encode(`${line}\n`))
+    },
+    respondQuestions(toolCallId, answers) {
+      const line = JSON.stringify({
+        type: "question_response",
+        tool_call_id: toolCallId,
+        answers,
       })
       proc.stdin.write(encoder.encode(`${line}\n`))
     },

@@ -201,6 +201,40 @@ pub enum StopReason {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub pros: String,
+    #[serde(default)]
+    pub cons: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentQuestion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<String>,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionResponse {
+    pub tool_call_id: ToolCallId,
+    pub answers: Vec<QuestionAnswer>,
+}
+
 /// When the harness should pause a tool call for human approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -422,6 +456,16 @@ pub enum SessionEvent {
     Diagnostics {
         session_id: SessionId,
         files: Vec<DiagnosticFile>,
+    },
+    QuestionsRequested {
+        session_id: SessionId,
+        tool_call_id: ToolCallId,
+        questions: Vec<AgentQuestion>,
+    },
+    QuestionsAnswered {
+        session_id: SessionId,
+        tool_call_id: ToolCallId,
+        answers: Vec<QuestionAnswer>,
     },
     PermissionRequest {
         session_id: SessionId,

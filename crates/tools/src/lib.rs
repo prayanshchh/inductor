@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use harness_core::{AgentQuestion, QuestionOption};
 use sandbox::SandboxPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +38,7 @@ pub enum ToolName {
     Grep,
     WebFetch,
     TodoWrite,
+    AskQuestions,
     Bash,
     BashWait,
     BashKill,
@@ -57,6 +59,7 @@ impl ToolName {
             Self::Grep => "grep",
             Self::WebFetch => "web_fetch",
             Self::TodoWrite => "todo_write",
+            Self::AskQuestions => "ask_questions",
             Self::Bash => "bash",
             Self::BashWait => "bash_wait",
             Self::BashKill => "bash_kill",
@@ -77,6 +80,7 @@ impl ToolName {
             Self::Grep => "Search Text",
             Self::WebFetch => "Fetch Webpage",
             Self::TodoWrite => "Update Todo List",
+            Self::AskQuestions => "Ask User Questions",
             Self::Bash => "Run Command",
             Self::BashWait => "Wait For Command",
             Self::BashKill => "Stop Command",
@@ -163,7 +167,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::TodoWrite,
-            description: "Update the agent task list for multi-step work.",
+            description: "Update the session todo list shown in the UI. Use for every task; call at the start with planned steps, when starting a step, and when completing steps. Pass an empty list to clear stale todos.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -180,6 +184,42 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["todos"]
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::AskQuestions,
+            description: "Pause for user input on important choices. Provide one or more questions, each with options that include label, description, pros, cons, and an optional recommended label.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "question": { "type": "string" },
+                                "recommended": { "type": "string", "description": "The recommended option label" },
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" },
+                                            "pros": { "type": "string" },
+                                            "cons": { "type": "string" }
+                                        },
+                                        "required": ["label", "description", "pros", "cons"]
+                                    }
+                                }
+                            },
+                            "required": ["question", "options"]
+                        }
+                    }
+                },
+                "required": ["questions"]
             }),
             read_only: true,
         },
@@ -250,6 +290,34 @@ fn compact_schema(schema: &serde_json::Value) -> String {
 pub struct TodoItem {
     pub content: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskQuestionsInput {
+    pub questions: Vec<AgentQuestion>,
+}
+
+pub fn normalize_questions(questions: &[AgentQuestion]) -> Vec<AgentQuestion> {
+    questions
+        .iter()
+        .filter(|question| !question.question.trim().is_empty())
+        .map(|question| AgentQuestion {
+            id: question.id.clone(),
+            question: question.question.clone(),
+            recommended: question.recommended.clone(),
+            options: question
+                .options
+                .iter()
+                .filter(|option| !option.label.trim().is_empty())
+                .map(|option| QuestionOption {
+                    label: option.label.clone(),
+                    description: option.description.clone(),
+                    pros: option.pros.clone(),
+                    cons: option.cons.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,15 +877,16 @@ impl ToolRuntime {
     }
 
     pub fn todo_write(&self, todos: &[TodoItem]) -> Result<ToolResult, ToolError> {
-        if todos.is_empty() {
-            return Err(ToolError::EmptyTodoList);
-        }
-        let output = todos
-            .iter()
-            .enumerate()
-            .map(|(index, todo)| format!("{}. [{}] {}", index + 1, todo.status, todo.content))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output = if todos.is_empty() {
+            "Todo list cleared".to_string()
+        } else {
+            todos
+                .iter()
+                .enumerate()
+                .map(|(index, todo)| format!("{}. [{}] {}", index + 1, todo.status, todo.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         Ok(ToolResult::success(
             ToolName::TodoWrite,
@@ -1668,6 +1737,8 @@ pub enum ToolError {
     },
     EmptyEdit,
     EmptyPatch,
+    // Keep the variant for compatibility with older callers; todo_write now
+    // accepts an empty list to clear stale session todos.
     EmptyTodoList,
     InvalidPattern(String),
     InvalidUrl(String),

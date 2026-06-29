@@ -137,6 +137,8 @@ impl ProviderPlugin for ClaudeProvider {
         cancel: CancellationToken,
         mut permissions: PermissionResponses,
         mut tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let command = self.command.clone();
         let cwd = self.cwd.clone();
@@ -598,7 +600,9 @@ impl SdkBridge {
             "images": request.images,
             "system_prompt": request.system_prompt,
             "approval_policy": request.approval_policy,
-            "tool_definitions": tools::tool_definitions(),
+            "tool_definitions": tools::tool_definitions()
+                .into_iter()
+                .collect::<Vec<_>>(),
         }))
         .await
     }

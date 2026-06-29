@@ -107,6 +107,8 @@ const TOOL_CALL_CLOSE: &str = "</inductor_tool_call>";
 fn generic_tools_preamble() -> String {
     format!(
         "You are an Inductor coding agent operating on the user's machine.\n\
+Create and maintain a todo list for every user task with todo_write: create todos before substantive work, keep exactly one in_progress item while working, mark items completed as soon as they are done, and update/replace the list when the user's prompt changes the plan.\n\
+When a feature, architecture, product, UX, data-loss, security, or other choice is ambiguous or important, ask the user instead of assuming. Use ask_questions with concrete options; every option needs a short description plus pros and cons, and mark your recommended option.\n\
 You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your reply:\n\n\
 <inductor_tool_call>{{\"name\":\"<tool>\",\"input\":{{ ... }}}}</inductor_tool_call>\n\n\
 Available tools and their JSON schemas:\n{}\n\n\
@@ -429,6 +431,13 @@ pub async fn execute_tool_call_cancellable_until(
             .map_err(ToolExecError::Runtime),
         _ => execute_tool_call(tools, call),
     }
+}
+
+fn parse_agent_questions(input: &Value) -> Vec<harness_core::AgentQuestion> {
+    let value = input.get("questions").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+    serde_json::from_value::<Vec<harness_core::AgentQuestion>>(value)
+        .map(|questions| tools::normalize_questions(&questions))
+        .unwrap_or_default()
 }
 
 fn string_field<'a>(
@@ -1699,6 +1708,8 @@ pub fn run_turn<'a>(
     config: HarnessConfig,
     cancel: CancellationToken,
     responses: provider_core::PermissionResponses,
+    question_responses: provider_core::QuestionResponses,
+    question_requests: provider_core::QuestionRequests,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send + 'a>> {
     Box::pin(try_stream! {
         let session_id = state.session_id;
@@ -1708,6 +1719,7 @@ pub fn run_turn<'a>(
         // turn (the only one that pauses for SDK tool permission). Later tool
         // rounds get a fresh, empty channel.
         let mut responses = Some(responses);
+        let mut question_responses = question_responses;
         let mut permissions = risk::PermissionService::new(allow);
         let mut hash_cache = ToolHashCache::default();
 
@@ -1738,8 +1750,13 @@ pub fn run_turn<'a>(
                 .take()
                 .unwrap_or_else(provider_core::empty_permission_responses);
             let (tool_response_tx, tool_response_rx) = tokio::sync::mpsc::unbounded_channel();
+            // Native providers emit ask_questions as a regular tool request and
+            // wait for the local tool response. The harness owns the UI answer
+            // receiver so it can service those requests here.
+            let turn_questions = provider_core::empty_question_responses();
+            let turn_question_requests = provider_core::empty_question_requests();
             let mut stream = match provider
-                .stream_turn(auth, request, cancel.clone(), turn_responses, tool_response_rx)
+                .stream_turn(auth, request, cancel.clone(), turn_responses, tool_response_rx, turn_questions, turn_question_requests)
                 .await
             {
                 Ok(stream) => stream,
@@ -1860,6 +1877,26 @@ pub fn run_turn<'a>(
                         input_json,
                         ..
                     } => {
+                        if name == ToolName::AskQuestions.as_str() {
+                            let questions = parse_agent_questions(&input_json);
+                            let result = provider_core::ask_questions(
+                                &question_requests,
+                                &mut question_responses,
+                                tool_call_id,
+                                questions.clone(),
+                            ).await;
+                            yield SessionEvent::QuestionsAnswered {
+                                session_id,
+                                tool_call_id,
+                                answers: result.answers.clone(),
+                            };
+                            let _ = tool_response_tx.send(ProviderToolResponse {
+                                tool_call_id,
+                                output: result.output,
+                                is_error: false,
+                            });
+                            continue;
+                        }
                         let call = ParsedToolCall { name, input: input_json };
                         state.push(
                             Role::Assistant,
@@ -2008,6 +2045,23 @@ pub fn run_turn<'a>(
                         yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
                         return;
                     }
+                    if call.name == ToolName::AskQuestions.as_str() {
+                        let questions = parse_agent_questions(&call.input);
+                        let result = provider_core::ask_questions(
+                            &question_requests,
+                            &mut question_responses,
+                            tool_call_id,
+                            questions,
+                        ).await;
+                        yield SessionEvent::QuestionsAnswered {
+                            session_id,
+                            tool_call_id,
+                            answers: result.answers.clone(),
+                        };
+                        state.push(Role::Tool, result.output);
+                        round += 1;
+                        continue;
+                    }
                     let mut updates = run_local_tool_call(
                         session_id,
                         tool_call_id,
@@ -2116,6 +2170,16 @@ Working rules:
 - Prefer the smallest correct change that follows existing local patterns.
 - Never revert or overwrite unrelated user changes.
 - Continue after tool results until the task is complete, blocked, or clearly needs user input.
+- Use precise edits for existing files and run focused verification when practical.
+- Final responses should state the outcome and any verification performed without extra preamble.
+
+Todo and question rules:
+- `todo_write` and `ask_questions` are real tools available to you. Use those tools directly; do not simulate them in prose.
+- Create and maintain a todo list for every user task with the `todo_write` tool before substantive work.
+- Keep exactly one todo in_progress while actively working, and mark todos completed as soon as each is done.
+- Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
+- Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
+- Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.";
 - Use apply_patch for all file changes, including creating new files with *** Add File. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
 - Run focused verification when practical.
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.

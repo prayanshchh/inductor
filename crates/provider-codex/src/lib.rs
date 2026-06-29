@@ -224,6 +224,8 @@ impl ProviderPlugin for CodexProvider {
         // Codex emits native function calls, but the harness owns execution.
         _permissions: PermissionResponses,
         mut tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, bearer_header(auth)?);
@@ -1096,6 +1098,8 @@ data: [DONE]
                 CancellationToken::new(),
                 provider_core::empty_permission_responses(),
                 tool_rx,
+                provider_core::empty_question_responses(),
+                provider_core::empty_question_requests(),
             )
             .await
             .unwrap();

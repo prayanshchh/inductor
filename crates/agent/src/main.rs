@@ -12,8 +12,8 @@ use futures_util::StreamExt;
 use git::{CreateWorktreeRequest, WorktreeManager};
 use harness_core::{
     ApprovalPolicy, ImageAttachment, PermissionDecision, PermissionRequestId, PermissionResponse,
-    ProviderId, SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId, TurnRequest,
-    WorkspaceId,
+    ProviderId, QuestionAnswer, QuestionResponse, SessionEvent, SessionId, SessionStatus,
+    StopReason, ToolCallId, TurnRequest, WorkspaceId,
 };
 use harness_runtime::{
     AllowStore, ApprovalRequest, Approver, AutoApprove, HarnessConfig, Role, SessionState,
@@ -858,7 +858,15 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             )?;
             let mut stream = plugin
-                .stream_turn(&provider_auth, request, cancel, perm_rx, tool_rx)
+                .stream_turn(
+                    &provider_auth,
+                    request,
+                    cancel,
+                    perm_rx,
+                    tool_rx,
+                    provider_core::empty_question_responses(),
+                    provider_core::empty_question_requests(),
+                )
                 .await
                 .map_err(|err| err.to_string())?;
 
@@ -1494,6 +1502,9 @@ async fn run_harness_command(
     let auto = AutoApprove;
     let channel_approver = ChannelApprover::new();
     let (perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel::<PermissionResponse>();
+    let (question_tx, question_rx) = tokio::sync::mpsc::unbounded_channel::<QuestionResponse>();
+    let (question_request_tx, mut question_request_rx) =
+        tokio::sync::mpsc::unbounded_channel::<provider_core::ProviderQuestionRequest>();
     if !yes {
         let approver_tx = channel_approver.sender();
         let provider_tx = perm_tx.clone();
@@ -1511,6 +1522,10 @@ async fn run_harness_command(
                     if approver_tx.send(resp).is_err() {
                         break;
                     }
+                    continue;
+                }
+                if let Some(resp) = parse_question_response(line) {
+                    let _ = question_tx.send(resp);
                 }
             }
         });
@@ -1583,6 +1598,8 @@ async fn run_harness_command(
         config,
         cancel,
         perm_rx,
+        question_rx,
+        question_request_tx,
     );
 
     dlog(&format!(
@@ -1592,7 +1609,26 @@ async fn run_harness_command(
 
     let mut final_status = SessionStatus::Completed;
     let mut saw_terminal_result = false;
-    while let Some(event) = stream.next().await {
+    loop {
+        let next_event = tokio::select! {
+            request = question_request_rx.recv() => {
+                if let Some(request) = request {
+                    let event = SessionEvent::QuestionsRequested {
+                        session_id,
+                        tool_call_id: request.tool_call_id,
+                        questions: request.questions,
+                    };
+                    persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&event).map_err(|err| err.to_string())?
+                    );
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = next_event else { break };
         let event = match event {
             Ok(event) => event,
             Err(err) => {
@@ -1935,6 +1971,8 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
         | SessionEvent::ToolCallError { session_id, .. }
         | SessionEvent::Patch { session_id, .. }
         | SessionEvent::Diagnostics { session_id, .. }
+        | SessionEvent::QuestionsRequested { session_id, .. }
+        | SessionEvent::QuestionsAnswered { session_id, .. }
         | SessionEvent::PermissionRequest { session_id, .. }
         | SessionEvent::PermissionResolved { session_id, .. }
         | SessionEvent::TerminalOutput { session_id, .. }
@@ -2102,6 +2140,24 @@ fn parse_permission_decision(line: &str) -> Option<PermissionResponse> {
         request_id,
         decision,
         message,
+    })
+}
+
+fn parse_question_response(line: &str) -> Option<QuestionResponse> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(|t| t.as_str()) != Some("question_response") {
+        return None;
+    }
+    let tool_call_id = value
+        .get("tool_call_id")
+        .and_then(|x| x.as_str())?
+        .parse::<ToolCallId>()
+        .ok()?;
+    let answers_value = value.get("answers")?.clone();
+    let answers = serde_json::from_value::<Vec<QuestionAnswer>>(answers_value).ok()?;
+    Some(QuestionResponse {
+        tool_call_id,
+        answers,
     })
 }
 
