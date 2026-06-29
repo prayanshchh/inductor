@@ -134,7 +134,15 @@ impl SessionNamer for ModelBasedNamer {
         let tool_rx = provider_core::empty_tool_responses();
 
         let mut stream = provider
-            .stream_turn(&auth, request, cancel, perm_rx, tool_rx, provider_core::empty_question_responses(), provider_core::empty_question_requests())
+            .stream_turn(
+                &auth,
+                request,
+                cancel,
+                perm_rx,
+                tool_rx,
+                provider_core::empty_question_responses(),
+                provider_core::empty_question_requests(),
+            )
             .await?;
         let mut response_text = String::new();
 
@@ -259,7 +267,15 @@ pub async fn generate_pull_request_description(
     let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
     let tool_rx = provider_core::empty_tool_responses();
     let mut stream = provider
-        .stream_turn(&auth, request, cancel, perm_rx, tool_rx, provider_core::empty_question_responses(), provider_core::empty_question_requests())
+        .stream_turn(
+            &auth,
+            request,
+            cancel,
+            perm_rx,
+            tool_rx,
+            provider_core::empty_question_responses(),
+            provider_core::empty_question_requests(),
+        )
         .await?;
     let mut response_text = String::new();
 

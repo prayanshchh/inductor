@@ -534,6 +534,8 @@ impl ProviderPlugin for ScriptedProvider {
         _cancel: CancellationToken,
         _permissions: provider_core::PermissionResponses,
         _tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let reply = self
             .replies
@@ -579,6 +581,8 @@ impl ProviderPlugin for StartFailingProvider {
         _cancel: CancellationToken,
         _permissions: provider_core::PermissionResponses,
         _tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         anyhow::bail!("start boom")
     }
@@ -611,6 +615,8 @@ impl ProviderPlugin for StreamFailingProvider {
         _cancel: CancellationToken,
         _permissions: provider_core::PermissionResponses,
         _tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let session_id = req.session_id;
         let stream = async_stream::try_stream! {
@@ -651,6 +657,8 @@ impl ProviderPlugin for EndingWithoutResultProvider {
         _cancel: CancellationToken,
         _permissions: provider_core::PermissionResponses,
         _tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let session_id = req.session_id;
         let stream = async_stream::try_stream! {
@@ -690,6 +698,8 @@ impl ProviderPlugin for NativeCheckpointWaitProvider {
         _cancel: CancellationToken,
         _permissions: provider_core::PermissionResponses,
         mut tool_responses: provider_core::ToolResponses,
+        _question_responses: provider_core::QuestionResponses,
+        _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let session_id = req.session_id;
         let stream = async_stream::try_stream! {
@@ -785,6 +795,8 @@ async fn loop_executes_tool_then_finishes() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -845,6 +857,8 @@ async fn loop_uses_cached_read_hash_instead_of_model_expected_hash() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -889,6 +903,8 @@ async fn provider_start_error_becomes_terminal_error_result() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -926,6 +942,8 @@ async fn provider_stream_error_becomes_terminal_error_result() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -967,6 +985,8 @@ async fn provider_eof_without_result_becomes_terminal_error_result() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1013,6 +1033,8 @@ async fn long_running_bash_emits_progress_before_result() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1069,6 +1091,8 @@ async fn bash_checkpoint_returns_partial_output_to_model() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1119,6 +1143,8 @@ async fn native_provider_can_wait_for_checkpointed_bash_final_output() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1163,6 +1189,8 @@ async fn loop_surfaces_tool_error_and_continues() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1213,6 +1241,8 @@ async fn loop_does_not_stop_at_configured_tool_round_limit() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1255,6 +1285,8 @@ async fn loop_allows_repeated_identical_tool_calls() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1306,6 +1338,8 @@ async fn loop_stubs_large_tool_output_and_writes_blob() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1379,6 +1413,8 @@ async fn risky_command_pauses_for_approval_and_denial_blocks_it() {
         HarnessConfig::new("test-model"), // default OnRequest
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1436,6 +1472,8 @@ async fn approved_outside_read_file_executes() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1483,6 +1521,8 @@ async fn never_policy_runs_outside_read_without_prompt() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1522,6 +1562,8 @@ async fn benign_command_does_not_pause_under_on_request() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1562,6 +1604,8 @@ async fn permission_request_includes_write_diff_preview() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1603,6 +1647,8 @@ async fn edit_file_emits_patch_event_after_execution() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1676,6 +1722,8 @@ async fn always_policy_pauses_even_for_benign_calls() {
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 
@@ -1715,6 +1763,8 @@ async fn allow_always_skips_future_prompts_for_same_program() {
         HarnessConfig::new("test-model"),
         CancellationToken::new(),
         provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
     ))
     .await;
 

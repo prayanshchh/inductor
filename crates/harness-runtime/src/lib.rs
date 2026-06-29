@@ -434,7 +434,10 @@ pub async fn execute_tool_call_cancellable_until(
 }
 
 fn parse_agent_questions(input: &Value) -> Vec<harness_core::AgentQuestion> {
-    let value = input.get("questions").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+    let value = input
+        .get("questions")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     serde_json::from_value::<Vec<harness_core::AgentQuestion>>(value)
         .map(|questions| tools::normalize_questions(&questions))
         .unwrap_or_default()
@@ -2179,7 +2182,7 @@ Todo and question rules:
 - Keep exactly one todo in_progress while actively working, and mark todos completed as soon as each is done.
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
-- Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.";
+- Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
 - Use apply_patch for all file changes, including creating new files with *** Add File. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
 - Run focused verification when practical.
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.

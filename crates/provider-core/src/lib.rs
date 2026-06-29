@@ -77,7 +77,15 @@ pub async fn ask_questions(
             .answers
             .iter()
             .enumerate()
-            .map(|(index, answer)| format!("Q{}: {}\nA{}: {}", index + 1, answer.question, index + 1, answer.answer))
+            .map(|(index, answer)| {
+                format!(
+                    "Q{}: {}\nA{}: {}",
+                    index + 1,
+                    answer.question,
+                    index + 1,
+                    answer.answer
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         return ProviderQuestionResult {
@@ -87,7 +95,9 @@ pub async fn ask_questions(
     }
     ProviderQuestionResult {
         answers: Vec::new(),
-        output: "No question answers received; ask the user again if this decision is still required.".to_string(),
+        output:
+            "No question answers received; ask the user again if this decision is still required."
+                .to_string(),
     }
 }
 
