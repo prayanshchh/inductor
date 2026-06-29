@@ -39,6 +39,13 @@ pub fn classify(call: &ParsedToolCall) -> Vec<RiskFlag> {
                 classify_write_path(path, &mut flags);
             }
         }
+        "apply_patch" | "apply_patch_freeform" => {
+            if let Some(patch) = call.input.get("patch").and_then(Value::as_str) {
+                for path in patch_paths(patch) {
+                    classify_write_path(&path, &mut flags);
+                }
+            }
+        }
         "apply_patch_structured" => {
             if let Some(operations) = call.input.get("operations").and_then(Value::as_array) {
                 for operation in operations {
@@ -299,6 +306,7 @@ pub fn is_mutating_tool_name(name: &str) -> bool {
         "write_file"
             | "edit_file"
             | "multi_edit"
+            | "apply_patch"
             | "apply_patch_freeform"
             | "apply_patch_structured"
             | "todo_write"
@@ -330,7 +338,12 @@ fn rule_matches(rule: &AllowRule, call: &ParsedToolCall) -> bool {
         AllowRuleKind::PathWrite => {
             matches!(
                 call.name.as_str(),
-                "write_file" | "edit_file" | "multi_edit" | "apply_patch_structured"
+                "write_file"
+                    | "edit_file"
+                    | "multi_edit"
+                    | "apply_patch"
+                    | "apply_patch_freeform"
+                    | "apply_patch_structured"
             ) && call
                 .input
                 .get("path")
@@ -339,6 +352,22 @@ fn rule_matches(rule: &AllowRule, call: &ParsedToolCall) -> bool {
                 .unwrap_or(false)
         }
     }
+}
+
+fn patch_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("*** Add File: ")
+                .or_else(|| line.strip_prefix("*** Update File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "))
+                .or_else(|| line.strip_prefix("--- a/"))
+                .or_else(|| line.strip_prefix("+++ b/"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && *path != "/dev/null")
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn call_fingerprint(call: &ParsedToolCall) -> String {

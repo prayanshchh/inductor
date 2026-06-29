@@ -1,4 +1,5 @@
 /** @jsxImportSource @opentui/solid */
+import { stringWidth } from "bun"
 import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, parseColor, type KeyEvent, type OptimizedBuffer } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
@@ -328,6 +329,7 @@ export function App(props: AppProps) {
   const [now, setNow] = createSignal(Date.now())
   const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
   const dimensions = useTerminalDimensions()
+  const availableInputWidth = createMemo(() => Math.max(1, dimensions().width - 6))
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
   const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
   // Full filesystem path the focused agent runs in: its managed worktree when
@@ -1572,6 +1574,7 @@ export function App(props: AppProps) {
           agent={agent()}
           inputRef={(ref) => (input = ref)}
           draft={draft}
+          inputWidth={availableInputWidth()}
           setDraft={updateDraft}
           submit={submit}
           palette={palette}
@@ -2463,6 +2466,7 @@ function Composer(props: {
   agent: string
   inputRef: (ref: TextareaRenderable) => void
   draft: () => string
+  inputWidth: number
   setDraft: (value: string) => void
   submit: () => void
   palette: () => PaletteKind
@@ -2482,8 +2486,8 @@ function Composer(props: {
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
-  const composerPlaceholder = (state: AppState) => state.pendingQuestions ? "answer questions above" : state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
-  const inputRows = createMemo(() => Math.max(1, props.draft().split("\n").length))
+  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
+  const inputRows = createMemo(() => promptVisualRows(props.draft(), props.inputWidth))
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
       <Show when={props.palette()}>
@@ -2541,7 +2545,7 @@ function Composer(props: {
             focusedTextColor={theme.text}
             focusedBackgroundColor={theme.surface3}
             cursorColor={theme.cyan}
-            cursorStyle={{ style: "block", blinking: true }}
+            cursorStyle={{ style: "block", blinking: false }}
             selectionBg={theme.selectionBg}
             selectionFg={theme.text}
             keyBindings={[
@@ -3337,6 +3341,15 @@ function shortWorkspace(path: string) {
 
 function shortModel(value: string) {
   return value.replace("claude-", "").replace("gpt-", "gpt ")
+}
+
+function promptVisualRows(value: string, width: number) {
+  const usableWidth = Math.max(1, Math.floor(width))
+  const rows = value.split("\n").reduce((total, line) => {
+    const visualWidth = stringWidth(line)
+    return total + Math.max(1, Math.ceil(visualWidth / usableWidth))
+  }, 0)
+  return Math.max(1, rows)
 }
 
 function truncateLeft(value: string, max: number) {
