@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use context::{ApproxTokenCounter, ContextLimits, prepare_context};
+use context::{ApproxTokenCounter, BlobStore, ContextLimits, prepare_context};
 use context::{ModelEffort, ProviderFamily};
 use futures_util::StreamExt;
 use harness_core::{
@@ -225,6 +225,28 @@ fn provider_request_preparer_builds_complete_turn_request() {
         message.role == "user"
             && message.parts.iter().any(|part| matches!(part, MessagePart::Image { image: part_image } if part_image == &image))
     }));
+}
+
+#[test]
+fn provider_request_preparer_uses_canonical_xhigh_effort() {
+    let temp = TempDir::new("provider-request-xhigh-effort");
+    let tools = ToolRuntime::new(temp.path()).unwrap();
+    let mut state = SessionState::new(SessionId::new());
+    state.push(Role::User, "think harder");
+    let mut config = HarnessConfig::new("test-model");
+    config.model_effort = ModelEffort::XHigh;
+
+    let prepared = ProviderRequestPreparer::prepare(ProviderRequestInput {
+        session_id: state.session_id,
+        round: 0,
+        state: &state,
+        turn_images: Vec::new(),
+        config: &config,
+        tools: &tools,
+    })
+    .unwrap();
+
+    assert_eq!(prepared.request.metadata["model_effort"], json!("xhigh"));
 }
 
 #[test]
@@ -466,6 +488,34 @@ fn execute_tool_call_dispatches_apply_patch() {
     assert_eq!(
         fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
         "hello inductor\n"
+    );
+}
+
+#[test]
+fn execute_tool_call_dispatches_line_aware_apply_patch() {
+    let temp = TempDir::new("dispatch-line-aware-apply-patch");
+    fs::write(temp.path().join("hello.txt"), "same\nsame\nsame\n").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let call = ParsedToolCall {
+        name: "apply_patch".to_string(),
+        input: json!({
+            "operations": [{
+                "op": "update",
+                "path": "hello.txt",
+                "start_line": 2,
+                "end_line": 2,
+                "old": "same\n",
+                "new": "changed\n"
+            }]
+        }),
+    };
+    let result = execute_tool_call(&runtime, &call).unwrap();
+
+    assert_eq!(result.name.as_str(), "apply_patch");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "same\nchanged\nsame\n"
     );
 }
 
@@ -1360,6 +1410,35 @@ async fn loop_stubs_large_tool_output_and_writes_blob() {
             .next()
             .is_some()
     );
+}
+
+#[test]
+fn read_blob_tool_returns_bounded_stored_output_slice() {
+    let temp = TempDir::new("read-blob-tool");
+    let blob_root = temp.path().join("blobs");
+    let store = BlobStore::new(&blob_root);
+    let blob = store
+        .store(b"0123456789abcdefghijklmnopqrstuvwxyz")
+        .unwrap();
+    let mut config = HarnessConfig::new("test-model");
+    config.context.blob_root = Some(blob_root);
+
+    let result = read_blob_tool_result(
+        &config,
+        &json!({
+            "blob_id": blob.id,
+            "start_byte": 10,
+            "limit_bytes": 5,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(result.name, ToolName::ReadBlob);
+    assert!(result.output.contains("bytes 10..15"));
+    assert!(result.output.ends_with("abcde"));
+    assert_eq!(result.metadata["start_byte"], 10);
+    assert_eq!(result.metadata["end_byte"], 15);
+    assert_eq!(result.metadata["truncated"], true);
 }
 
 // --- Phase 6: approval gate ------------------------------------------------

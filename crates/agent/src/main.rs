@@ -144,7 +144,7 @@ enum Command {
         #[arg(long, default_value_t = 24_000)]
         hard_tokens: usize,
 
-        #[arg(long, default_value_t = 16 * 1024)]
+        #[arg(long, default_value_t = 4 * 1024)]
         tool_result_inline_bytes: usize,
 
         #[arg(long)]
@@ -1134,7 +1134,11 @@ async fn run_context_command(command: ContextCommand) -> Result<(), String> {
             let prepared = prepare_context(
                 "system",
                 &messages,
-                &ContextLimits::new(soft_tokens, hard_tokens, 16 * 1024),
+                &ContextLimits::new(
+                    soft_tokens,
+                    hard_tokens,
+                    ContextLimits::default().tool_result_inline_bytes,
+                ),
                 &counter,
             )
             .map_err(|err| err.to_string())?;
@@ -1415,6 +1419,7 @@ async fn run_harness_command(
     let state_db_path = state_db
         .or(forced_state_db)
         .unwrap_or_else(|| workspace_state_path(&workspace_path));
+    let blob_root = blob_root.or_else(|| default_blob_root(&state_db_path));
     let workspace_db = WorkspaceDb::open(&state_db_path).map_err(|err| err.to_string())?;
     let model = model.unwrap_or_else(|| default_provider_model(provider).to_string());
     let session_id = requested_session_id.unwrap_or_else(SessionId::new);
@@ -3364,6 +3369,12 @@ fn worktree_state_db_path(workspace_id: WorkspaceId) -> Result<PathBuf, String> 
         .join("Inductor")
         .join("state")
         .join(format!("{workspace_id}.db")))
+}
+
+fn default_blob_root(state_db_path: &Path) -> Option<PathBuf> {
+    state_db_path
+        .parent()
+        .map(|parent| parent.join("tool-output-blobs"))
 }
 
 /// Generate a short (<=3 word) fallback name for a fresh worktree-mode session

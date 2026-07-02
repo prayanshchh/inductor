@@ -194,6 +194,11 @@ async function requestPermission(toolName, toolInput, opts, approvalPolicy = "on
 }
 
 function zodForJsonSchema(schema = {}) {
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    const options = schema.oneOf.map((option) => zodForJsonSchema(option));
+    return options.length === 1 ? options[0] : z.union(options);
+  }
+
   if (Array.isArray(schema.enum) && schema.enum.every((value) => typeof value === "string")) {
     return schema.enum.length === 0 ? z.string() : z.enum(schema.enum);
   }
