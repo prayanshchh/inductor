@@ -302,6 +302,8 @@ function toolAliases(toolDefinitions = []) {
   const aliases = {
     Read: mcpName("read_file"),
     LS: mcpName("list_dir"),
+    ReadMemory: mcpName("read_memory"),
+    WriteMemory: mcpName("write_memory"),
     Write: mcpName("write_file"),
     Edit: mcpName("edit_file"),
     MultiEdit: mcpName("multi_edit"),

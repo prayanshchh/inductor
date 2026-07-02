@@ -29,6 +29,8 @@ pub enum ToolName {
     ReadFile,
     ReadBlob,
     ListDir,
+    ReadMemory,
+    WriteMemory,
     WriteFile,
     EditFile,
     MultiEdit,
@@ -51,6 +53,8 @@ impl ToolName {
             Self::ReadFile => "read_file",
             Self::ReadBlob => "read_blob",
             Self::ListDir => "list_dir",
+            Self::ReadMemory => "read_memory",
+            Self::WriteMemory => "write_memory",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
             Self::MultiEdit => "multi_edit",
@@ -73,6 +77,8 @@ impl ToolName {
             Self::ReadFile => "Read File",
             Self::ReadBlob => "Read Stored Tool Output",
             Self::ListDir => "List Directory",
+            Self::ReadMemory => "Read Repo Memory",
+            Self::WriteMemory => "Write Repo Memory",
             Self::WriteFile => "Write File",
             Self::EditFile => "Edit File",
             Self::MultiEdit => "Multi Edit",
@@ -137,6 +143,27 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": { "path": { "type": "string", "description": "Optional directory path" } }
             }),
             read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::ReadMemory,
+            description: "Read this repository's shared memory markdown file. The memory is shared by all Inductor sessions and worktrees for the same source repo.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::WriteMemory,
+            description: "Replace this repository's shared memory markdown file. Keep it concise and durable: stable project conventions, recurring workflows, known pitfalls, and useful context. Do not store secrets.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Full markdown content to write to the repo memory file." }
+                },
+                "required": ["content"]
+            }),
+            read_only: false,
         },
         ToolDefinition {
             name: ToolName::ApplyPatch,
@@ -467,6 +494,7 @@ struct NormalizedLineUpdate {
 #[derive(Debug, Clone)]
 pub struct ToolRuntime {
     workspace_root: PathBuf,
+    memory_file: Option<PathBuf>,
     output_limit_bytes: usize,
     grep_match_limit: usize,
     sandbox: SandboxPolicy,
@@ -527,6 +555,7 @@ impl ToolRuntime {
         let workspace_root = Self::canonical_workspace(workspace_root.as_ref())?;
         Ok(Self {
             workspace_root,
+            memory_file: None,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             grep_match_limit: DEFAULT_GREP_MATCH_LIMIT,
             sandbox: SandboxPolicy::Disabled,
@@ -551,6 +580,7 @@ impl ToolRuntime {
     pub fn approved_outside_access(&self) -> Self {
         Self {
             workspace_root: self.workspace_root.clone(),
+            memory_file: self.memory_file.clone(),
             output_limit_bytes: self.output_limit_bytes,
             grep_match_limit: self.grep_match_limit,
             sandbox: SandboxPolicy::Disabled,
@@ -597,6 +627,21 @@ impl ToolRuntime {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub fn with_memory_file(mut self, memory_file: impl Into<PathBuf>) -> Self {
+        self.memory_file = Some(memory_file.into());
+        self
+    }
+
+    pub fn memory_file(&self) -> Option<&Path> {
+        self.memory_file.as_deref()
+    }
+
+    fn configured_memory_file(&self) -> Result<PathBuf, ToolError> {
+        self.memory_file
+            .clone()
+            .ok_or_else(ToolError::memory_unavailable)
     }
 
     pub fn sandbox(&self) -> &SandboxPolicy {
@@ -704,6 +749,62 @@ impl ToolRuntime {
             result.with_metadata(json!({
                 "path": self.relative_path(&path),
                 "entries": entry_count,
+            }))
+        })
+    }
+
+    pub fn read_memory(&self) -> Result<ToolResult, ToolError> {
+        let path = self.configured_memory_file()?;
+        match fs::read_to_string(&path) {
+            Ok(output) => {
+                let sha256 = sha256_hex(output.as_bytes());
+                let bytes = output.len();
+                Ok(ToolResult::success(
+                    ToolName::ReadMemory,
+                    cap_output(output, self.output_limit_bytes),
+                ))
+                .map(|result| {
+                    result.with_metadata(json!({
+                        "path": path.display().to_string(),
+                        "exists": true,
+                        "bytes": bytes,
+                        "sha256": sha256,
+                    }))
+                })
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ToolResult::success(
+                ToolName::ReadMemory,
+                CappedOutput::complete(format!(
+                    "No repo memory file exists yet at {}. Use write_memory to create it when you learn durable project context.",
+                    path.display()
+                )),
+            ))
+            .map(|result| {
+                result.with_metadata(json!({
+                    "path": path.display().to_string(),
+                    "exists": false,
+                    "bytes": 0,
+                }))
+            }),
+            Err(err) => Err(ToolError::io(&path, err)),
+        }
+    }
+
+    pub fn write_memory(&self, content: impl AsRef<str>) -> Result<ToolResult, ToolError> {
+        let path = self.configured_memory_file()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ToolError::io(parent, err))?;
+        }
+        fs::write(&path, content.as_ref()).map_err(|err| ToolError::io(&path, err))?;
+
+        Ok(ToolResult::success(
+            ToolName::WriteMemory,
+            CappedOutput::complete(format!("wrote repo memory to {}", path.display())),
+        ))
+        .map(|result| {
+            result.with_metadata(json!({
+                "path": path.display().to_string(),
+                "bytes": content.as_ref().len(),
             }))
         })
     }
@@ -2051,6 +2152,7 @@ pub enum ToolError {
     InvalidPath {
         path: PathBuf,
     },
+    MemoryUnavailable,
     PathEscapesWorkspace {
         path: PathBuf,
         workspace_root: PathBuf,
@@ -2136,6 +2238,10 @@ impl ToolError {
             source,
         }
     }
+
+    fn memory_unavailable() -> Self {
+        Self::MemoryUnavailable
+    }
 }
 
 impl fmt::Display for ToolError {
@@ -2159,6 +2265,7 @@ impl fmt::Display for ToolError {
                 )
             }
             Self::InvalidPath { path } => write!(f, "invalid tool path: {}", path.display()),
+            Self::MemoryUnavailable => write!(f, "repo memory is not configured for this run"),
             Self::PathEscapesWorkspace {
                 path,
                 workspace_root,
@@ -2902,6 +3009,42 @@ mod tests {
         let written = outside.path().join("notes").join("new.md");
         runtime.write_file(&written, "new memory").unwrap();
         assert_eq!(fs::read_to_string(written).unwrap(), "new memory");
+    }
+
+    #[test]
+    fn memory_tools_read_and_write_configured_file_outside_workspace() {
+        let workspace = TempDir::new("memory-tool-workspace");
+        let source = TempDir::new("memory-tool-source");
+        let memory_file = source.path().join(".inductor").join("memory.md");
+        let runtime = ToolRuntime::new(workspace.path())
+            .unwrap()
+            .with_memory_file(memory_file.clone());
+
+        let initial = runtime.read_memory().unwrap();
+        assert_eq!(initial.metadata["exists"], false);
+
+        runtime
+            .write_memory("# Memory\n\n- Use cargo test.")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&memory_file).unwrap(),
+            "# Memory\n\n- Use cargo test."
+        );
+
+        let read = runtime.read_memory().unwrap();
+        assert_eq!(read.output, "# Memory\n\n- Use cargo test.");
+        assert_eq!(read.metadata["exists"], true);
+        assert_eq!(read.metadata["path"], memory_file.display().to_string());
+    }
+
+    #[test]
+    fn memory_tools_error_when_unconfigured() {
+        let workspace = TempDir::new("memory-tool-unconfigured");
+        let runtime = ToolRuntime::new(workspace.path()).unwrap();
+
+        let error = runtime.read_memory().unwrap_err();
+
+        assert!(matches!(error, ToolError::MemoryUnavailable));
     }
 
     #[test]

@@ -321,6 +321,7 @@ fn test_environment() -> SystemEnvironment {
         model: "test-model".to_string(),
         cwd: PathBuf::from("/tmp/inductor-workspace"),
         workspace_root: PathBuf::from("/tmp/inductor-workspace"),
+        memory_file: Some(PathBuf::from("/tmp/inductor-source/.inductor/memory.md")),
         is_git_repo: true,
         platform: "test-os",
         date_utc: "2026-06-12".to_string(),

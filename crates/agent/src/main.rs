@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use auth::{AuthDetector, ProviderKind, RuntimeCredentialLoader};
 use base64::{Engine as _, engine::general_purpose};
@@ -41,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tools::{StructuredPatch, TextEdit, ToolRuntime};
 
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_REPO_MEMORY_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -1310,7 +1314,10 @@ async fn run_harness_command(
     // this source workspace's `.inductor/attachments/`, which is untracked and
     // therefore absent from a freshly created worktree — keep it so prompt
     // image mentions can be sourced from it.
-    let source_workspace = workspace.clone();
+    let source_workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.clone());
+    let mut memory_source_workspace = source_workspace.clone();
     let mut app_db = app_db;
     let mut forced_workspace_id = requested_workspace_id;
     let mut forced_state_db: Option<PathBuf> = None;
@@ -1336,6 +1343,7 @@ async fn run_harness_command(
             // Resuming a session that already owns a worktree — reuse it as-is.
             WorktreeBinding {
                 workspace_id: worktree.id,
+                source_repo: worktree.source_repo,
                 worktree_path: worktree.worktree_path,
                 created_worktree: None,
             }
@@ -1347,6 +1355,7 @@ async fn run_harness_command(
             create_worktree_binding(&registry, &workspace, slug.as_deref())?
         };
         workspace = binding.worktree_path.clone();
+        memory_source_workspace = binding.source_repo.clone();
         forced_workspace_id = Some(binding.workspace_id);
         worktree_rename_candidate = binding.created_worktree;
         // Keep the session's state.db outside the worktree so archiving
@@ -1409,12 +1418,17 @@ async fn run_harness_command(
         ProviderKind::Copilot => Box::new(CopilotProvider::new().map_err(|err| err.to_string())?),
     };
 
-    let mut tools = if workspace_only {
+    let memory_file = repo_memory_file(&memory_source_workspace, &workspace_path)
+        .unwrap_or_else(|| workspace_path.join(".inductor").join("memory.md"));
+    ensure_repo_memory_file(&memory_file).map_err(|err| err.to_string())?;
+
+    let mut tools = (if workspace_only {
         ToolRuntime::sandboxed(workspace_path.clone())
     } else {
         ToolRuntime::unrestricted(workspace_path.clone())
-    }
-    .map_err(|err| err.to_string())?;
+    })
+    .map_err(|err| err.to_string())?
+    .with_memory_file(memory_file.clone());
 
     let state_db_path = state_db
         .or(forced_state_db)
@@ -1490,6 +1504,9 @@ async fn run_harness_command(
         ProviderKind::Codex => ProviderFamily::Codex,
         ProviderKind::Copilot => ProviderFamily::Copilot,
     };
+    if let Some(layer) = repo_memory_prompt_layer(&memory_file)? {
+        config.prompt.system_layers.push(layer);
+    }
     let cancel = CancellationToken::new();
     let cancel_on_signal = cancel.clone();
     tokio::spawn(async move {
@@ -1572,12 +1589,13 @@ async fn run_harness_command(
                     // follow it so cwd-relative work keeps landing in the
                     // worktree rather than the repo root.
                     set_process_cwd(&workspace_path);
-                    tools = if workspace_only {
+                    tools = (if workspace_only {
                         ToolRuntime::sandboxed(workspace_path.clone())
                     } else {
                         ToolRuntime::unrestricted(workspace_path.clone())
-                    }
-                    .map_err(|err| err.to_string())?;
+                    })
+                    .map_err(|err| err.to_string())?
+                    .with_memory_file(memory_file.clone());
                     if matches!(provider, ProviderKind::Claude) {
                         provider_plugin =
                             Box::new(ClaudeProvider::with_cwd(workspace_path.clone()));
@@ -3319,6 +3337,61 @@ mod tests {
             Some("Topbar Overflow Merge".to_string())
         );
     }
+
+    #[test]
+    fn repo_memory_file_prefers_source_workspace_git_root() {
+        let source = temp_workspace("memory-source");
+        let worktree = temp_workspace("memory-worktree");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&source)
+            .output()
+            .unwrap();
+
+        let memory = repo_memory_file(&source, &worktree).unwrap();
+
+        assert_eq!(
+            memory,
+            std::fs::canonicalize(&source)
+                .unwrap()
+                .join(".inductor")
+                .join("memory.md")
+        );
+
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(worktree);
+    }
+
+    #[test]
+    fn repo_memory_file_falls_back_to_workspace_folder_for_non_git_projects() {
+        let workspace = temp_workspace("memory-nongit");
+
+        let memory = repo_memory_file(&workspace, &workspace).unwrap();
+
+        assert_eq!(
+            memory,
+            std::fs::canonicalize(&workspace)
+                .unwrap()
+                .join(".inductor")
+                .join("memory.md")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn ensure_repo_memory_file_creates_default_memory() {
+        let workspace = temp_workspace("memory-create");
+        let memory = workspace.join(".inductor").join("memory.md");
+
+        ensure_repo_memory_file(&memory).unwrap();
+
+        let content = std::fs::read_to_string(memory).unwrap();
+        assert!(content.contains("# Inductor Repo Memory"));
+        assert!(content.contains("Do not store secrets"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
 }
 
 /// Point the process working directory at `path`, the preferred home for a
@@ -3375,6 +3448,83 @@ fn default_blob_root(state_db_path: &Path) -> Option<PathBuf> {
     state_db_path
         .parent()
         .map(|parent| parent.join("tool-output-blobs"))
+}
+
+/// Repo-scoped memory is stored in the source checkout's Inductor state dir,
+/// not inside a per-session worktree. In worktree mode every session passes the
+/// same `source_workspace`, so each worktree reads/writes the same file.
+fn repo_memory_file(source_workspace: &Path, workspace_path: &Path) -> Option<PathBuf> {
+    let source_repo = canonical_git_root(source_workspace)
+        .or_else(|| canonical_git_root(workspace_path))
+        .or_else(|| canonical_dir(source_workspace))?;
+    Some(source_repo.join(".inductor").join("memory.md"))
+}
+
+fn ensure_repo_memory_file(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, initial_repo_memory_content())
+}
+
+fn initial_repo_memory_content() -> &'static str {
+    "# Inductor Repo Memory\n\n\
+Shared memory for all Inductor sessions and worktrees for this repository.\n\n\
+Guidelines:\n\
+- Keep this concise and durable: project conventions, recurring workflows, stable architecture notes, and known pitfalls.\n\
+- Do not store secrets, credentials, tokens, or one-off scratch notes.\n\
+- Required team guidance belongs in AGENTS.md or checked-in docs; this file is a local recall layer.\n\n"
+}
+
+fn repo_memory_prompt_layer(path: &Path) -> Result<Option<String>, String> {
+    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let content = truncate_memory_content(&content, MAX_REPO_MEMORY_BYTES);
+    Ok(Some(format!(
+        "Repo memory is enabled for this workspace. It is shared by all Inductor sessions and worktrees for the same source repo.\n\
+Memory file: {}\n\n\
+Current repo memory:\n<repo_memory>\n{}\n</repo_memory>\n\n\
+Use read_memory if you need to inspect the latest memory file, and use write_memory to update it with concise, durable context learned during the task. Do not store secrets in memory.",
+        path.display(),
+        content
+    )))
+}
+
+fn truncate_memory_content(content: &str, limit: usize) -> String {
+    if content.len() <= limit {
+        return content.to_string();
+    }
+    let mut end = limit;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[Inductor truncated repo memory from {} bytes to {} bytes for this prompt. Use read_memory for the full file.]",
+        &content[..end],
+        content.len(),
+        end
+    )
+}
+
+fn canonical_git_root(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    canonical_dir(Path::new(root.trim()))
+}
+
+fn canonical_dir(path: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(path).ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 /// Generate a short (<=3 word) fallback name for a fresh worktree-mode session
@@ -3465,6 +3615,7 @@ fn fallback_worktree_name(prompt: &str) -> Option<String> {
 /// to the worktree registry.
 struct WorktreeBinding {
     workspace_id: WorkspaceId,
+    source_repo: PathBuf,
     worktree_path: PathBuf,
     created_worktree: Option<git::ManagedWorktree>,
 }
@@ -3494,6 +3645,7 @@ fn create_worktree_binding(
 
     Ok(WorktreeBinding {
         workspace_id: created.workspace_id,
+        source_repo: created.source_repo.clone(),
         worktree_path: created.worktree_path.clone(),
         created_worktree: Some(created),
     })
