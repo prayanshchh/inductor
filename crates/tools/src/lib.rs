@@ -1146,9 +1146,9 @@ impl ToolRuntime {
 
             let index = start_line - 1;
             let old = normalize_edit_text(&update.old, newline);
-            let new = normalize_edit_text(&update.new, newline);
+            let mut new = normalize_edit_text(&update.new, newline);
             let old_lines = split_lines_lossless(&old);
-            let new_lines = split_lines_lossless(&new);
+            let mut new_lines = split_lines_lossless(&new);
 
             if old.is_empty() {
                 if end_line != start_line {
@@ -1164,6 +1164,10 @@ impl ToolRuntime {
                             "line-aware insert start_line {start_line} is beyond end of file; file has {original_len} line(s)"
                         ),
                     });
+                }
+                let new_end = index + new_lines.len();
+                if new_end <= original_len && lines_match(&lines, index, new_end, &new_lines) {
+                    continue;
                 }
                 normalized.push(NormalizedLineUpdate {
                     start_index: index,
@@ -1186,12 +1190,25 @@ impl ToolRuntime {
             let end_index = end_line;
             if index >= original_len
                 || end_index > original_len
-                || lines[index..end_index] != old_lines
+                || !lines_match(&lines, index, end_index, &old_lines)
             {
+                let new_end = index + new_lines.len();
+                if new_end <= original_len && lines_match(&lines, index, new_end, &new_lines) {
+                    continue;
+                }
                 return Err(ToolError::PatchApplyFailed {
                     path: path.to_path_buf(),
                     message: format_line_patch_mismatch(&lines, start_line, end_line, &old),
                 });
+            }
+            if old_lines.last().is_some_and(|line| !line_has_newline(line))
+                && lines
+                    .get(end_index - 1)
+                    .is_some_and(|line| line_has_newline(line))
+                && new_lines.last().is_some_and(|line| !line_has_newline(line))
+            {
+                new.push_str(newline.as_str());
+                new_lines = split_lines_lossless(&new);
             }
 
             normalized.push(NormalizedLineUpdate {
@@ -2421,6 +2438,15 @@ enum NewlineStyle {
     Crlf,
 }
 
+impl NewlineStyle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TextFile {
     text: String,
@@ -2546,6 +2572,30 @@ fn split_lines_lossless(text: &str) -> Vec<String> {
         lines.push(text[start..].to_string());
     }
     lines
+}
+
+fn lines_match(
+    lines: &[String],
+    start_index: usize,
+    end_index: usize,
+    expected: &[String],
+) -> bool {
+    if end_index < start_index || end_index > lines.len() {
+        return false;
+    }
+    let actual_lines = &lines[start_index..end_index];
+    if actual_lines.len() != expected.len() {
+        return false;
+    }
+
+    let actual = actual_lines.concat();
+    let expected = expected.concat();
+    actual == expected
+        || actual.trim_end_matches(['\r', '\n']) == expected.trim_end_matches(['\r', '\n'])
+}
+
+fn line_has_newline(line: &str) -> bool {
+    line.ends_with('\n')
 }
 
 #[derive(Debug)]
@@ -3685,6 +3735,78 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("file.txt")).unwrap(),
             "one\nTWO\nTWO-B\nthree\nFOUR\nfive\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_accepts_old_text_without_final_copied_newline() {
+        let temp = TempDir::new("line-patch-missing-final-newline");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 3,
+                old: "two\nthree".to_string(),
+                new: "TWO\nTHREE".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nTHREE\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_treats_already_applied_update_as_success() {
+        let temp = TempDir::new("line-patch-idempotent-update");
+        fs::write(temp.path().join("file.txt"), "one\nTWO\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 2,
+                old: "two".to_string(),
+                new: "TWO".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_treats_already_present_insertion_as_success() {
+        let temp = TempDir::new("line-patch-idempotent-insert");
+        fs::write(temp.path().join("file.txt"), "one\ninserted\ntwo\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 2,
+                old: "".to_string(),
+                new: "inserted".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ninserted\ntwo\n"
         );
     }
 
