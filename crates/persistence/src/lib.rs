@@ -553,6 +553,21 @@ ORDER BY updated_at DESC
         Ok(rows)
     }
 
+    pub fn list_incomplete_sessions(&self) -> Result<Vec<SessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT id, workspace_id, provider_id, model, status, display_name, created_at, updated_at
+FROM sessions
+WHERE status IN ('starting', 'streaming', 'running_tools', 'waiting_for_permission')
+ORDER BY updated_at DESC
+"#,
+        )?;
+        let rows = stmt
+            .query_map([], map_session_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn put_setting(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let now = now_rfc3339()?;
         let value_json = serde_json::to_string(value)?;
@@ -1333,6 +1348,40 @@ mod tests {
         assert_eq!(loaded.status, SessionStatus::RunningTools);
         assert_eq!(loaded.model, "sonnet");
         assert_eq!(loaded.display_name, record.display_name);
+    }
+
+    #[test]
+    fn app_db_lists_only_incomplete_sessions() {
+        let db = AppDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        db.upsert_workspace(workspace_id, "/tmp/project", "project")
+            .unwrap();
+
+        let starting_id = SessionId::new();
+        let mut starting = new_session_record(
+            starting_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.5",
+        )
+        .unwrap();
+        starting.status = SessionStatus::Starting;
+        db.upsert_session(&starting).unwrap();
+
+        let completed_id = SessionId::new();
+        let mut completed = new_session_record(
+            completed_id,
+            workspace_id,
+            ProviderId("claude".to_string()),
+            "sonnet",
+        )
+        .unwrap();
+        completed.status = SessionStatus::Completed;
+        db.upsert_session(&completed).unwrap();
+
+        let incomplete = db.list_incomplete_sessions().unwrap();
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].id, starting_id);
     }
 
     #[test]

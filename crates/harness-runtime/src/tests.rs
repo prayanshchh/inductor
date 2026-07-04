@@ -935,6 +935,94 @@ async fn loop_uses_cached_read_hash_instead_of_model_expected_hash() {
 }
 
 #[tokio::test]
+async fn loop_requires_fresh_read_before_line_patch_after_same_file_write() {
+    let temp = TempDir::new("loop-line-patch-fresh-read-required");
+    fs::write(temp.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\",\"start_line\":1,\"end_line\":3}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"update\",\"path\":\"hello.txt\",\"start_line\":2,\"end_line\":2,\"old\":\"two\\n\",\"new\":\"TWO\\n\"}]}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"update\",\"path\":\"hello.txt\",\"start_line\":3,\"end_line\":3,\"old\":\"three\\n\",\"new\":\"THREE\\n\"}]}}</inductor_tool_call>",
+        "Done.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "edit hello.txt".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
+    ))
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallError { message, .. }
+            if message.contains("requires a fresh read_file")
+                && message.contains("hello.txt")
+    )));
+}
+
+#[tokio::test]
+async fn loop_allows_line_patch_after_fresh_read_following_write() {
+    let temp = TempDir::new("loop-line-patch-fresh-read-allows");
+    fs::write(temp.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\",\"start_line\":1,\"end_line\":3}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"update\",\"path\":\"hello.txt\",\"start_line\":2,\"end_line\":2,\"old\":\"two\\n\",\"new\":\"TWO\\n\"}]}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\",\"start_line\":3,\"end_line\":3}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"update\",\"path\":\"hello.txt\",\"start_line\":3,\"end_line\":3,\"old\":\"three\\n\",\"new\":\"THREE\\n\"}]}}</inductor_tool_call>",
+        "Done.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "edit hello.txt".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
+    ))
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "one\nTWO\nTHREE\n"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallError { message, .. }
+            if message.contains("requires a fresh read_file")
+    )));
+}
+
+#[tokio::test]
 async fn provider_start_error_becomes_terminal_error_result() {
     let temp = TempDir::new("provider-start-error");
     let runtime = ToolRuntime::new(temp.path()).unwrap();

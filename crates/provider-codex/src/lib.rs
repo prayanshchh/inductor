@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const DEFAULT_CODEX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_CODEX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct CodexProvider {
@@ -35,7 +36,7 @@ impl CodexProvider {
 
     pub fn with_base_url(base_url: impl Into<String>) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(DEFAULT_CODEX_CONNECT_TIMEOUT)
             .build()?;
 
         Ok(Self {

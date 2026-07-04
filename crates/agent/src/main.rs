@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -45,6 +46,7 @@ use tools::{StructuredPatch, TextEdit, ToolRuntime};
 
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_REPO_MEMORY_BYTES: usize = 32 * 1024;
+const ORPHANED_SESSION_RECOVERY_MESSAGE: &str = "Recovered after Inductor restarted: the previous agent run was interrupted before it could finish. Inductor will automatically resume the latest interrupted prompt when this session is loaded.";
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -976,6 +978,11 @@ async fn run_opentui_command(
     // The worktree registry lives in the app DB; share its path with the TUI so
     // the dashboard can list/archive worktrees the backend creates.
     let app_db = default_app_db_path()?;
+    let registry = AppDb::open(&app_db).map_err(|err| err.to_string())?;
+    let recovered = recover_orphaned_sessions(&registry)?;
+    if recovered > 0 {
+        eprintln!("Recovered {recovered} interrupted Inductor session(s) from a previous process.");
+    }
 
     let mut command = std::process::Command::new("bun");
     command
@@ -3105,6 +3112,59 @@ fn lookup_worktree(registry: &AppDb, workspace_id: WorkspaceId) -> Result<Worktr
         .ok_or_else(|| format!("no managed worktree for workspace {workspace_id}"))
 }
 
+fn recover_orphaned_sessions(registry: &AppDb) -> Result<usize, String> {
+    let incomplete = registry
+        .list_incomplete_sessions()
+        .map_err(|err| err.to_string())?;
+    if incomplete.is_empty() {
+        return Ok(0);
+    }
+
+    let mut state_paths = HashMap::new();
+    for workspace in registry.list_workspaces().map_err(|err| err.to_string())? {
+        state_paths.insert(workspace.id, workspace_state_path(workspace.path));
+    }
+    for worktree in registry.list_worktrees().map_err(|err| err.to_string())? {
+        state_paths.insert(worktree.id, worktree_state_db_path(worktree.id)?);
+    }
+
+    let mut recovered = 0;
+    for mut session in incomplete {
+        let Some(state_path) = state_paths.get(&session.workspace_id) else {
+            continue;
+        };
+        let workspace_db = WorkspaceDb::open(state_path).map_err(|err| err.to_string())?;
+
+        session.status = SessionStatus::Idle;
+        session.updated_at = now_rfc3339().map_err(|err| err.to_string())?;
+        workspace_db
+            .upsert_session(&session)
+            .map_err(|err| err.to_string())?;
+        registry
+            .upsert_session(&session)
+            .map_err(|err| err.to_string())?;
+
+        let error_event = SessionEvent::Error {
+            session_id: session.id,
+            message: ORPHANED_SESSION_RECOVERY_MESSAGE.to_string(),
+        };
+        workspace_db
+            .append_event(session.id, &error_event)
+            .map_err(|err| err.to_string())?;
+        let idle_event = SessionEvent::Status {
+            session_id: session.id,
+            status: SessionStatus::Idle,
+        };
+        workspace_db
+            .append_event(session.id, &idle_event)
+            .map_err(|err| err.to_string())?;
+
+        recovered += 1;
+    }
+
+    Ok(recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3229,6 +3289,66 @@ mod tests {
                 text: "look at this screenshot".to_string()
             }]
         );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn startup_recovery_marks_incomplete_sessions_idle() {
+        let workspace = temp_workspace("startup-recovery");
+        let app_path = workspace.join("app.db");
+        let state_path = workspace_state_path(&workspace);
+        let app_db = AppDb::open(&app_path).unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        app_db
+            .upsert_workspace(workspace_id, &workspace, "startup-recovery")
+            .unwrap();
+
+        let mut session = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.5",
+        )
+        .unwrap();
+        session.status = SessionStatus::Streaming;
+        app_db.upsert_session(&session).unwrap();
+
+        let workspace_db = WorkspaceDb::open(&state_path).unwrap();
+        workspace_db.upsert_session(&session).unwrap();
+        workspace_db
+            .append_event(
+                session_id,
+                &SessionEvent::Status {
+                    session_id,
+                    status: SessionStatus::Streaming,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(recover_orphaned_sessions(&app_db).unwrap(), 1);
+
+        let app_session = app_db.get_session(session_id).unwrap().unwrap();
+        assert_eq!(app_session.status, SessionStatus::Idle);
+        let workspace_session = workspace_db.get_session(session_id).unwrap().unwrap();
+        assert_eq!(workspace_session.status, SessionStatus::Idle);
+
+        let events = workspace_db.events(session_id).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(SessionEvent::Status {
+                status: SessionStatus::Idle,
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Error { message, .. }
+                if message.contains("Recovered after Inductor restarted")
+        )));
+
+        assert_eq!(recover_orphaned_sessions(&app_db).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(workspace);
     }

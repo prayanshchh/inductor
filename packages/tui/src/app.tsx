@@ -83,6 +83,7 @@ type PrFlow = { step: "base" | "message"; base: string; worktree: Worktree }
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
+const RECOVERED_RESTART_MARKER = "Recovered after Inductor restarted"
 
 const theme = {
   bg: "transparent",
@@ -246,6 +247,7 @@ export function App(props: AppProps) {
   })
   const runs = new Map<string, BackendRun>()
   const runFlags = new Map<string, RunFlags>()
+  const autoResumedSessions = new Set<string>()
 
   const focusedAgent = createMemo(() => store.agents.find((a) => a.key === store.focusedKey) ?? store.agents[0])
   const fstate = createMemo(() => focusedAgent().state)
@@ -417,7 +419,7 @@ export function App(props: AppProps) {
   onMount(() => {
     props.registerCtrlCHandler(handleCtrlC)
     props.registerSelectionTransform((text) => expandPromptPlaceholders(text, promptPlaceholders()))
-    void refreshWorktrees()
+    void refreshWorktrees().then((next) => autoResumeRecoveredWorktrees(next))
     const worktreeRefreshTimer = setInterval(() => void refreshWorktrees(), 30_000)
     void refreshCopilotModels()
     onCleanup(() => clearInterval(worktreeRefreshTimer))
@@ -495,9 +497,32 @@ export function App(props: AppProps) {
     }
     if (!visiblePrompt) return
 
+    const backendPrompt = resumePromptFromUserPrompt(visiblePrompt, fstate()) ?? prompt
+    startAgentTurn(store.focusedKey, backendPrompt, {
+      clearComposer: true,
+      recordHistoryText: visiblePrompt,
+      clearAttachments: true,
+    })
+  }
+
+  function startAgentTurn(
+    key: string,
+    prompt: string,
+    options: {
+      clearComposer?: boolean
+      recordHistoryText?: string
+      clearAttachments?: boolean
+      noticeText?: string
+    } = {},
+  ) {
+    const idx = agentIndex(key)
+    if (idx < 0) return
+    const slot = store.agents[idx]
+    if (slot.state.running || runs.has(key)) return
+    if (!prompt.trim()) return
+
     // Pin the turn to the currently focused slot so its events route here even
     // after the user switches focus to another running agent.
-    const key = store.focusedKey
     const flags = runFlagsFor(key)
     flags.stopping = false
     flags.exitAfter = false
@@ -506,29 +531,33 @@ export function App(props: AppProps) {
       flags.forceTimer = undefined
     }
 
-    input.setText("")
-    setDraft("")
-    recordHistory(visiblePrompt)
-    setPromptImages([])
-    setPromptPastes([])
+    if (options.clearComposer) {
+      input.setText("")
+      setDraft("")
+    }
+    if (options.recordHistoryText?.trim()) recordHistory(options.recordHistoryText)
+    if (options.clearAttachments) {
+      setPromptImages([])
+      setPromptPastes([])
+    }
     setPalette(undefined)
     disarmStopWarning()
-    setNotice(undefined)
-    updateAgentState(key, (next) => addUserMessage(next, visiblePrompt))
+    setNotice(options.noticeText ? { text: options.noticeText, tone: "cyan" } : undefined)
+    updateAgentState(key, (next) => addUserMessage(next, prompt))
     const run = startBackendTurn(prompt, {
       ...props,
-      provider: provider(),
-      model: model(),
-      approval: approval(),
-      workspaceOnly: workspaceOnly(),
-      sessionId: sessionId(),
-      effort: backendEffort(mode()),
-      mode: devMode(),
+      provider: slot.provider,
+      model: slot.model,
+      approval: slot.approval,
+      workspaceOnly: slot.workspaceOnly,
+      sessionId: slot.sessionId,
+      effort: backendEffort(slot.effort),
+      mode: slot.devMode,
       appDb: props.appDb,
       // Reuse the worktree once the session owns one; the backend creates it on
       // the first prompt (named after the work) when these are absent.
-      workspaceId: focusedAgent().workspaceId,
-      stateDb: focusedAgent().stateDb,
+      workspaceId: slot.workspaceId,
+      stateDb: slot.stateDb,
     }, {
       onEvent(event) {
         if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) {
@@ -578,6 +607,48 @@ export function App(props: AppProps) {
       },
     })
     runs.set(key, run)
+  }
+
+  function resumePromptFromUserPrompt(prompt: string, state: AppState) {
+    if (!isResumePrompt(prompt)) return undefined
+    const latest = latestUserPromptFromState(state)
+    if (!latest) return undefined
+    return resumeInstruction(latest)
+  }
+
+  function isResumePrompt(prompt: string) {
+    return /^(?:inductor\s+)?resume(?:\s+(?:please|this|it|that|thing|thingy))?[\s.!?]*$/i.test(prompt.trim())
+  }
+
+  function latestUserPromptFromState(state: AppState) {
+    for (let index = state.transcript.length - 1; index >= 0; index -= 1) {
+      const item = state.transcript[index]
+      if (item.kind !== "user") continue
+      if (isResumePrompt(item.text)) continue
+      return item.text.trim()
+    }
+    return undefined
+  }
+
+  function resumeInstruction(latestPrompt: string) {
+    return [
+      "Resume the user's most recent substantive request below.",
+      "Do not treat the word \"resume\" as the task. Continue the interrupted work using the existing transcript and current workspace state.",
+      "Avoid repeating completed work; inspect current files/status if needed, then keep making progress.",
+      "",
+      "Latest request to resume:",
+      latestPrompt,
+    ].join("\n")
+  }
+
+  function autoResumeInstruction(latestPrompt: string) {
+    return [
+      "Inductor restarted before the previous run could finish. Resume the interrupted request below now.",
+      "Continue from the existing transcript and current workspace state. Avoid repeating completed work; inspect current files/status if needed, then keep making progress.",
+      "",
+      "Latest interrupted request:",
+      latestPrompt,
+    ].join("\n")
   }
 
   function focusedAgentSessionMatches(key: string, sessionId: string) {
@@ -1176,10 +1247,13 @@ export function App(props: AppProps) {
       const next = await listWorktrees(props)
       // Archived worktrees keep their chats but no longer have a working
       // directory — hide them from the sidebar so it only lists live worktrees.
-      setWorktrees(next.filter((w) => w.status !== "archived"))
+      const visible = next.filter((w) => w.status !== "archived")
+      setWorktrees(visible)
       setSessionListStatus("")
+      return visible
     } catch (error) {
       setSessionListStatus(error instanceof Error ? error.message : "Could not load worktrees")
+      return []
     }
   }
 
@@ -1221,6 +1295,79 @@ export function App(props: AppProps) {
     } catch (error) {
       setNotice({ text: error instanceof Error ? error.message : "Could not load session", tone: "red" })
     }
+  }
+
+  async function autoResumeRecoveredWorktrees(visibleWorktrees: Worktree[]) {
+    for (const worktree of visibleWorktrees) {
+      if (!worktree.session_id || !worktree.state_db) continue
+      if (autoResumedSessions.has(worktree.session_id)) continue
+      const open = agentForWorktree(worktree)
+      if (open?.state.running || runs.has(open?.key ?? "")) continue
+
+      let detail
+      try {
+        detail = await showWorkspaceSession(props, worktree.session_id, worktree.state_db)
+      } catch {
+        continue
+      }
+      if (!shouldAutoResumeRecoveredSession(detail)) continue
+
+      const latestPrompt = latestUserPromptFromSession(detail)
+      if (!latestPrompt) continue
+      autoResumedSessions.add(worktree.session_id)
+
+      const key = open?.key ?? openRecoveredWorktreeSlot(worktree, detail)
+      if (!key) continue
+      setStore("focusedKey", key)
+      setExpanded(new Set<string>())
+      queueMicrotask(() => {
+        startAgentTurn(key, autoResumeInstruction(latestPrompt), {
+          noticeText: "Resuming interrupted prompt after restart...",
+        })
+      })
+    }
+  }
+
+  function openRecoveredWorktreeSlot(worktree: Worktree, detail: Awaited<ReturnType<typeof showWorkspaceSession>>) {
+    const slot = makeAgentSlot({
+      sessionId: worktree.session_id ?? undefined,
+      workspaceId: worktree.workspace_id,
+      branch: worktree.branch_name,
+      provider: sessionProvider(detail.session.provider_id) ?? props.provider,
+      model: detail.session.model || (props.model ?? defaultModel(props.provider)),
+      devMode: "worktree",
+      stateDb: worktree.state_db ?? undefined,
+      state: loadStoredSession(detail),
+    })
+    setStore("agents", (agents) => [...agents, slot])
+    return slot.key
+  }
+
+  function shouldAutoResumeRecoveredSession(detail: Awaited<ReturnType<typeof showWorkspaceSession>>) {
+    const events = detail.events ?? []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type === "status") continue
+      return event.type === "error" && typeof event.message === "string" && event.message.includes(RECOVERED_RESTART_MARKER)
+    }
+    return false
+  }
+
+  function latestUserPromptFromSession(detail: Awaited<ReturnType<typeof showWorkspaceSession>>) {
+    const events = detail.events ?? []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type !== "user_message") continue
+      const text = typeof event.text === "string" ? event.text.trim() : ""
+      if (text && !isResumePrompt(text)) return text
+    }
+    for (let index = detail.messages.length - 1; index >= 0; index -= 1) {
+      const message = detail.messages[index]
+      if (message.role.toLowerCase() !== "user") continue
+      const text = message.content.trim()
+      if (text && !isResumePrompt(text)) return text
+    }
+    return undefined
   }
 
   function decide(decision: PermissionDecision) {

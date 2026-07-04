@@ -30,6 +30,8 @@ const DEFAULT_EDITOR_VERSION: &str = "vscode/1.95.0";
 const DEFAULT_INTEGRATION_ID: &str = "vscode-chat";
 const DEFAULT_USER_AGENT: &str = "GithubCopilot/1.0";
 const DEFAULT_COPILOT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_COPILOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_COPILOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct CopilotProvider {
@@ -60,7 +62,7 @@ impl CopilotProvider {
         copilot_api_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(DEFAULT_COPILOT_CONNECT_TIMEOUT)
             .build()?;
         Ok(Self {
             client,
@@ -107,6 +109,7 @@ impl CopilotProvider {
             .client
             .get(self.token_url())
             .headers(github_token_headers(auth)?)
+            .timeout(DEFAULT_COPILOT_REQUEST_TIMEOUT)
             .send()
             .await?;
         let status = response.status();
@@ -158,6 +161,7 @@ impl ProviderPlugin for CopilotProvider {
             .client
             .get(self.models_url())
             .headers(copilot_headers(&bearer.token)?)
+            .timeout(DEFAULT_COPILOT_REQUEST_TIMEOUT)
             .send()
             .await?;
         let status = response.status();

@@ -1130,7 +1130,7 @@ impl ToolRuntime {
 
         for update in updates {
             let start_line = update.start_line;
-            let end_line = update.end_line;
+            let mut end_line = update.end_line;
             if start_line == 0 {
                 return Err(ToolError::InvalidPatch(format!(
                     "line-aware update start_line must be 1-based for {}",
@@ -1147,6 +1147,9 @@ impl ToolRuntime {
             let index = start_line - 1;
             let old = normalize_edit_text(&update.old, newline);
             let mut new = normalize_edit_text(&update.new, newline);
+            if text_matches_loose(&old, &new) {
+                continue;
+            }
             let old_lines = split_lines_lossless(&old);
             let mut new_lines = split_lines_lossless(&new);
 
@@ -1180,11 +1183,19 @@ impl ToolRuntime {
 
             let expected_line_count = end_line - start_line + 1;
             if old_lines.len() != expected_line_count {
-                return Err(ToolError::InvalidPatch(format!(
-                    "line-aware update for {} has start_line {start_line} and end_line {end_line}, but old text spans {} line(s)",
-                    display_path.display(),
-                    old_lines.len()
-                )));
+                let corrected_end_line = start_line + old_lines.len().saturating_sub(1);
+                let corrected_end_index = index + old_lines.len();
+                if corrected_end_index <= original_len
+                    && lines_match(&lines, index, corrected_end_index, &old_lines)
+                {
+                    end_line = corrected_end_line;
+                } else {
+                    return Err(ToolError::InvalidPatch(format!(
+                        "line-aware update for {} has start_line {start_line} and end_line {end_line}, but old text spans {} line(s)",
+                        display_path.display(),
+                        old_lines.len()
+                    )));
+                }
             }
 
             let end_index = end_line;
@@ -2598,6 +2609,10 @@ fn line_has_newline(line: &str) -> bool {
     line.ends_with('\n')
 }
 
+fn text_matches_loose(left: &str, right: &str) -> bool {
+    left == right || left.trim_end_matches(['\r', '\n']) == right.trim_end_matches(['\r', '\n'])
+}
+
 #[derive(Debug)]
 struct UnifiedFilePatch {
     path: PathBuf,
@@ -3664,6 +3679,56 @@ mod tests {
     }
 
     #[test]
+    fn line_patch_corrects_safe_end_line_count_mismatch() {
+        let temp = TempDir::new("line-patch-correct-end-line");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 3,
+                old: "two\nthree\nfour\n".to_string(),
+                new: "TWO\nTHREE\nFOUR\n".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nTHREE\nFOUR\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_rejects_end_line_count_mismatch_when_old_text_does_not_match_start() {
+        let temp = TempDir::new("line-patch-bad-end-line");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 3,
+                old: "missing\nthree\nfour\n".to_string(),
+                new: "TWO\nTHREE\nFOUR\n".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        let error = runtime.apply_line_patch(&patch).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidPatch(_)));
+        assert!(error.to_string().contains("old text spans 3 line(s)"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ntwo\nthree\nfour\n"
+        );
+    }
+
+    #[test]
     fn line_patch_rejects_stale_line_without_searching_for_anchor() {
         let temp = TempDir::new("line-patch-stale");
         fs::write(temp.path().join("file.txt"), "same\nsame\nsame\n").unwrap();
@@ -3807,6 +3872,30 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("file.txt")).unwrap(),
             "one\ninserted\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_ignores_no_op_update_even_when_line_is_stale() {
+        let temp = TempDir::new("line-patch-no-op-stale-line");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 99,
+                end_line: 99,
+                old: "submit={submit}".to_string(),
+                new: "submit={submit}".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ntwo\nthree\n"
         );
     }
 

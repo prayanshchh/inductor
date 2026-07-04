@@ -114,14 +114,16 @@ You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your 
 Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
+- If the user prompt is just \"resume\" or asks to resume, treat it as a request to continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.\n\
 - Use apply_patch for all file changes. For edits, first read the target range and then provide operations with exact path, 1-based inclusive start_line and end_line, old text, and new text. Do not use anchor-only patches.\n\
+- Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
 - Keep tool output small: prefer read_file with start_line/end_line over large reads, use rg with focused patterns instead of broad dumps, and avoid large sed commands.\n\
 - If a tool result says it was truncated and gives a blob_id, use read_blob with a bounded start_byte/limit_bytes range to inspect more without rerunning the tool.\n\
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.\n\
 - Emit at most one envelope per reply. After a tool result is returned, continue.\n\
-- Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.\n\
-- In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.\n\
+- Progress messages must be sparse: only report material new facts, decisions, blockers, failures, verification results, or completed phases.\n\
+- Do not repeat the same status or narrate routine reads/searches/inspections; keep working silently until something changes. No hidden chain-of-thought.\n\
 - When you have the final answer and need no more tools, reply with concise prose and NO envelope.",
         tools::tool_prompt_docs()
     )
@@ -861,6 +863,7 @@ struct LocalToolRunResult {
 #[derive(Debug, Default)]
 struct ToolHashCache {
     hashes_by_path: HashMap<String, String>,
+    dirty_since_read: HashMap<String, String>,
 }
 
 impl ToolHashCache {
@@ -889,13 +892,44 @@ impl ToolHashCache {
             ) {
                 self.hashes_by_path
                     .insert(path.to_string(), hash.to_string());
+                self.dirty_since_read.remove(path);
             }
             return;
         }
 
         for path in tool_target_paths(call) {
-            refresh_hash_for_path(tools, &path, &mut self.hashes_by_path);
+            self.mark_written(tools, &path);
         }
+    }
+
+    fn stale_line_patch_reason(
+        &self,
+        tools: &ToolRuntime,
+        call: &ParsedToolCall,
+    ) -> Option<String> {
+        if call.name != ToolName::ApplyPatch.as_str() || !is_line_aware_patch(&call.input) {
+            return None;
+        }
+
+        line_patch_paths(&call.input)?
+            .into_iter()
+            .find_map(|path| {
+                let key = workspace_relative_key(tools, &path)?;
+                self.dirty_since_read.get(&key).map(|reason| {
+                    format!(
+                        "line-aware apply_patch for {key} requires a fresh read_file because this file changed after the last read ({reason}). Re-read the exact target range with read_file start_line/end_line, then retry with current line numbers and old text."
+                    )
+                })
+            })
+    }
+
+    fn mark_written(&mut self, tools: &ToolRuntime, path: &str) {
+        let Some(key) = workspace_relative_key(tools, path) else {
+            return;
+        };
+        self.hashes_by_path.remove(&key);
+        self.dirty_since_read
+            .insert(key, "previous tool write".to_string());
     }
 }
 
@@ -1044,6 +1078,7 @@ fn run_local_tool_call<'a>(
         status: SessionStatus::RunningTools,
     });
 
+    let stale_line_patch_error = hash_cache.stale_line_patch_reason(tools, &execution_call);
     let unlocked_tools;
     let execution_tools = if approved_unlocked_execution {
         unlocked_tools = tools.approved_outside_access();
@@ -1054,6 +1089,8 @@ fn run_local_tool_call<'a>(
 
     let result = if execution_call.name == ToolName::ReadBlob.as_str() {
         read_blob_tool_result(&config, &execution_call.input)
+    } else if let Some(message) = stale_line_patch_error {
+        Err(ToolExecError::Harness(message))
     } else {
         let mut execution = execute_tool_call_with_progress(
             session_id,
@@ -1437,26 +1474,6 @@ fn cached_hash_for_path(
     workspace_relative_key(tools, path).and_then(|key| hashes_by_path.get(&key).cloned())
 }
 
-fn refresh_hash_for_path(
-    tools: &ToolRuntime,
-    path: &str,
-    hashes_by_path: &mut HashMap<String, String>,
-) {
-    let Some(key) = workspace_relative_key(tools, path) else {
-        return;
-    };
-    match tools.read_file(&key) {
-        Ok(result) => {
-            if let Some(hash) = result.metadata.get("sha256").and_then(Value::as_str) {
-                hashes_by_path.insert(key, hash.to_string());
-            }
-        }
-        Err(_) => {
-            hashes_by_path.remove(&key);
-        }
-    }
-}
-
 fn workspace_relative_key(tools: &ToolRuntime, path: &str) -> Option<String> {
     let input = Path::new(path);
     let absolute = if input.is_absolute() {
@@ -1502,6 +1519,20 @@ fn line_patch_paths(input: &Value) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+fn is_line_aware_patch(input: &Value) -> bool {
+    input
+        .get("operations")
+        .and_then(Value::as_array)
+        .is_some_and(|operations| {
+            operations.iter().any(|operation| {
+                operation
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .is_some_and(|op| op == "update")
+            })
+        })
 }
 
 fn predicted_after(call: &ParsedToolCall, target: &ToolTarget) -> Option<String> {
@@ -2356,7 +2387,9 @@ Working rules:
 - Prefer the smallest correct change that follows existing local patterns.
 - Never revert or overwrite unrelated user changes.
 - Continue after tool results until the task is complete, blocked, or clearly needs user input.
+- If the user prompt is just \"resume\" or asks to resume, continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.
 - Use precise edits for existing files and run focused verification when practical.
+- Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.
 - Final responses should state the outcome and any verification performed without extra preamble.
 
 Todo and question rules:
@@ -2369,8 +2402,8 @@ Todo and question rules:
 - Use apply_patch for all file changes. For edits, provide operations with exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.
-- Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.
-- In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.
+- Progress messages must be sparse: only report material new facts, decisions, blockers, failures, verification results, or completed phases.
+- Do not repeat the same status or narrate routine reads/searches/inspections; keep working silently until something changes. No hidden chain-of-thought.
 - Final responses should state the outcome, changed files, and verification performed.";
 
 #[derive(Debug, Clone)]
