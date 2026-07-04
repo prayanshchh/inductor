@@ -20,7 +20,8 @@ export function deletePromptPlaceholderAtCursor(value: string, cursorOffset: num
   for (const span of spans) {
     if (direction === "backward") {
       const afterTokenSpace = offset === span.end + 1 && /\s/.test(value[span.end] ?? "")
-      if ((offset > span.start && offset <= span.end) || afterTokenSpace) {
+      const deletingTokenEnd = offset === span.end - 1 && value[offset] === span.label.at(-1)
+      if ((offset > span.start && offset <= span.end) || deletingTokenEnd || afterTokenSpace) {
         const end = afterTokenSpace ? span.end + 1 : span.end
         return { value: `${value.slice(0, span.start)}${value.slice(end)}`, cursorOffset: span.start, deleted: true }
       }
@@ -98,12 +99,12 @@ function clampCursor(value: string, cursorOffset: number) {
 }
 
 function placeholderSpans(value: string, placeholders: readonly PromptPlaceholder[]) {
-  const spans: { start: number; end: number }[] = []
+  const spans: { start: number; end: number; label: string }[] = []
   for (const placeholder of placeholders) {
     if (!placeholder.label) continue
     let start = value.indexOf(placeholder.label)
     while (start >= 0) {
-      spans.push({ start, end: start + placeholder.label.length })
+      spans.push({ start, end: start + placeholder.label.length, label: placeholder.label })
       start = value.indexOf(placeholder.label, start + placeholder.label.length)
     }
   }
