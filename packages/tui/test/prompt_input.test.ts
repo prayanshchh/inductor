@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { insertTextAtCursor, parsePromptHistory, PROMPT_HISTORY_LIMIT, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
+import { deletePromptPlaceholderAtCursor, insertTextAtCursor, parsePromptHistory, PROMPT_HISTORY_LIMIT, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type PromptHistoryState } from "../src/prompt_input"
 
 describe("prompt input helpers", () => {
   test("inserts ctrl-j newline at the cursor", () => {
@@ -63,5 +63,25 @@ describe("prompt input helpers", () => {
     expect(shouldCompactPastedText("short paste")).toBe(false)
     expect(shouldCompactPastedText("x".repeat(501))).toBe(true)
     expect(shouldCompactPastedText(Array.from({ length: 9 }, (_, i) => `line ${i}`).join("\n"))).toBe(true)
+  })
+
+  test("deletes multi-word skill placeholders atomically with backspace", () => {
+    const prompt = "use $code review skill please"
+    const placeholder = { label: "$code review skill", replacement: "code review skill" }
+    expect(deletePromptPlaceholderAtCursor(prompt, "$code review skill".length + 4, [placeholder], "backward")).toEqual({
+      value: "use  please",
+      cursorOffset: 4,
+      deleted: true,
+    })
+  })
+
+  test("deletes a multi-word skill placeholder and its trailing insertion space", () => {
+    const prompt = "use $code review skill please"
+    const placeholder = { label: "$code review skill", replacement: "code review skill" }
+    expect(deletePromptPlaceholderAtCursor(prompt, "$code review skill ".length + 4, [placeholder], "backward")).toEqual({
+      value: "use please",
+      cursorOffset: 4,
+      deleted: true,
+    })
   })
 })
