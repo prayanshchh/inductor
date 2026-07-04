@@ -78,6 +78,15 @@ export type BackendOptions = {
   stateDb?: string
   /** Bind the run to a worktree the TUI pre-created for this session. */
   workspaceId?: string
+  /** Skill names or paths to activate for this turn. */
+  skills?: string[]
+}
+
+export type SkillInfo = {
+  name: string
+  description: string
+  path: string
+  source: string
 }
 
 export type Worktree = {
@@ -199,6 +208,9 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
   if (options.workspaceOnly) {
     cmd.push("--workspace-only")
   }
+  for (const skill of options.skills ?? []) {
+    cmd.push("--skill", skill)
+  }
 
   const proc = Bun.spawn(cmd, {
     cwd: options.repoRoot,
@@ -276,6 +288,11 @@ export async function listWorktrees(options: Pick<BackendOptions, "backendBin" |
   if (options.workspace) args.push("--source-repo", options.workspace)
   const output = await runBackendJson(options, args)
   return Array.isArray(output) ? (output as Worktree[]) : []
+}
+
+export async function listSkills(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "workspace">): Promise<SkillInfo[]> {
+  const output = await runBackendJson(options, ["skill", "list", "--workspace", options.workspace, "--json"])
+  return Array.isArray(output) ? (output as SkillInfo[]) : []
 }
 
 

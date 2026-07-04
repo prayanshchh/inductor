@@ -20,7 +20,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listProviderModels, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type Worktree } from "./backend"
+import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type SkillInfo, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -39,9 +39,8 @@ import {
   type PromptImageAttachment,
   type PromptTextAttachment,
 } from "./mentions"
-import { deletePromptPlaceholderAtCursor, expandPromptPlaceholders, insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState } from "./prompt_input"
+import { deletePromptPlaceholderAtCursor, expandPromptPlaceholders, insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState, type PromptPlaceholder } from "./prompt_input"
 import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
-
 export type AppProps = BackendOptions & {
   exitApp(): void
   registerCtrlCHandler(handler: (() => void) | undefined): void
@@ -69,15 +68,18 @@ type AgentSlot = {
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
-type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "pr" | "review" | "sessions"
+type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "pr" | "review" | "sessions" | "skills"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
 type ConnectChoice = { provider: string; label: string; description: string }
 type EffortChoice = { name: string; label: string; description: string; value: EffortValue }
 type AgentChoice = { name: string; description: string }
 type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
-type PaletteItem = Command | ModelChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | FileChoice
+type SkillChoice = SkillInfo & { label: string }
+type PaletteItem = Command | ModelChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | SkillChoice | FileChoice
+type SkillMentionState = { triggerStart: number; token: string; query: string }
+type SkillCreateFlow = { step: "name" | "description" | "body"; name: string; description: string }
 type StopIntent = "interrupt" | "exit"
 type PrFlow = { step: "base" | "message"; base: string; worktree: Worktree }
 type NoticeTone = "cyan" | "red" | "muted"
@@ -108,6 +110,7 @@ const theme = {
   yellow: "#f2b86b",
   purple: "#b18cff",
   orange: "#ffbf80",
+  skillOrange: "#ff7a00",
   addedBg: "#142f25",
   removedBg: "#34191b",
   selectionBg: "#3b4d6c",
@@ -134,6 +137,8 @@ const commands: Command[] = [
   { name: "/pr", description: "Create pull request", action: "pr" },
   { name: "/review", description: "Review changes", action: "review" },
   { name: "/sessions", description: "Open sessions", action: "sessions" },
+  { name: "/skill", description: "Create a reusable skill", action: "skills" },
+  { name: "/skills", description: "Toggle reusable skills for future prompts", action: "skills" },
   { name: "/clear", description: "Clear transcript", action: "clear" },
   { name: "/exit", description: "Exit app", action: "exit" },
 ]
@@ -318,16 +323,25 @@ export function App(props: AppProps) {
   const [palette, setPalette] = createSignal<PaletteKind>()
   const [selected, setSelected] = createSignal(0)
   const [mention, setMention] = createSignal<MentionState>()
+  const [skillMention, setSkillMention] = createSignal<SkillMentionState>()
   const [pasteCount, setPasteCount] = createSignal(0)
   const [promptImages, setPromptImages] = createSignal<PromptImageAttachment[]>([])
   const [promptPastes, setPromptPastes] = createSignal<PromptTextAttachment[]>([])
   const [prFlow, setPrFlow] = createSignal<PrFlow>()
   const [worktrees, setWorktrees] = createSignal<Worktree[]>([])
+  const [skills, setSkills] = createSignal<SkillChoice[]>([])
+  const [activeSkills, setActiveSkills] = createSignal<string[]>([]) // Explicitly tagged/preloaded; all discovered skills are still advertised to the model.
+  const [skillsStatus, setSkillsStatus] = createSignal("")
+  const [skillCreateFlow, setSkillCreateFlow] = createSignal<SkillCreateFlow>()
   const [worktreeBusy, setWorktreeBusy] = createSignal<string>()
   const [sessionListStatus, setSessionListStatus] = createSignal("")
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
   const [now, setNow] = createSignal(Date.now())
   const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
+  const skillHighlightStyle = SyntaxStyle.fromStyles({ skill: { fg: theme.skillOrange, bold: true } })
+  const skillHighlightStyleId = skillHighlightStyle.getStyleId("skill") ?? skillHighlightStyle.registerStyle("skill", { fg: theme.skillOrange, bold: true })
+  const skillHighlightRef = 4242
+
   const dimensions = useTerminalDimensions()
   const availableInputWidth = createMemo(() => Math.max(1, dimensions().width - 6))
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
@@ -396,6 +410,15 @@ export function App(props: AppProps) {
     const active = mention()
     return active ? listFileChoices(props.workspace, active) : []
   })
+  const skillItems = createMemo(() => {
+    const active = skillMention()
+    if (!active) return skills()
+    const query = active.query.toLowerCase()
+    const selected = new Set(activeSkills())
+    return skills()
+      .filter((skill) => !selected.has(skill.name) || skill.name.toLowerCase().includes(query))
+      .filter((skill) => skill.name.toLowerCase().includes(query) || skill.description.toLowerCase().includes(query) || skill.source.toLowerCase().includes(query))
+  })
   const paletteItems = createMemo(() => {
     if (palette() === "files") return fileItems()
     if (palette() === "models") {
@@ -406,6 +429,7 @@ export function App(props: AppProps) {
     if (palette() === "agents") return agentChoices
     if (palette() === "modes") return effortChoices(selectedModelChoice(provider(), model()))
     if (palette() === "permissions") return permissionChoices
+    if (palette() === "skills") return skillItems()
     return commandItems()
   })
 
@@ -418,10 +442,15 @@ export function App(props: AppProps) {
     props.registerCtrlCHandler(handleCtrlC)
     props.registerSelectionTransform((text) => expandPromptPlaceholders(text, promptPlaceholders()))
     void refreshWorktrees()
+    void refreshSkills()
     const worktreeRefreshTimer = setInterval(() => void refreshWorktrees(), 30_000)
     void refreshCopilotModels()
     onCleanup(() => clearInterval(worktreeRefreshTimer))
   })
+  createEffect(() => {
+    applySkillHighlights(input, draft(), skills(), skillHighlightStyle, skillHighlightStyleId, skillHighlightRef)
+  })
+
   onCleanup(() => {
     props.registerCtrlCHandler(undefined)
     props.registerSelectionTransform(undefined)
@@ -433,6 +462,7 @@ export function App(props: AppProps) {
     for (const run of runs.values()) run.kill()
     runs.clear()
     runFlags.clear()
+    skillHighlightStyle.destroy()
     terminalSession?.kill()
   })
 
@@ -472,6 +502,14 @@ export function App(props: AppProps) {
       setNotice({ text: "PR creation cancelled", tone: "muted" })
       return
     }
+    if (isEscape(event) && skillCreateFlow()) {
+      event.preventDefault()
+      event.stopPropagation()
+      setSkillCreateFlow(undefined)
+      replacePrompt("")
+      setNotice({ text: "Skill creation cancelled", tone: "muted" })
+      return
+    }
     if (isEscape(event) && (fstate().running || runs.has(store.focusedKey))) {
       event.preventDefault()
       event.stopPropagation()
@@ -484,6 +522,7 @@ export function App(props: AppProps) {
   function submit() {
     const visiblePrompt = input.plainText.trim()
     const prompt = promptForSubmit(visiblePrompt, promptImages(), promptPastes()).trim()
+    const promptSkills = extractSkillMentions(visiblePrompt, skills())
     if (fstate().running) return
     if (palette()) {
       acceptPalette()
@@ -491,6 +530,10 @@ export function App(props: AppProps) {
     }
     if (prFlow()) {
       void submitPrFlow(visiblePrompt)
+      return
+    }
+    if (skillCreateFlow()) {
+      submitSkillCreateFlow(visiblePrompt)
       return
     }
     if (!visiblePrompt) return
@@ -529,6 +572,7 @@ export function App(props: AppProps) {
       // the first prompt (named after the work) when these are absent.
       workspaceId: focusedAgent().workspaceId,
       stateDb: focusedAgent().stateDb,
+      skills: uniqueStrings([...activeSkills(), ...promptSkills]),
     }, {
       onEvent(event) {
         if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) {
@@ -592,11 +636,25 @@ export function App(props: AppProps) {
     const activeMention = findActiveMention(value)
     if (activeMention) {
       setMention(activeMention)
+      setSkillMention(undefined)
       openPalette("files")
+      return
+    }
+    const activeSkillMention = findActiveSkillMention(value)
+    if (activeSkillMention) {
+      setSkillMention(activeSkillMention)
+      setMention(undefined)
+      void refreshSkills()
+      openPalette("skills")
       return
     }
     if (palette() === "files") {
       setMention(undefined)
+      setPalette(undefined)
+      setSelected(0)
+    }
+    if (palette() === "skills" && skillMention()) {
+      setSkillMention(undefined)
       setPalette(undefined)
       setSelected(0)
     }
@@ -614,13 +672,13 @@ export function App(props: AppProps) {
     void normalizeImagePathPaste(value)
   }
 
-  function promptPlaceholders() {
+  function promptPlaceholders(): PromptPlaceholder[] {
     return [
       ...promptImages().map((image) => ({ label: image.label, replacement: `${image.label} @${image.path}` })),
       ...promptPastes().map((paste) => ({ label: paste.label, replacement: paste.text })),
+      ...skillPlaceholders(input.plainText, skills()),
     ]
   }
-
   function deletePromptPlaceholder(direction: "backward" | "forward") {
     const next = deletePromptPlaceholderAtCursor(input.plainText, input.cursorOffset, promptPlaceholders(), direction)
     if (!next.deleted) return false
@@ -633,6 +691,7 @@ export function App(props: AppProps) {
   function dismissPalette() {
     setPalette(undefined)
     setMention(undefined)
+    setSkillMention(undefined)
     setSelected(0)
   }
 
@@ -720,6 +779,10 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "skills") {
+      acceptSkillChoice(item as SkillChoice)
+      return
+    }
     runCommand(item as Command)
   }
 
@@ -763,7 +826,33 @@ export function App(props: AppProps) {
       closePalette()
       return
     }
+    if (palette() === "skills") {
+      acceptSkillChoice(item as SkillChoice)
+      return
+    }
     runCommand(item as Command)
+  }
+
+  function toggleSkill(choice: SkillChoice) {
+    const isEnabled = activeSkills().includes(choice.name)
+    setActiveSkills((current) => isEnabled ? current.filter((name) => name !== choice.name) : [...current, choice.name])
+    setNotice({ text: `${isEnabled ? "unpreloaded" : "preloaded"} skill ${choice.name} · all skills are always visible to the model`, tone: "muted" })
+    closePalette()
+  }
+
+  function acceptSkillChoice(choice: SkillChoice) {
+    const inline = skillMention()
+    if (!inline) {
+      toggleSkill(choice)
+      return
+    }
+
+    const next = replaceSkillMention(input.plainText, inline, choice)
+    input.setText(next)
+    input.cursorOffset = inline.triggerStart + choice.name.length + 2
+    setDraft(next)
+    setNotice({ text: `tagged skill ${choice.name} · model can also invoke any listed skill`, tone: "muted" })
+    closePalette(true)
   }
 
   function connectProvider(choice: ConnectChoice) {
@@ -825,12 +914,15 @@ export function App(props: AppProps) {
     }
   }
 
-  function closePalette() {
+  function closePalette(keepPrompt = false) {
     setPalette(undefined)
     setMention(undefined)
+    setSkillMention(undefined)
     setSelected(0)
-    input.setText("")
-    setDraft("")
+    if (!keepPrompt) {
+      input.setText("")
+      setDraft("")
+    }
     queueMicrotask(() => input.focus())
   }
 
@@ -1006,6 +1098,20 @@ export function App(props: AppProps) {
       openPalette("permissions")
       return
     }
+    if (command.action === "skills") {
+      if (command.name === "/skill") {
+        closePalette()
+        setSkillCreateFlow({ step: "name", name: "", description: "" })
+        replacePrompt("")
+        setNotice({ text: "Skill name · enter to continue, or use $skill in a prompt to activate existing skills", tone: "cyan" })
+        return
+      }
+      closePalette(true)
+      void refreshSkills()
+      openPalette("skills")
+      setNotice({ text: "Preload/tag skills; every discovered skill is listed to the model by default", tone: "cyan" })
+      return
+    }
     if (command.action === "pr") {
       closePalette()
       startPullRequestFlow()
@@ -1069,6 +1175,42 @@ export function App(props: AppProps) {
     setPrFlow(undefined)
     recordHistory(`/pr ${flow.base} ${message}`)
     await createPullRequestForWorktree(flow.worktree, flow.base, message)
+  }
+
+  function submitSkillCreateFlow(value: string) {
+    const flow = skillCreateFlow()
+    if (!flow) return
+    if (flow.step === "name") {
+      const name = value.trim()
+      if (!name) {
+        setNotice({ text: "Skill name is required", tone: "red" })
+        return
+      }
+      setSkillCreateFlow({ step: "description", name, description: "" })
+      replacePrompt("")
+      setNotice({ text: `Description for ${name} · when should agents use this skill?`, tone: "cyan" })
+      return
+    }
+    if (flow.step === "description") {
+      const description = value.trim()
+      if (!description) {
+        setNotice({ text: "Skill description is required", tone: "red" })
+        return
+      }
+      setSkillCreateFlow({ ...flow, step: "body", description })
+      replacePrompt("Describe the exact steps, constraints, examples, and files/tools this skill should use.")
+      setNotice({ text: `Instructions for ${flow.name} · edit or press enter for the template`, tone: "cyan" })
+      return
+    }
+
+    const body = value.trim() || "Describe the exact steps, constraints, examples, and files/tools this skill should use."
+    const skillPath = createWorkspaceSkill(props.workspace, flow.name, flow.description, body)
+    input.setText("")
+    setDraft("")
+    setSkillCreateFlow(undefined)
+    recordHistory(`/skill ${flow.name}`)
+    setNotice({ text: `created skill ${sanitizeSkillName(flow.name)} at ${toWorkspacePath(skillPath)}`, tone: "muted" })
+    void refreshSkills()
   }
 
   async function createPullRequestForWorktree(worktree: Worktree, base: string, message: string) {
@@ -1180,6 +1322,18 @@ export function App(props: AppProps) {
       setSessionListStatus("")
     } catch (error) {
       setSessionListStatus(error instanceof Error ? error.message : "Could not load worktrees")
+    }
+  }
+
+  async function refreshSkills() {
+    setSkillsStatus("loading")
+    try {
+      const next = await listSkills(props)
+      setSkills(next.map((skill) => ({ ...skill, label: skill.name })))
+      setSkillsStatus("")
+    } catch (error) {
+      setSkills([])
+      setSkillsStatus(error instanceof Error ? error.message : "Could not load skills")
     }
   }
 
@@ -1572,6 +1726,7 @@ export function App(props: AppProps) {
           model={model()}
           mode={mode()}
           agent={agent()}
+          activeSkills={activeSkills()}
           inputRef={(ref) => (input = ref)}
           draft={draft}
           inputWidth={availableInputWidth()}
@@ -1579,6 +1734,7 @@ export function App(props: AppProps) {
           submit={submit}
           palette={palette}
           paletteItems={paletteItems}
+          skillsStatus={skillsStatus()}
           selected={selected}
           moveSelection={moveSelection}
           dismissPalette={dismissPalette}
@@ -2464,6 +2620,7 @@ function Composer(props: {
   model: string
   mode: EffortValue
   agent: string
+  activeSkills: string[]
   inputRef: (ref: TextareaRenderable) => void
   draft: () => string
   inputWidth: number
@@ -2471,6 +2628,7 @@ function Composer(props: {
   submit: () => void
   palette: () => PaletteKind
   paletteItems: () => readonly PaletteItem[]
+  skillsStatus: string
   selected: () => number
   moveSelection: (delta: number) => void
   dismissPalette: () => void
@@ -2486,12 +2644,12 @@ function Composer(props: {
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
-  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : "Ask INDUCTOR..."
+  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : props.activeSkills.length ? `Ask INDUCTOR with ${props.activeSkills.join(", ")}...` : "Ask INDUCTOR..."
   const inputRows = createMemo(() => promptVisualRows(props.draft(), props.inputWidth))
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
       <Show when={props.palette()}>
-        {(kind) => <Palette kind={kind()} items={props.paletteItems()} selected={props.selected()} choose={props.choosePalette} />}
+        {(kind) => <Palette kind={kind()} items={props.paletteItems()} selected={props.selected()} skillsStatus={props.skillsStatus} choose={props.choosePalette} />}
       </Show>
       <Show when={showActivity()}>
         <box
@@ -2682,9 +2840,11 @@ function Palette(props: {
   kind: PaletteKind
   items: readonly PaletteItem[]
   selected: number
+  skillsStatus: string
   choose: (index: number) => void
 }) {
   const maxRows = () => props.kind === "models" ? 10 : 14
+  const isSkillPalette = () => props.kind === "skills"
   const startIndex = () => {
     const rows = maxRows()
     if (props.items.length <= rows) return 0
@@ -2709,6 +2869,11 @@ function Palette(props: {
       <Show when={hiddenBefore() > 0}>
         <text fg={theme.dim}>  ↑ {hiddenBefore()} more</text>
       </Show>
+      <Show when={props.items.length === 0}>
+        <text fg={theme.muted}>
+          {emptyPaletteMessage(props.kind, props.skillsStatus)}
+        </text>
+      </Show>
       <For each={visibleItems()}>
         {(item, index) => {
           const absoluteIndex = () => startIndex() + index()
@@ -2718,9 +2883,11 @@ function Palette(props: {
               flexDirection="row"
               backgroundColor={selected() ? theme.paletteSelected : theme.palette}
               paddingLeft={1}
+              paddingTop={isSkillPalette() ? 1 : 0}
+              paddingBottom={isSkillPalette() ? 1 : 0}
               onMouseUp={() => props.choose(absoluteIndex())}
             >
-              <text width={18} fg={selected() ? theme.cyan : theme.text} attributes={selected() ? TextAttributes.BOLD : undefined}>
+              <text width={18} fg={paletteItemLabelColor(item, selected())} attributes={selected() ? TextAttributes.BOLD : undefined}>
                 {paletteItemLabel(item)}
               </text>
               <text fg={selected() ? theme.text : theme.muted}>
@@ -2737,14 +2904,114 @@ function Palette(props: {
   )
 }
 
+function emptyPaletteMessage(kind: PaletteKind, skillsStatus: string) {
+  if (kind === "skills") {
+    if (skillsStatus === "loading") return "  loading skills…"
+    if (skillsStatus) return `  could not load skills: ${skillsStatus}`
+    return "  no skills found — create one with /skill"
+  }
+  return "  no matches"
+}
+
+function paletteItemLabelColor(item: PaletteItem, selected: boolean) {
+  if (isSkillChoice(item)) return theme.skillOrange
+  return selected ? theme.cyan : theme.text
+}
+
+function isSkillChoice(item: PaletteItem): item is SkillChoice {
+  return "source" in item && "path" in item
+}
+
 function paletteItemLabel(item: PaletteItem) {
   return "label" in item ? item.label : item.name
 }
 
 function paletteItemDescription(item: PaletteItem) {
   if ("efforts" in item) return item.group
+  if ("source" in item) return `${item.source} · ${item.description || item.path}`
   if ("description" in item) return item.description
   return ""
+}
+
+function findActiveSkillMention(value: string): SkillMentionState | undefined {
+  const triggerStart = value.lastIndexOf("$")
+  if (triggerStart < 0) return undefined
+  if (triggerStart > 0 && !/\s/.test(value[triggerStart - 1])) return undefined
+
+  const token = value.slice(triggerStart)
+  if (/\s/.test(token)) return undefined
+  const query = token.slice(1)
+  if (query.includes("/")) return undefined
+  return { triggerStart, token, query }
+}
+
+function replaceSkillMention(value: string, mention: SkillMentionState, choice: SkillChoice) {
+  return `${value.slice(0, mention.triggerStart)}$${choice.name} ${value.slice(mention.triggerStart + mention.token.length)}`
+}
+
+function applySkillHighlights(textarea: TextareaRenderable | undefined, value: string, choices: readonly SkillChoice[], style: SyntaxStyle, styleId: number, hlRef: number) {
+  if (!textarea) return
+  textarea.syntaxStyle = style
+  textarea.removeHighlightsByRef(hlRef)
+
+  for (const span of skillMentionSpans(value, choices)) {
+    textarea.addHighlightByCharRange({ start: span.start, end: span.end, styleId, hlRef, priority: 100 })
+  }
+}
+
+function extractSkillMentions(value: string, choices: readonly SkillChoice[]) {
+  return uniqueStrings(skillMentionSpans(value, choices).map((span) => span.name))
+}
+
+function skillPlaceholders(value: string, choices: readonly SkillChoice[]): PromptPlaceholder[] {
+  return skillMentionSpans(value, choices).map((span) => ({ label: value.slice(span.start, span.end), replacement: span.name }))
+}
+
+function skillMentionSpans(value: string, choices: readonly SkillChoice[]) {
+  if (choices.length === 0) return []
+  const spans: { start: number; end: number; name: string }[] = []
+  const sorted = [...choices]
+    .map((choice) => choice.name)
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "$") continue
+    if (index > 0 && !/\s/.test(value[index - 1])) continue
+
+    for (const name of sorted) {
+      const end = index + 1 + name.length
+      if (value.slice(index + 1, end) !== name) continue
+      const next = value[end]
+      if (next && !/\s/.test(next)) continue
+      spans.push({ start: index, end, name })
+      index = end - 1
+      break
+    }
+  }
+
+  return spans
+}
+
+function createWorkspaceSkill(workspace: string, name: string, description: string, body: string) {
+  const slug = sanitizeSkillName(name)
+  if (!slug) throw new Error("invalid skill name")
+  const filePath = path.join(workspace, ".inductor", "skills", slug, "SKILL.md")
+  mkdirSync(path.dirname(filePath), { recursive: true })
+  writeFileSync(filePath, `---\nname: ${slug}\ndescription: ${yamlString(description)}\n---\n\n# ${slug}\n\n${body.trim()}\n`)
+  return filePath
+}
+
+function sanitizeSkillName(name: string) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "")
+}
+
+function yamlString(value: string) {
+  return JSON.stringify(value)
+}
+
+function uniqueStrings(values: readonly string[]) {
+  return Array.from(new Set(values))
 }
 
 function TelemetrySidebar(props: {

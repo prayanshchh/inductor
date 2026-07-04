@@ -32,7 +32,7 @@ use provider_codex::CodexProvider;
 use provider_copilot::CopilotProvider;
 use provider_core::{ProviderAuth, ProviderAuthKind, ProviderPlugin};
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use session_naming::{
     SessionNamingConfig, generate_context_name, generate_pull_request_description,
@@ -74,6 +74,10 @@ enum Command {
     Context {
         #[command(subcommand)]
         command: ContextCommand,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     Db {
         #[command(subcommand)]
@@ -156,6 +160,10 @@ enum Command {
 
         #[arg(long, value_enum, default_value_t = EffortArg::Medium)]
         effort: EffortArg,
+
+        /// Skill names or paths to load into the system prompt for this turn.
+        #[arg(long = "skill")]
+        skills: Vec<String>,
 
         /// App-level database path. When set, workspace/session metadata is also recorded there.
         #[arg(long)]
@@ -333,6 +341,60 @@ impl From<EffortProviderArg> for ProviderFamily {
             EffortProviderArg::Generic => Self::Generic,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// List skills found in the workspace, repo, and global skill directories.
+    List {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new standard skill under <workspace>/.agents/skills/<name>/SKILL.md.
+    Create {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        #[arg(long)]
+        name: String,
+
+        #[arg(long)]
+        description: String,
+
+        #[arg(long)]
+        body: Option<String>,
+
+        #[arg(long)]
+        force: bool,
+
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the composed prompt layer, optionally preloading one or more tagged skills.
+    Use {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillInfo {
+    name: String,
+    description: String,
+    path: PathBuf,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillFrontMatter {
+    name: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -660,6 +722,7 @@ async fn main() {
         Some(Command::Provider { command }) => run_provider_command(command).await,
         Some(Command::Diff { command }) => run_diff_command(command).await,
         Some(Command::Context { command }) => run_context_command(command).await,
+        Some(Command::Skill { command }) => run_skill_command(command).await,
         Some(Command::Db { command }) => run_db_command(command).await,
         Some(Command::OpenTui {
             workspace,
@@ -685,6 +748,7 @@ async fn main() {
             tool_result_inline_bytes,
             blob_root,
             effort,
+            skills,
             app_db,
             state_db,
             session_id,
@@ -706,6 +770,7 @@ async fn main() {
                 tool_result_inline_bytes,
                 blob_root,
                 effort,
+                skills,
                 app_db,
                 state_db,
                 session_id,
@@ -1163,6 +1228,343 @@ async fn run_context_command(command: ContextCommand) -> Result<(), String> {
     Ok(())
 }
 
+async fn run_skill_command(command: SkillCommand) -> Result<(), String> {
+    match command {
+        SkillCommand::List { workspace, json } => {
+            let skills = discover_skills(&workspace)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&skills).map_err(|err| err.to_string())?
+                );
+            } else if skills.is_empty() {
+                println!("no skills found");
+            } else {
+                for skill in skills {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        skill.name,
+                        skill.source,
+                        skill.path.display(),
+                        skill.description
+                    );
+                }
+            }
+        }
+        SkillCommand::Create {
+            workspace,
+            name,
+            description,
+            body,
+            force,
+            json,
+        } => {
+            let path = create_skill(&workspace, &name, &description, body.as_deref(), force)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({ "name": name, "path": path }))
+                        .map_err(|err| err.to_string())?
+                );
+            } else {
+                println!("created skill: {}", path.display());
+            }
+        }
+        SkillCommand::Use { workspace, skills } => {
+            if let Some(layer) = compose_skill_prompt_layer(&workspace, &workspace, &skills)? {
+                println!("{layer}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn create_skill(
+    workspace: &Path,
+    name: &str,
+    description: &str,
+    body: Option<&str>,
+    force: bool,
+) -> Result<PathBuf, String> {
+    let slug = sanitize_skill_name(name)?;
+    let dir = workspace.join(".agents").join("skills").join(&slug);
+    let path = dir.join("SKILL.md");
+    if path.exists() && !force {
+        return Err(format!(
+            "skill already exists: {} (pass --force to overwrite)",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let body = body
+        .unwrap_or("Describe when to use this skill and the exact steps the agent should follow.");
+    let content = format!(
+        "---\nname: {slug}\ndescription: {}\n---\n\n# {slug}\n\n{}\n",
+        yaml_scalar(description),
+        body.trim()
+    );
+    std::fs::write(&path, content).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn discover_skills(workspace: &Path) -> Result<Vec<SkillInfo>, String> {
+    let mut roots = Vec::new();
+    let repo_root = resolve_repo_root().ok();
+
+    for root in workspace_skill_roots(workspace, repo_root.as_deref()) {
+        roots.push((root.join(".agents").join("skills"), "repo".to_string()));
+        roots.push((root.join(".claude").join("skills"), "claude-project".to_string()));
+        roots.push((root.join(".github").join("skills"), "copilot-project".to_string()));
+    }
+
+    // Back-compatibility for skills created by the first Inductor skill MVP.
+    roots.push((
+        workspace.join(".inductor").join("skills"),
+        "legacy-inductor".to_string(),
+    ));
+    roots.push((workspace.join("skills"), "legacy-workspace".to_string()));
+    if let Some(repo_root) = &repo_root {
+        roots.push((repo_root.join("skills"), "legacy-repo".to_string()));
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push((home.join(".agents").join("skills"), "user".to_string()));
+        roots.push((home.join(".claude").join("skills"), "claude-user".to_string()));
+        roots.push((home.join(".copilot").join("skills"), "copilot-user".to_string()));
+        roots.push((home.join(".codex").join("skills"), "codex-user-legacy".to_string()));
+        roots.push((
+            home.join(".inductor").join("skills"),
+            "legacy-inductor-user".to_string(),
+        ));
+    }
+
+    roots.push((PathBuf::from("/etc/codex/skills"), "codex-admin".to_string()));
+
+    let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (root, source) in roots {
+        read_skills_from_root(&root, &source, &mut seen, &mut skills)?;
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    Ok(skills)
+}
+
+fn workspace_skill_roots(workspace: &Path, repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut current = workspace.to_path_buf();
+    loop {
+        roots.push(current.clone());
+        if repo_root.is_some_and(|root| current == root) {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    roots
+}
+
+fn read_skills_from_root(
+    root: &Path,
+    source: &str,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    skills: &mut Vec<SkillInfo>,
+) -> Result<(), String> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(root).map_err(|err| err.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let skill_path = if path.is_dir() {
+            path.join("SKILL.md")
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            path
+        } else {
+            continue;
+        };
+        let seen_key = skill_path
+            .canonicalize()
+            .unwrap_or_else(|_| skill_path.clone());
+        if !skill_path.is_file() || !seen.insert(seen_key) {
+            continue;
+        }
+        if let Some(skill) = read_skill_info(&skill_path, source) {
+            skills.push(skill);
+        }
+    }
+    Ok(())
+}
+
+fn compose_skill_prompt_layer(
+    workspace: &Path,
+    source_workspace: &Path,
+    requested: &[String],
+) -> Result<Option<String>, String> {
+    let catalog = discover_skills(source_workspace)?;
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+
+    let catalog_rows = catalog
+        .iter()
+        .map(|skill| {
+            format!(
+                "- ${}: {} (source: {}; path: {})",
+                skill.name,
+                skill.description,
+                skill.source,
+                skill.path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut sections = Vec::new();
+    for request in requested {
+        let path = resolve_skill_request(workspace, source_workspace, &catalog, request)?;
+        let content = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        let name = skill_name_from_path(&path, &content);
+        sections.push(format!(
+            "## Preloaded skill: {name}\nSource: {}\n\n{}",
+            path.display(),
+            content.trim()
+        ));
+    }
+
+    let preloaded = if sections.is_empty() {
+        "No skill has been explicitly preloaded for this turn. Use the catalog above to choose skills yourself.".to_string()
+    } else {
+        sections.join("\n\n---\n\n")
+    };
+
+    Ok(Some(format!(
+        "# Skills\n\nSkills are provider-standard SKILL.md capability packages from Codex, Claude, Copilot, and compatible locations. All discovered skill names, descriptions, and paths are listed below so you can choose the right skill without the user tagging it.\n\nBe proactive: whenever a task matches a skill description, invoke that skill by reading its SKILL.md at the listed path, then follow the skill instructions. Do not wait for the user to tag the skill. If the user explicitly mentions a $skill, prefer that skill. If a skill conflicts with higher-priority system or developer instructions, follow the higher-priority instruction.\n\n## Available skills\n\n{}\n\n## Explicitly tagged/preloaded skills\n\n{}",
+        catalog_rows,
+        preloaded
+    )))
+}
+
+fn resolve_skill_request(
+    workspace: &Path,
+    source_workspace: &Path,
+    catalog: &[SkillInfo],
+    request: &str,
+) -> Result<PathBuf, String> {
+    let request = request.strip_prefix('$').unwrap_or(request);
+    let requested_path = PathBuf::from(request);
+    if requested_path.components().count() > 1 || request.ends_with(".md") {
+        let path = if requested_path.is_absolute() {
+            requested_path
+        } else {
+            workspace.join(&requested_path)
+        };
+        let path = if path.is_dir() {
+            path.join("SKILL.md")
+        } else {
+            path
+        };
+        if path.is_file() {
+            return Ok(path);
+        }
+        let source_path = if PathBuf::from(request).is_absolute() {
+            PathBuf::from(request)
+        } else {
+            source_workspace.join(request)
+        };
+        let source_path = if source_path.is_dir() {
+            source_path.join("SKILL.md")
+        } else {
+            source_path
+        };
+        if source_path.is_file() {
+            return Ok(source_path);
+        }
+    }
+    catalog
+        .iter()
+        .find(|skill| skill.name == request)
+        .map(|skill| skill.path.clone())
+        .ok_or_else(|| format!("skill not found: {request}"))
+}
+
+fn read_skill_info(path: &Path, source: &str) -> Option<SkillInfo> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (frontmatter, _) = split_frontmatter(&content);
+    let parsed = frontmatter.and_then(|raw| serde_yaml::from_str::<SkillFrontMatter>(raw).ok());
+    let fallback_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string();
+    Some(SkillInfo {
+        name: parsed
+            .as_ref()
+            .and_then(|meta| meta.name.clone())
+            .unwrap_or(fallback_name),
+        description: parsed.and_then(|meta| meta.description).unwrap_or_default(),
+        path: path.to_path_buf(),
+        source: source.to_string(),
+    })
+}
+
+fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return (None, content);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (None, content);
+    };
+    (Some(&rest[..end]), &rest[end + 4..])
+}
+
+fn skill_name_from_path(path: &Path, content: &str) -> String {
+    let (frontmatter, _) = split_frontmatter(content);
+    frontmatter
+        .and_then(|raw| serde_yaml::from_str::<SkillFrontMatter>(raw).ok())
+        .and_then(|meta| meta.name)
+        .or_else(|| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "skill".to_string())
+}
+
+fn sanitize_skill_name(name: &str) -> Result<String, String> {
+    let slug = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() || slug == "." || slug == ".." || slug.contains("..") {
+        return Err(format!("invalid skill name: {name}"));
+    }
+    Ok(slug)
+}
+
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(value)
+        .unwrap_or_else(|_| format!("\"{}\"", value.replace('"', "\\\"")))
+        .trim()
+        .trim_start_matches("---")
+        .trim()
+        .to_string()
+}
+
 async fn run_db_command(command: DbCommand) -> Result<(), String> {
     match command {
         DbCommand::InitApp { path } => {
@@ -1295,6 +1697,7 @@ async fn run_harness_command(
     tool_result_inline_bytes: usize,
     blob_root: Option<PathBuf>,
     effort: EffortArg,
+    skills: Vec<String>,
     app_db: Option<PathBuf>,
     state_db: Option<PathBuf>,
     requested_session_id: Option<SessionId>,
@@ -1504,6 +1907,9 @@ async fn run_harness_command(
         ProviderKind::Codex => ProviderFamily::Codex,
         ProviderKind::Copilot => ProviderFamily::Copilot,
     };
+    if let Some(layer) = compose_skill_prompt_layer(&workspace_path, &source_workspace, &skills)? {
+        config.prompt.system_layers.push(layer);
+    }
     if let Some(layer) = repo_memory_prompt_layer(&memory_file)? {
         config.prompt.system_layers.push(layer);
     }
