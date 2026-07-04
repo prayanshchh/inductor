@@ -24,7 +24,7 @@ pub fn classify(call: &ParsedToolCall) -> Vec<RiskFlag> {
                 classify_bash(command, &mut flags);
             }
         }
-        "read_file" | "glob" | "grep" => {
+        "read_file" | "glob" | "grep" | "read_memory" => {
             if let Some(path) = call.input.get("path").and_then(Value::as_str) {
                 classify_read_path(path, &mut flags);
             }
@@ -34,7 +34,7 @@ pub fn classify(call: &ParsedToolCall) -> Vec<RiskFlag> {
                 classify_read_path(path, &mut flags);
             }
         }
-        "write_file" | "edit_file" | "multi_edit" => {
+        "write_file" | "write_memory" | "edit_file" | "multi_edit" => {
             if let Some(path) = call.input.get("path").and_then(Value::as_str) {
                 classify_write_path(path, &mut flags);
             }
@@ -304,6 +304,7 @@ pub fn is_mutating_tool_name(name: &str) -> bool {
     matches!(
         name,
         "write_file"
+            | "write_memory"
             | "edit_file"
             | "multi_edit"
             | "apply_patch"
@@ -339,6 +340,7 @@ fn rule_matches(rule: &AllowRule, call: &ParsedToolCall) -> bool {
             matches!(
                 call.name.as_str(),
                 "write_file"
+                    | "write_memory"
                     | "edit_file"
                     | "multi_edit"
                     | "apply_patch"

@@ -14,6 +14,7 @@ pub enum ModelEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh", alias = "x_high", alias = "x-high")]
     XHigh,
     Max,
 }
@@ -119,7 +120,7 @@ impl Default for ContextLimits {
         Self {
             soft_tokens: 16_000,
             hard_tokens: 24_000,
-            tool_result_inline_bytes: 16 * 1024,
+            tool_result_inline_bytes: 4 * 1024,
         }
     }
 }
@@ -316,14 +317,15 @@ pub fn stub_tool_output(
     let inline = truncate_utf8(output, limit_bytes);
     let suffix = match &blob {
         Some(blob) => format!(
-            "\n\n[Inductor truncated this tool output from {} bytes to {} bytes. Full output stored in blob {} at {}.]",
+            "\n\n[Inductor truncated this tool output from {} bytes to {} bytes. Full output stored in blob {} at {}. To inspect more without rerunning the tool, call read_blob with blob_id \"{}\".]",
             output.len(),
             inline.len(),
             blob.id,
-            blob.path.display()
+            blob.path.display(),
+            blob.id
         ),
         None => format!(
-            "\n\n[Inductor truncated this tool output from {} bytes to {} bytes. Full output was not stored.]",
+            "\n\n[Inductor truncated this tool output from {} bytes to {} bytes. Full output was not stored; rerun with a narrower query or configure a blob root.]",
             output.len(),
             inline.len()
         ),
@@ -470,6 +472,18 @@ mod tests {
         assert_eq!(mapping.parameter_name.as_deref(), Some("reasoning_effort"));
         assert_eq!(mapping.parameter_value.as_deref(), Some("high"));
         assert!(mapping.prompt_hint.is_none());
+    }
+
+    #[test]
+    fn model_effort_serializes_xhigh_in_provider_format() {
+        assert_eq!(
+            serde_json::to_value(ModelEffort::XHigh).unwrap(),
+            serde_json::json!("xhigh")
+        );
+        assert_eq!(
+            serde_json::from_value::<ModelEffort>(serde_json::json!("x_high")).unwrap(),
+            ModelEffort::XHigh
+        );
     }
 
     #[test]

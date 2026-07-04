@@ -194,6 +194,11 @@ async function requestPermission(toolName, toolInput, opts, approvalPolicy = "on
 }
 
 function zodForJsonSchema(schema = {}) {
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    const options = schema.oneOf.map((option) => zodForJsonSchema(option));
+    return options.length === 1 ? options[0] : z.union(options);
+  }
+
   if (Array.isArray(schema.enum) && schema.enum.every((value) => typeof value === "string")) {
     return schema.enum.length === 0 ? z.string() : z.enum(schema.enum);
   }
@@ -297,6 +302,8 @@ function toolAliases(toolDefinitions = []) {
   const aliases = {
     Read: mcpName("read_file"),
     LS: mcpName("list_dir"),
+    ReadMemory: mcpName("read_memory"),
+    WriteMemory: mcpName("write_memory"),
     Write: mcpName("write_file"),
     Edit: mcpName("edit_file"),
     MultiEdit: mcpName("multi_edit"),

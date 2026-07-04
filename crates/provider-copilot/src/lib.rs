@@ -15,7 +15,9 @@ use provider_core::{
     PermissionResponses, ProviderAuth, ProviderAuthKind, ProviderPlugin, ProviderToolResponse,
     ToolResponses,
 };
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -203,7 +205,9 @@ impl ProviderPlugin for CopilotProvider {
         _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let bearer = self.bearer_token(auth).await?;
-        let headers = copilot_headers(&bearer.token)?;
+        let mut headers = copilot_headers(&bearer.token)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         let provider = self.clone();
         let session_id = req.session_id;
         let idle_timeout = copilot_idle_timeout();
@@ -216,6 +220,8 @@ impl ProviderPlugin for CopilotProvider {
 
             let mut messages = copilot_messages(&req);
             loop {
+                let mut safe_stream_retries_remaining = 1usize;
+                'request_attempt: loop {
                 let request = provider
                     .client
                     .post(provider.chat_url())
@@ -245,6 +251,11 @@ impl ProviderPlugin for CopilotProvider {
 
                 let response = response?;
                 let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
                     yield SessionEvent::Error {
@@ -265,6 +276,11 @@ impl ProviderPlugin for CopilotProvider {
                 let mut bytes = response.bytes_stream();
                 let mut buffer = String::new();
                 let mut assistant = PendingAssistantMessage::default();
+                let mut bytes_read = 0usize;
+                let mut events_parsed = 0usize;
+                let mut last_event_type: Option<String> = None;
+                let mut emitted_visible_event = false;
+                let mut retry_request = false;
 
                 loop {
                     let chunk = tokio::select! {
@@ -292,17 +308,46 @@ impl ProviderPlugin for CopilotProvider {
                         break;
                     };
 
-                    let chunk = chunk?;
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let diagnostic = format_stream_decode_error(
+                                "Copilot",
+                                &error,
+                                status,
+                                content_type.as_deref(),
+                                bytes_read,
+                                events_parsed,
+                                last_event_type.as_deref(),
+                                emitted_visible_event,
+                            );
+                            if !emitted_visible_event && safe_stream_retries_remaining > 0 {
+                                safe_stream_retries_remaining -= 1;
+                                retry_request = true;
+                                break;
+                            }
+                            Err(anyhow::anyhow!(diagnostic))?;
+                            unreachable!();
+                        }
+                    };
+                    bytes_read += chunk.len();
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
                     for event in drain_sse_events(&mut buffer) {
+                        events_parsed += 1;
+                        last_event_type = sse_event_type(&event);
                         let parsed = parse_chat_stream_event(session_id, &event, &mut assistant);
                         for mapped in parsed.events {
+                            emitted_visible_event |= provider_event_is_visible(&mapped);
                             yield mapped;
                         }
                         if parsed.done {
                             break;
                         }
                     }
+                }
+
+                if retry_request {
+                    continue 'request_attempt;
                 }
 
                 for event in drain_sse_events_at_eof(&mut buffer) {
@@ -354,6 +399,8 @@ impl ProviderPlugin for CopilotProvider {
                         }
                     };
                     messages.push(tool_result_message(&pending, tool_result));
+                }
+                break 'request_attempt;
                 }
             }
         };
@@ -818,6 +865,71 @@ fn copilot_idle_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_COPILOT_IDLE_TIMEOUT)
+}
+
+fn provider_event_is_visible(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::TextStart { .. }
+            | SessionEvent::TextDelta { .. }
+            | SessionEvent::TextEnd { .. }
+            | SessionEvent::ToolCallRequested { .. }
+            | SessionEvent::ToolInputStart { .. }
+            | SessionEvent::ToolInputEnd { .. }
+            | SessionEvent::ToolCallStart { .. }
+            | SessionEvent::ToolCallResult { .. }
+            | SessionEvent::ToolCallError { .. }
+            | SessionEvent::Patch { .. }
+            | SessionEvent::Diagnostics { .. }
+    )
+}
+
+fn format_stream_decode_error(
+    provider: &str,
+    error: &reqwest::Error,
+    status: reqwest::StatusCode,
+    content_type: Option<&str>,
+    bytes_read: usize,
+    events_parsed: usize,
+    last_event_type: Option<&str>,
+    emitted_visible_event: bool,
+) -> String {
+    let phase = if emitted_visible_event {
+        "stream dropped after partial assistant output; resume to continue"
+    } else {
+        "stream failed before visible output; safe retry already attempted"
+    };
+    format!(
+        "{provider} provider {phase}: {error}; http_status={status}; content_type={}; bytes_read={bytes_read}; events_parsed={events_parsed}; last_event_type={}; visible_output_emitted={emitted_visible_event}; source_chain={}",
+        content_type.unwrap_or("<unknown>"),
+        last_event_type.unwrap_or("<none>"),
+        error_source_chain(error)
+    )
+}
+
+fn error_source_chain(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(err) = source {
+        parts.push(err.to_string());
+        source = err.source();
+    }
+    parts.join(" -> ")
+}
+
+fn sse_event_type(raw: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let data = line.strip_prefix("data:")?.trim();
+        if data == "[DONE]" {
+            return Some("[DONE]".to_string());
+        }
+        let value = serde_json::from_str::<Value>(data).ok()?;
+        value
+            .get("object")
+            .or_else(|| value.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 fn redact_error_body(body: &str) -> String {

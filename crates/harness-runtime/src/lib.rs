@@ -41,7 +41,7 @@ use provider_core::{ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Map, Value, json};
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
-use tools::{StructuredPatch, TextEdit, ToolName, ToolRuntime};
+use tools::{LinePatch, StructuredPatch, TextEdit, ToolName, ToolRuntime};
 
 pub mod risk;
 
@@ -114,8 +114,11 @@ You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your 
 Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
-- Use apply_patch for all file changes, including creating new files with *** Add File.\n\
+- Use apply_patch for all file changes. For edits, first read the target range and then provide operations with exact path, 1-based inclusive start_line and end_line, old text, and new text. Do not use anchor-only patches.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
+- Keep tool output small: prefer read_file with start_line/end_line over large reads, use rg with focused patterns instead of broad dumps, and avoid large sed commands.\n\
+- If a tool result says it was truncated and gives a blob_id, use read_blob with a bounded start_byte/limit_bytes range to inspect more without rerunning the tool.\n\
+- If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.\n\
 - Emit at most one envelope per reply. After a tool result is returned, continue.\n\
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.\n\
 - In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.\n\
@@ -281,8 +284,17 @@ pub fn parse_tool_call(text: &str) -> Option<Result<ParsedToolCall, ToolCallPars
 #[derive(Debug)]
 pub enum ToolExecError {
     UnknownTool(String),
-    MissingField { tool: String, field: &'static str },
+    MissingField {
+        tool: String,
+        field: &'static str,
+    },
+    InvalidField {
+        tool: String,
+        field: &'static str,
+        message: String,
+    },
     Runtime(tools::ToolError),
+    Harness(String),
 }
 
 impl fmt::Display for ToolExecError {
@@ -292,7 +304,13 @@ impl fmt::Display for ToolExecError {
             Self::MissingField { tool, field } => {
                 write!(f, "tool {tool} requires a string `{field}` input field")
             }
+            Self::InvalidField {
+                tool,
+                field,
+                message,
+            } => write!(f, "tool {tool} has invalid `{field}` input: {message}"),
             Self::Runtime(err) => write!(f, "{err}"),
+            Self::Harness(message) => f.write_str(message),
         }
     }
 }
@@ -306,11 +324,17 @@ pub fn execute_tool_call(
 ) -> Result<tools::ToolResult, ToolExecError> {
     let input = &call.input;
     let result = match call.name.as_str() {
-        name if name == ToolName::ReadFile.as_str() => {
-            tools.read_file(string_field(input, "path", name)?)
-        }
+        name if name == ToolName::ReadFile.as_str() => tools.read_file_range(
+            string_field(input, "path", name)?,
+            optional_usize_field(input, "start_line"),
+            optional_usize_field(input, "end_line"),
+        ),
         name if name == ToolName::ListDir.as_str() => {
             tools.list_dir(optional_string_field(input, "path"))
+        }
+        name if name == ToolName::ReadMemory.as_str() => tools.read_memory(),
+        name if name == ToolName::WriteMemory.as_str() => {
+            tools.write_memory(string_field(input, "content", name)?)
         }
         name if name == ToolName::WriteFile.as_str() => tools.write_file(
             string_field(input, "path", name)?,
@@ -341,7 +365,17 @@ pub fn execute_tool_call(
             tools.multi_edit(path, &edits, optional_string_field(input, "expected_hash"))
         }
         name if name == ToolName::ApplyPatch.as_str() => {
-            tools.apply_patch(string_field(input, "patch", name)?)
+            if input.get("operations").is_some() {
+                let patch = serde_json::from_value::<LinePatch>(input.clone()).map_err(|_| {
+                    ToolExecError::MissingField {
+                        tool: name.to_string(),
+                        field: "operations",
+                    }
+                })?;
+                tools.apply_line_patch(&patch)
+            } else {
+                tools.apply_patch(string_field(input, "patch", name)?)
+            }
         }
         name if name == ToolName::ApplyPatchFreeform.as_str() => {
             tools.apply_patch_freeform(string_field(input, "patch", name)?)
@@ -463,6 +497,93 @@ fn optional_string_field<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
 
 fn optional_u64_field(input: &Value, field: &str) -> Option<u64> {
     input.get(field).and_then(Value::as_u64)
+}
+
+fn optional_usize_field(input: &Value, field: &str) -> Option<usize> {
+    input
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn read_blob_tool_result(
+    config: &HarnessConfig,
+    input: &Value,
+) -> Result<tools::ToolResult, ToolExecError> {
+    let tool = ToolName::ReadBlob.as_str();
+    let blob_id = string_field(input, "blob_id", tool)?;
+    if blob_id.len() != 64 || !blob_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ToolExecError::InvalidField {
+            tool: tool.to_string(),
+            field: "blob_id",
+            message: "expected a 64-character hex blob id from a truncated tool result".to_string(),
+        });
+    }
+
+    let blob_root = config.context.blob_root.as_ref().ok_or_else(|| {
+        ToolExecError::Harness(
+            "read_blob is unavailable because no blob root is configured for this run".to_string(),
+        )
+    })?;
+    let path = blob_root.join(blob_id);
+    let bytes = fs::read(&path).map_err(|err| {
+        ToolExecError::Harness(format!(
+            "failed to read stored tool output blob {blob_id}: {err}"
+        ))
+    })?;
+    let start = optional_usize_field(input, "start_byte").unwrap_or(0);
+    if start > bytes.len() {
+        return Err(ToolExecError::InvalidField {
+            tool: tool.to_string(),
+            field: "start_byte",
+            message: format!("offset {start} is beyond blob size {}", bytes.len()),
+        });
+    }
+    let requested_limit = optional_usize_field(input, "limit_bytes")
+        .unwrap_or(config.context.limits.tool_result_inline_bytes);
+    let limit = requested_limit.max(1).min(
+        config
+            .context
+            .limits
+            .tool_result_inline_bytes
+            .max(16 * 1024),
+    );
+    let all_text = String::from_utf8_lossy(&bytes).to_string();
+    let mut start_boundary = start;
+    while start_boundary < all_text.len() && !all_text.is_char_boundary(start_boundary) {
+        start_boundary += 1;
+    }
+    let end = start_boundary.saturating_add(limit).min(all_text.len());
+    let mut end_boundary = end;
+    while end_boundary > start_boundary && !all_text.is_char_boundary(end_boundary) {
+        end_boundary -= 1;
+    }
+    let text = all_text[start_boundary..end_boundary].to_string();
+    let prefix = format!(
+        "Stored tool output blob {blob_id}, bytes {start_boundary}..{end_boundary} of {}{}:\n",
+        all_text.len(),
+        if end_boundary < all_text.len() {
+            ". More bytes remain; call read_blob again with start_byte set to this end offset"
+        } else {
+            ""
+        }
+    );
+
+    Ok(tools::ToolResult {
+        name: ToolName::ReadBlob,
+        title: ToolName::ReadBlob.title().to_string(),
+        metadata: json!({
+            "blob_id": blob_id,
+            "path": path.display().to_string(),
+            "bytes": all_text.len(),
+            "start_byte": start_boundary,
+            "end_byte": end_boundary,
+            "truncated": end_boundary < all_text.len(),
+        }),
+        output: format!("{prefix}{text}"),
+        exit_code: Some(0),
+        truncated: end_boundary < all_text.len(),
+    })
 }
 
 /// Configuration for a harness turn.
@@ -650,8 +771,11 @@ struct ProviderRequestInput<'a> {
 impl ProviderRequestPreparer {
     fn prepare(input: ProviderRequestInput<'_>) -> anyhow::Result<PreparedProviderTurn> {
         let counter = ApproxTokenCounter;
-        let environment =
-            SystemEnvironment::capture(&input.config.model, input.tools.workspace_root());
+        let environment = SystemEnvironment::capture(
+            &input.config.model,
+            input.tools.workspace_root(),
+            input.tools.memory_file(),
+        );
         let system_preamble = PromptComposer::compose(
             input.config.provider_family,
             input.config.model_effort,
@@ -928,26 +1052,31 @@ fn run_local_tool_call<'a>(
         tools
     };
 
-    let mut execution = execute_tool_call_with_progress(
-        session_id,
-        tool_call_id,
-        execution_tools,
-        &execution_call,
-        cancel.clone(),
-        config.tool_model_checkpoint_after,
-    );
-    let result = loop {
-        let Some(update) = execution.next().await else {
-            break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
-                command: display_call.name.clone(),
-            }));
+    let result = if execution_call.name == ToolName::ReadBlob.as_str() {
+        read_blob_tool_result(&config, &execution_call.input)
+    } else {
+        let mut execution = execute_tool_call_with_progress(
+            session_id,
+            tool_call_id,
+            execution_tools,
+            &execution_call,
+            cancel.clone(),
+            config.tool_model_checkpoint_after,
+        );
+        let result = loop {
+            let Some(update) = execution.next().await else {
+                break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
+                    command: display_call.name.clone(),
+                }));
+            };
+            match update? {
+                ToolExecutionUpdate::Event(event) => yield LocalToolRunUpdate::Event(event),
+                ToolExecutionUpdate::Done(result) => break result,
+            }
         };
-        match update? {
-            ToolExecutionUpdate::Event(event) => yield LocalToolRunUpdate::Event(event),
-            ToolExecutionUpdate::Done(result) => break result,
-        }
+        drop(execution);
+        result
     };
-    drop(execution);
 
     match result {
         Ok(mut result) => {
@@ -1225,10 +1354,18 @@ impl ToolTargets {
 
 fn tool_target_paths(call: &ParsedToolCall) -> Vec<String> {
     match call.name.as_str() {
+        "write_memory" => Vec::new(),
         "write_file" | "edit_file" | "multi_edit" => optional_string_field(&call.input, "path")
             .map(|path| vec![path.to_string()])
             .unwrap_or_default(),
-        "apply_patch" | "apply_patch_freeform" => call
+        "apply_patch" => line_patch_paths(&call.input).unwrap_or_else(|| {
+            call.input
+                .get("patch")
+                .and_then(Value::as_str)
+                .map(patch_paths_from_text)
+                .unwrap_or_default()
+        }),
+        "apply_patch_freeform" => call
             .input
             .get("patch")
             .and_then(Value::as_str)
@@ -1268,7 +1405,7 @@ fn attach_cached_hashes(
                 object.insert("expected_hash".to_string(), Value::String(hash));
             }
         }
-        "apply_patch_structured" => {
+        "apply_patch" | "apply_patch_structured" => {
             if let Some(operations) = input.get_mut("operations").and_then(Value::as_array_mut) {
                 for operation in operations {
                     let Some(object) = operation.as_object_mut() else {
@@ -1349,10 +1486,29 @@ fn structured_patch_paths(input: &Value) -> Vec<String> {
         .collect()
 }
 
+fn line_patch_paths(input: &Value) -> Option<Vec<String>> {
+    input.get("operations")?;
+    Some(
+        input
+            .get("operations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|operation| {
+                operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect(),
+    )
+}
+
 fn predicted_after(call: &ParsedToolCall, target: &ToolTarget) -> Option<String> {
     let before = target.before.as_deref().unwrap_or("");
     match call.name.as_str() {
         "write_file" => call.input.get("content")?.as_str().map(str::to_string),
+        "write_memory" => call.input.get("content")?.as_str().map(str::to_string),
         "edit_file" => {
             let old = call.input.get("old")?.as_str()?;
             let new = call.input.get("new")?.as_str()?;
@@ -1397,15 +1553,26 @@ fn get_outside_path(call: &ParsedToolCall) -> Option<String> {
                 .filter(|path| path.starts_with('/') || path.contains(".."))
                 .map(str::to_string)
         }
-        "apply_patch" | "apply_patch_freeform" => call
-            .input
-            .get("patch")
-            .and_then(Value::as_str)
-            .and_then(|patch| {
-                patch_paths_from_text(patch)
-                    .into_iter()
-                    .find(|path| path.starts_with('/') || path.contains(".."))
-            }),
+        "apply_patch" => line_patch_paths(&call.input)
+            .unwrap_or_else(|| {
+                call.input
+                    .get("patch")
+                    .and_then(Value::as_str)
+                    .map(patch_paths_from_text)
+                    .unwrap_or_default()
+            })
+            .into_iter()
+            .find(|path| path.starts_with('/') || path.contains("..")),
+        "apply_patch_freeform" => {
+            call.input
+                .get("patch")
+                .and_then(Value::as_str)
+                .and_then(|patch| {
+                    patch_paths_from_text(patch)
+                        .into_iter()
+                        .find(|path| path.starts_with('/') || path.contains(".."))
+                })
+        }
         "apply_patch_structured" => {
             if let Some(operations) = call.input.get("operations").and_then(Value::as_array) {
                 for operation in operations {
@@ -1786,6 +1953,7 @@ pub fn run_turn<'a>(
             let text_id = format!("round-{round}-text-0");
             let mut text_started = false;
             let mut text_ended = false;
+            let mut visible_provider_output_started = false;
             loop {
                 if cancel.is_cancelled() {
                     if text_started && !text_ended {
@@ -1836,9 +2004,20 @@ pub fn run_turn<'a>(
                                 text: assistant_text.clone(),
                             };
                         }
+                        let message = if text_started || !assistant_text.is_empty() {
+                            format!(
+                                "stream dropped after partial assistant output; partial text was preserved above. Resume to continue. provider stream failed: {error}"
+                            )
+                        } else if visible_provider_output_started {
+                            format!(
+                                "stream dropped after visible provider output; resume to continue. provider stream failed: {error}"
+                            )
+                        } else {
+                            format!("provider stream failed: {error}")
+                        };
                         yield SessionEvent::Error {
                             session_id,
-                            message: format!("provider stream failed: {error}"),
+                            message,
                         };
                         yield SessionEvent::StepFinish {
                             session_id,
@@ -1854,6 +2033,7 @@ pub fn run_turn<'a>(
                 };
                 match event {
                     SessionEvent::TextDelta { text, .. } => {
+                        visible_provider_output_started = true;
                         if !text_started {
                             text_started = true;
                             yield SessionEvent::TextStart {
@@ -1865,12 +2045,14 @@ pub fn run_turn<'a>(
                         yield SessionEvent::TextDelta { session_id, text };
                     }
                     SessionEvent::TextStart { session_id: event_session_id, text_id } => {
+                        visible_provider_output_started = true;
                         if !text_started {
                             text_started = true;
                         }
                         yield SessionEvent::TextStart { session_id: event_session_id, text_id };
                     }
                     SessionEvent::TextEnd { session_id: event_session_id, text_id, text } => {
+                        visible_provider_output_started = true;
                         text_ended = true;
                         yield SessionEvent::TextEnd { session_id: event_session_id, text_id, text };
                     }
@@ -1880,6 +2062,7 @@ pub fn run_turn<'a>(
                         input_json,
                         ..
                     } => {
+                        visible_provider_output_started = true;
                         if name == ToolName::AskQuestions.as_str() {
                             let questions = parse_agent_questions(&input_json);
                             let result = provider_core::ask_questions(
@@ -2183,7 +2366,8 @@ Todo and question rules:
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
-- Use apply_patch for all file changes, including creating new files with *** Add File. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Use apply_patch for all file changes. For edits, provide operations with exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.
 - Keep the user informed with brief milestone updates before a new phase, after a tool failure, and before verification. Do not narrate every command.
 - In progress updates, share a concise public reasoning summary: what you are checking, what evidence you found, why the next step follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought.
@@ -2194,17 +2378,19 @@ struct SystemEnvironment {
     model: String,
     cwd: PathBuf,
     workspace_root: PathBuf,
+    memory_file: Option<PathBuf>,
     is_git_repo: bool,
     platform: &'static str,
     date_utc: String,
 }
 
 impl SystemEnvironment {
-    fn capture(model: &str, workspace_root: &Path) -> Self {
+    fn capture(model: &str, workspace_root: &Path, memory_file: Option<&Path>) -> Self {
         Self {
             model: model.to_string(),
             cwd: std::env::current_dir().unwrap_or_else(|_| workspace_root.to_path_buf()),
             workspace_root: workspace_root.to_path_buf(),
+            memory_file: memory_file.map(Path::to_path_buf),
             is_git_repo: is_git_repo(workspace_root),
             platform: std::env::consts::OS,
             date_utc: OffsetDateTime::now_utc().date().to_string(),
@@ -2213,11 +2399,15 @@ impl SystemEnvironment {
 
     fn render(&self) -> String {
         format!(
-            "Environment:\n<env>\n  Model: {}\n  Working directory: {}\n  Workspace root: {}\n  Is workspace a git repo: {}\n  Platform: {}\n  Current date (UTC): {}\n</env>",
+            "Environment:\n<env>\n  Model: {}\n  Working directory: {}\n  Workspace root: {}\n  Is workspace a git repo: {}\n  Repo memory file: {}\n  Platform: {}\n  Current date (UTC): {}\n</env>",
             self.model,
             self.cwd.display(),
             self.workspace_root.display(),
             if self.is_git_repo { "yes" } else { "no" },
+            self.memory_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
             self.platform,
             self.date_utc,
         )

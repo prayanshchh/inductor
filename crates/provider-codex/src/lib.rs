@@ -10,7 +10,7 @@ use harness_core::{
 use provider_core::{
     PermissionResponses, ProviderAuth, ProviderAuthKind, ProviderPlugin, ProviderToolResponse,
 };
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -54,15 +54,23 @@ impl CodexProvider {
     }
 
     fn request_body_with_input(&self, req: &TurnRequest, input: Vec<Value>) -> Value {
+        let model = normalize_codex_model(&req.model);
         let mut body = json!({
-            "model": normalize_codex_model(&req.model),
+            "model": model,
             "instructions": req.system_prompt.as_deref().unwrap_or("You are an Inductor coding agent working in the user's workspace. \
                 Use the provided tools to read, edit, and create files and run commands. Don't \
                 describe a tool-call format — just call the tools. Keep the user informed with \
                 brief milestone updates, especially before new phases, after tool failures, and \
                 before verification. In progress updates, share a concise public reasoning \
                 summary: what you are checking, what evidence you found, why the next step \
-                follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought."),
+                follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought. \
+                Keep tool output small: prefer read_file with start_line/end_line over large reads, \
+                use focused rg patterns instead of broad dumps, and avoid large sed commands. \
+                If a tool result says it was truncated and gives a blob_id, call read_blob with a \
+                bounded start_byte/limit_bytes range to inspect more without rerunning the tool. \
+                For file edits, use apply_patch line-aware operations with exact path, 1-based \
+                inclusive start_line/end_line, old text, and new text from a recent read_file result; do not use \
+                anchor-only patches."),
             "input": input,
             "tools": codex_tools(),
             "tool_choice": "auto",
@@ -74,11 +82,50 @@ impl CodexProvider {
             // The Responses API nests effort under `reasoning`; a top-level
             // `reasoning_effort` is rejected as an unsupported parameter.
             body["reasoning"] = json!({
-                "effort": if effort == "minimal" { "none" } else { effort }
+                "effort": normalize_codex_reasoning_effort(model, effort)
             });
         }
         body
     }
+}
+
+fn normalize_codex_reasoning_effort(model: &str, effort: &str) -> &'static str {
+    let canonical = match effort
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
+        .as_str()
+    {
+        "none" => "none",
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "extrahigh" => "xhigh",
+        // Codex/OpenAI Responses does not accept "max"; use the strongest
+        // supported value instead of sending an invalid request.
+        "max" | "ultracode" => "xhigh",
+        _ => "medium",
+    };
+
+    if model.eq_ignore_ascii_case("gpt-5-pro") {
+        return "high";
+    }
+
+    if model.starts_with("gpt-5.1") && canonical == "xhigh" {
+        return "high";
+    }
+
+    if (model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("codex-mini"))
+        && matches!(canonical, "none" | "minimal" | "xhigh")
+    {
+        return "medium";
+    }
+
+    canonical
 }
 
 fn codex_input_messages(req: &TurnRequest) -> Vec<Value> {
@@ -229,6 +276,8 @@ impl ProviderPlugin for CodexProvider {
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, bearer_header(auth)?);
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
         let session_id = req.session_id;
         let provider = self.clone();
@@ -242,6 +291,8 @@ impl ProviderPlugin for CodexProvider {
 
             let mut input = codex_input_messages(&req);
             loop {
+                let mut safe_stream_retries_remaining = 1usize;
+                'request_attempt: loop {
                 let request = provider
                     .client
                     .post(&responses_url)
@@ -270,6 +321,11 @@ impl ProviderPlugin for CodexProvider {
                 };
                 let response = response?;
                 let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
 
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
@@ -289,6 +345,11 @@ impl ProviderPlugin for CodexProvider {
                 let mut buffer = String::new();
                 let mut output_items = Vec::new();
                 let mut pending_function_calls = Vec::new();
+                let mut bytes_read = 0usize;
+                let mut events_parsed = 0usize;
+                let mut last_event_type: Option<String> = None;
+                let mut emitted_visible_event = false;
+                let mut retry_request = false;
 
                 loop {
                     let chunk = tokio::select! {
@@ -324,18 +385,47 @@ impl ProviderPlugin for CodexProvider {
                         return;
                     }
 
-                    let chunk = chunk?;
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let diagnostic = format_stream_decode_error(
+                                "Codex",
+                                &error,
+                                status,
+                                content_type.as_deref(),
+                                bytes_read,
+                                events_parsed,
+                                last_event_type.as_deref(),
+                                emitted_visible_event,
+                            );
+                            if !emitted_visible_event && safe_stream_retries_remaining > 0 {
+                                safe_stream_retries_remaining -= 1;
+                                retry_request = true;
+                                break;
+                            }
+                            Err(anyhow::anyhow!(diagnostic))?;
+                            unreachable!();
+                        }
+                    };
+                    bytes_read += chunk.len();
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                     for event in drain_sse_events(&mut buffer) {
+                        events_parsed += 1;
+                        last_event_type = sse_event_type(&event);
                         let parsed = parse_response_stream_event_detail(session_id, &event);
                         let _response_completed = parsed.completed;
                         output_items.extend(parsed.output_items);
                         pending_function_calls.extend(parsed.function_calls);
                         for mapped in parsed.events {
+                            emitted_visible_event |= provider_event_is_visible(&mapped);
                             yield mapped;
                         }
                     }
+                }
+
+                if retry_request {
+                    continue 'request_attempt;
                 }
 
                 for event in drain_sse_events_at_eof(&mut buffer) {
@@ -389,6 +479,8 @@ impl ProviderPlugin for CodexProvider {
                     };
                     input.push(function_call_output_item(&pending, tool_result));
                 }
+                break 'request_attempt;
+                }
             }
         };
 
@@ -403,6 +495,70 @@ fn codex_idle_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_CODEX_IDLE_TIMEOUT)
+}
+
+fn provider_event_is_visible(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::TextStart { .. }
+            | SessionEvent::TextDelta { .. }
+            | SessionEvent::TextEnd { .. }
+            | SessionEvent::ToolCallRequested { .. }
+            | SessionEvent::ToolInputStart { .. }
+            | SessionEvent::ToolInputEnd { .. }
+            | SessionEvent::ToolCallStart { .. }
+            | SessionEvent::ToolCallResult { .. }
+            | SessionEvent::ToolCallError { .. }
+            | SessionEvent::Patch { .. }
+            | SessionEvent::Diagnostics { .. }
+    )
+}
+
+fn format_stream_decode_error(
+    provider: &str,
+    error: &reqwest::Error,
+    status: reqwest::StatusCode,
+    content_type: Option<&str>,
+    bytes_read: usize,
+    events_parsed: usize,
+    last_event_type: Option<&str>,
+    emitted_visible_event: bool,
+) -> String {
+    let phase = if emitted_visible_event {
+        "stream dropped after partial assistant output; resume to continue"
+    } else {
+        "stream failed before visible output; safe retry already attempted"
+    };
+    format!(
+        "{provider} provider {phase}: {error}; http_status={status}; content_type={}; bytes_read={bytes_read}; events_parsed={events_parsed}; last_event_type={}; visible_output_emitted={emitted_visible_event}; source_chain={}",
+        content_type.unwrap_or("<unknown>"),
+        last_event_type.unwrap_or("<none>"),
+        error_source_chain(error)
+    )
+}
+
+fn error_source_chain(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(err) = source {
+        parts.push(err.to_string());
+        source = err.source();
+    }
+    parts.join(" -> ")
+}
+
+fn sse_event_type(raw: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let data = line.strip_prefix("data:")?.trim();
+        if data == "[DONE]" {
+            return Some("[DONE]".to_string());
+        }
+        let value = serde_json::from_str::<Value>(data).ok()?;
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 fn bearer_header(auth: &ProviderAuth) -> anyhow::Result<HeaderValue> {
@@ -819,6 +975,46 @@ mod tests {
         let body = provider.request_body(&request);
 
         assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn request_body_normalizes_reasoning_effort_aliases() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        for (input, expected) in [
+            ("x_high", "xhigh"),
+            ("x-high", "xhigh"),
+            ("extra high", "xhigh"),
+            ("max", "xhigh"),
+            ("ultracode", "xhigh"),
+            ("minimal", "minimal"),
+            ("unknown", "medium"),
+        ] {
+            let mut request = text_request("think");
+            request.metadata = json!({ "model_effort": input });
+            let body = provider.request_body(&request);
+            assert_eq!(body["reasoning"]["effort"], expected);
+        }
+    }
+
+    #[test]
+    fn request_body_clamps_effort_for_models_with_narrower_support() {
+        let provider = CodexProvider::with_base_url("https://example.test").unwrap();
+        for (model, input, expected) in [
+            ("gpt-5.1", "x_high", "high"),
+            ("gpt-5-pro", "medium", "high"),
+            ("o3", "minimal", "medium"),
+            ("codex-mini-latest", "xhigh", "medium"),
+            (DEFAULT_CODEX_MODEL, "x_high", "xhigh"),
+        ] {
+            let mut request = text_request("think");
+            request.model = model.to_string();
+            request.metadata = json!({ "model_effort": input });
+            let body = provider.request_body(&request);
+            assert_eq!(
+                body["reasoning"]["effort"], expected,
+                "unexpected effort for {model}"
+            );
+        }
     }
 
     #[test]

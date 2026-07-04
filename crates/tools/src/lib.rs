@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command as TokioCommand, sync::Notify};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 16 * 1024;
 const DEFAULT_GREP_MATCH_LIMIT: usize = 100;
 const DEFAULT_GLOB_MATCH_LIMIT: usize = 100;
 const WEB_FETCH_TIMEOUT_SECS: u64 = 30;
@@ -27,7 +27,10 @@ const WEB_FETCH_TIMEOUT_SECS: u64 = 30;
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
     ReadFile,
+    ReadBlob,
     ListDir,
+    ReadMemory,
+    WriteMemory,
     WriteFile,
     EditFile,
     MultiEdit,
@@ -48,7 +51,10 @@ impl ToolName {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadFile => "read_file",
+            Self::ReadBlob => "read_blob",
             Self::ListDir => "list_dir",
+            Self::ReadMemory => "read_memory",
+            Self::WriteMemory => "write_memory",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
             Self::MultiEdit => "multi_edit",
@@ -69,7 +75,10 @@ impl ToolName {
     pub fn title(self) -> &'static str {
         match self {
             Self::ReadFile => "Read File",
+            Self::ReadBlob => "Read Stored Tool Output",
             Self::ListDir => "List Directory",
+            Self::ReadMemory => "Read Repo Memory",
+            Self::WriteMemory => "Write Repo Memory",
             Self::WriteFile => "Write File",
             Self::EditFile => "Edit File",
             Self::MultiEdit => "Multi Edit",
@@ -100,11 +109,29 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: ToolName::ReadFile,
-            description: "Read a UTF-8 text file. Paths may be workspace-relative or absolute when unrestricted access is enabled.",
+            description: "Read a UTF-8 text file. Paths may be workspace-relative or absolute when unrestricted access is enabled. Prefer start_line/end_line for large files.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "File path" } },
+                "properties": {
+                    "path": { "type": "string", "description": "File path" },
+                    "start_line": { "type": "integer", "description": "Optional 1-based first line to return" },
+                    "end_line": { "type": "integer", "description": "Optional 1-based last line to return, inclusive" }
+                },
                 "required": ["path"]
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::ReadBlob,
+            description: "Read previously stored full output for a truncated tool result without rerunning the original tool. Use the blob_id shown in a truncated tool result.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "blob_id": { "type": "string", "description": "Blob id from a truncated tool result" },
+                    "start_byte": { "type": "integer", "description": "Optional 0-based byte offset to start reading" },
+                    "limit_bytes": { "type": "integer", "description": "Optional max bytes to return; defaults to the normal tool output cap" }
+                },
+                "required": ["blob_id"]
             }),
             read_only: true,
         },
@@ -118,17 +145,71 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             read_only: true,
         },
         ToolDefinition {
-            name: ToolName::ApplyPatch,
-            description: "Apply a patch to files in the workspace. Prefer this for all file writes. Supports unified diff and the *** Begin Patch format, including *** Add File for creating new files, *** Update File for editing existing files, and *** Delete File for deleting files.",
+            name: ToolName::ReadMemory,
+            description: "Read this repository's shared memory markdown file. The memory is shared by all Inductor sessions and worktrees for the same source repo.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: ToolName::WriteMemory,
+            description: "Replace this repository's shared memory markdown file. Keep it concise and durable: stable project conventions, recurring workflows, known pitfalls, and useful context. Do not store secrets.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "patch": {
-                        "type": "string",
-                        "description": "Patch text. For new files use: *** Begin Patch\\n*** Add File: path\\n+contents\\n*** End Patch"
+                    "content": { "type": "string", "description": "Full markdown content to write to the repo memory file." }
+                },
+                "required": ["content"]
+            }),
+            read_only: false,
+        },
+        ToolDefinition {
+            name: ToolName::ApplyPatch,
+            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; the tool will not search for ambiguous anchors. Multiple updates to the same file are applied against one original snapshot and written once. Use add_file for new files and delete_file for deletes.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "description": "Line-aware patch operations. For edits, first call read_file with start_line/end_line to get exact line numbers and old text.",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["update"] },
+                                        "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
+                                        "start_line": { "type": "integer", "description": "1-based first line of the old range; use total_lines + 1 with old = \"\" to append." },
+                                        "end_line": { "type": "integer", "description": "1-based last line of the old range, inclusive. For insertions where old is empty, set end_line equal to start_line." },
+                                        "old": { "type": "string", "description": "Exact text expected in start_line..end_line inclusive. Use empty string only for insertion." },
+                                        "new": { "type": "string", "description": "Replacement text for the inclusive line range." }
+                                    },
+                                    "required": ["op", "path", "start_line", "end_line", "old", "new"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["add_file"] },
+                                        "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
+                                        "content": { "type": "string", "description": "Full file contents." }
+                                    },
+                                    "required": ["op", "path", "content"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["delete_file"] },
+                                        "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" }
+                                    },
+                                    "required": ["op", "path"]
+                                }
+                            ]
+                        }
                     }
                 },
-                "required": ["patch"]
+                "required": ["operations"]
             }),
             read_only: false,
         },
@@ -361,9 +442,59 @@ pub struct StructuredPatch {
     pub operations: Vec<StructuredPatchOperation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum LinePatchOperation {
+    Update {
+        path: PathBuf,
+        start_line: usize,
+        end_line: usize,
+        old: String,
+        new: String,
+        expected_hash: Option<String>,
+    },
+    AddFile {
+        path: PathBuf,
+        content: String,
+    },
+    DeleteFile {
+        path: PathBuf,
+        expected_hash: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinePatch {
+    pub operations: Vec<LinePatchOperation>,
+}
+
+#[derive(Debug)]
+struct PendingLineUpdate {
+    start_line: usize,
+    end_line: usize,
+    old: String,
+    new: String,
+}
+
+#[derive(Debug)]
+struct PendingFileLineUpdates {
+    display_path: PathBuf,
+    expected_hash: Option<String>,
+    updates: Vec<PendingLineUpdate>,
+}
+
+#[derive(Debug)]
+struct NormalizedLineUpdate {
+    start_index: usize,
+    end_index: usize,
+    new_lines: Vec<String>,
+    insertion: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolRuntime {
     workspace_root: PathBuf,
+    memory_file: Option<PathBuf>,
     output_limit_bytes: usize,
     grep_match_limit: usize,
     sandbox: SandboxPolicy,
@@ -424,6 +555,7 @@ impl ToolRuntime {
         let workspace_root = Self::canonical_workspace(workspace_root.as_ref())?;
         Ok(Self {
             workspace_root,
+            memory_file: None,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             grep_match_limit: DEFAULT_GREP_MATCH_LIMIT,
             sandbox: SandboxPolicy::Disabled,
@@ -448,6 +580,7 @@ impl ToolRuntime {
     pub fn approved_outside_access(&self) -> Self {
         Self {
             workspace_root: self.workspace_root.clone(),
+            memory_file: self.memory_file.clone(),
             output_limit_bytes: self.output_limit_bytes,
             grep_match_limit: self.grep_match_limit,
             sandbox: SandboxPolicy::Disabled,
@@ -496,6 +629,21 @@ impl ToolRuntime {
         &self.workspace_root
     }
 
+    pub fn with_memory_file(mut self, memory_file: impl Into<PathBuf>) -> Self {
+        self.memory_file = Some(memory_file.into());
+        self
+    }
+
+    pub fn memory_file(&self) -> Option<&Path> {
+        self.memory_file.as_deref()
+    }
+
+    fn configured_memory_file(&self) -> Result<PathBuf, ToolError> {
+        self.memory_file
+            .clone()
+            .ok_or_else(ToolError::memory_unavailable)
+    }
+
     pub fn sandbox(&self) -> &SandboxPolicy {
         &self.sandbox
     }
@@ -508,10 +656,42 @@ impl ToolRuntime {
     }
 
     pub fn read_file(&self, path: impl AsRef<Path>) -> Result<ToolResult, ToolError> {
+        self.read_file_range(path, None, None)
+    }
+
+    pub fn read_file_range(
+        &self,
+        path: impl AsRef<Path>,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> Result<ToolResult, ToolError> {
         let path = self.resolve_existing_path(path.as_ref())?;
         let output = fs::read_to_string(&path).map_err(|err| ToolError::io(&path, err))?;
         let sha256 = sha256_hex(output.as_bytes());
         let bytes = output.len();
+        let total_lines = output.lines().count();
+        let requested_start = start_line.unwrap_or(1).max(1);
+        let requested_end = end_line.unwrap_or(total_lines).max(requested_start);
+        let ranged = start_line.is_some() || end_line.is_some();
+        let output = if ranged {
+            output
+                .lines()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    let line_number = index + 1;
+                    (line_number >= requested_start && line_number <= requested_end)
+                        .then(|| format!("{line_number}: {line}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            output
+        };
+        let returned_lines = if ranged {
+            output.lines().count()
+        } else {
+            total_lines
+        };
 
         Ok(ToolResult::success(
             ToolName::ReadFile,
@@ -522,6 +702,10 @@ impl ToolRuntime {
                 "path": self.relative_path(&path),
                 "bytes": bytes,
                 "sha256": sha256,
+                "total_lines": total_lines,
+                "start_line": if ranged { Some(requested_start) } else { None },
+                "end_line": if ranged { Some(requested_end.min(total_lines)) } else { None },
+                "returned_lines": returned_lines,
             }))
         })
     }
@@ -565,6 +749,62 @@ impl ToolRuntime {
             result.with_metadata(json!({
                 "path": self.relative_path(&path),
                 "entries": entry_count,
+            }))
+        })
+    }
+
+    pub fn read_memory(&self) -> Result<ToolResult, ToolError> {
+        let path = self.configured_memory_file()?;
+        match fs::read_to_string(&path) {
+            Ok(output) => {
+                let sha256 = sha256_hex(output.as_bytes());
+                let bytes = output.len();
+                Ok(ToolResult::success(
+                    ToolName::ReadMemory,
+                    cap_output(output, self.output_limit_bytes),
+                ))
+                .map(|result| {
+                    result.with_metadata(json!({
+                        "path": path.display().to_string(),
+                        "exists": true,
+                        "bytes": bytes,
+                        "sha256": sha256,
+                    }))
+                })
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ToolResult::success(
+                ToolName::ReadMemory,
+                CappedOutput::complete(format!(
+                    "No repo memory file exists yet at {}. Use write_memory to create it when you learn durable project context.",
+                    path.display()
+                )),
+            ))
+            .map(|result| {
+                result.with_metadata(json!({
+                    "path": path.display().to_string(),
+                    "exists": false,
+                    "bytes": 0,
+                }))
+            }),
+            Err(err) => Err(ToolError::io(&path, err)),
+        }
+    }
+
+    pub fn write_memory(&self, content: impl AsRef<str>) -> Result<ToolResult, ToolError> {
+        let path = self.configured_memory_file()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ToolError::io(parent, err))?;
+        }
+        fs::write(&path, content.as_ref()).map_err(|err| ToolError::io(&path, err))?;
+
+        Ok(ToolResult::success(
+            ToolName::WriteMemory,
+            CappedOutput::complete(format!("wrote repo memory to {}", path.display())),
+        ))
+        .map(|result| {
+            result.with_metadata(json!({
+                "path": path.display().to_string(),
+                "bytes": content.as_ref().len(),
             }))
         })
     }
@@ -711,6 +951,105 @@ impl ToolRuntime {
         .map(|result| result.with_metadata(json!({ "operations": changed })))
     }
 
+    pub fn apply_line_patch(&self, patch: &LinePatch) -> Result<ToolResult, ToolError> {
+        if patch.operations.is_empty() {
+            return Err(ToolError::EmptyPatch);
+        }
+
+        let mut changed = 0usize;
+        let mut pending_updates: HashMap<PathBuf, PendingFileLineUpdates> = HashMap::new();
+        let mut immediate_operations: Vec<&LinePatchOperation> = Vec::new();
+
+        for operation in &patch.operations {
+            match operation {
+                LinePatchOperation::Update {
+                    path,
+                    start_line,
+                    end_line,
+                    old,
+                    new,
+                    expected_hash,
+                } => {
+                    let resolved_path = self.resolve_existing_path(path)?;
+                    let entry = pending_updates.entry(resolved_path).or_insert_with(|| {
+                        PendingFileLineUpdates {
+                            display_path: path.clone(),
+                            expected_hash: expected_hash.clone(),
+                            updates: Vec::new(),
+                        }
+                    });
+                    if entry.expected_hash.is_none() {
+                        entry.expected_hash = expected_hash.clone();
+                    } else if expected_hash.is_some() && entry.expected_hash != *expected_hash {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "conflicting expected_hash values for {}",
+                            path.display()
+                        )));
+                    }
+                    entry.updates.push(PendingLineUpdate {
+                        start_line: *start_line,
+                        end_line: *end_line,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+                LinePatchOperation::AddFile { .. } | LinePatchOperation::DeleteFile { .. } => {
+                    immediate_operations.push(operation);
+                }
+            }
+        }
+
+        for operation in immediate_operations {
+            match operation {
+                LinePatchOperation::AddFile { path, content } => {
+                    let resolved_path = self.resolve_write_path(path)?;
+                    if pending_updates.contains_key(&resolved_path) {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "cannot add and update the same file in one line-aware patch: {}",
+                            path.display()
+                        )));
+                    }
+                    self.write_file(path, content)?;
+                    changed += 1;
+                }
+                LinePatchOperation::DeleteFile {
+                    path,
+                    expected_hash,
+                } => {
+                    let resolved_path = self.resolve_existing_path(path)?;
+                    if pending_updates.contains_key(&resolved_path) {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "cannot delete and update the same file in one line-aware patch: {}",
+                            path.display()
+                        )));
+                    }
+                    self.read_text_file(&resolved_path, expected_hash.as_deref())?;
+                    fs::remove_file(&resolved_path)
+                        .map_err(|err| ToolError::io(&resolved_path, err))?;
+                    changed += 1;
+                }
+                LinePatchOperation::Update { .. } => {}
+            }
+        }
+
+        for (resolved_path, pending) in pending_updates {
+            let update_count = pending.updates.len();
+            self.apply_line_updates(
+                &resolved_path,
+                &pending.display_path,
+                &pending.updates,
+                pending.expected_hash.as_deref(),
+            )?;
+            changed += update_count;
+        }
+
+        Ok(ToolResult::success(
+            ToolName::ApplyPatch,
+            CappedOutput::complete(format!("applied {changed} line-aware patch operation(s)")),
+        ))
+        .map(|result| result.with_metadata(json!({ "operations": changed })))
+    }
+
     pub fn apply_patch_freeform(&self, patch: impl AsRef<str>) -> Result<ToolResult, ToolError> {
         let patch = patch.as_ref();
         if patch.trim_start().starts_with("*** Begin Patch") {
@@ -770,6 +1109,148 @@ impl ToolRuntime {
             CappedOutput::complete(format!("applied begin patch to {changed} file(s)")),
         ))
         .map(|result| result.with_metadata(json!({ "files": changed })))
+    }
+
+    fn apply_line_updates(
+        &self,
+        path: &Path,
+        display_path: &Path,
+        updates: &[PendingLineUpdate],
+        expected_hash: Option<&str>,
+    ) -> Result<(), ToolError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let text_file = self.read_text_file(path, expected_hash)?;
+        let newline = text_file.newline;
+        let mut lines = split_lines_lossless(&text_file.text);
+        let original_len = lines.len();
+        let mut normalized = Vec::with_capacity(updates.len());
+
+        for update in updates {
+            let start_line = update.start_line;
+            let end_line = update.end_line;
+            if start_line == 0 {
+                return Err(ToolError::InvalidPatch(format!(
+                    "line-aware update start_line must be 1-based for {}",
+                    display_path.display()
+                )));
+            }
+            if end_line < start_line {
+                return Err(ToolError::InvalidPatch(format!(
+                    "line-aware update end_line must be greater than or equal to start_line for {}",
+                    display_path.display()
+                )));
+            }
+
+            let index = start_line - 1;
+            let old = normalize_edit_text(&update.old, newline);
+            let mut new = normalize_edit_text(&update.new, newline);
+            let old_lines = split_lines_lossless(&old);
+            let mut new_lines = split_lines_lossless(&new);
+
+            if old.is_empty() {
+                if end_line != start_line {
+                    return Err(ToolError::InvalidPatch(format!(
+                        "line-aware insert must set end_line equal to start_line for {}",
+                        display_path.display()
+                    )));
+                }
+                if index > original_len {
+                    return Err(ToolError::PatchApplyFailed {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "line-aware insert start_line {start_line} is beyond end of file; file has {original_len} line(s)"
+                        ),
+                    });
+                }
+                let new_end = index + new_lines.len();
+                if new_end <= original_len && lines_match(&lines, index, new_end, &new_lines) {
+                    continue;
+                }
+                normalized.push(NormalizedLineUpdate {
+                    start_index: index,
+                    end_index: index,
+                    new_lines,
+                    insertion: true,
+                });
+                continue;
+            }
+
+            let expected_line_count = end_line - start_line + 1;
+            if old_lines.len() != expected_line_count {
+                return Err(ToolError::InvalidPatch(format!(
+                    "line-aware update for {} has start_line {start_line} and end_line {end_line}, but old text spans {} line(s)",
+                    display_path.display(),
+                    old_lines.len()
+                )));
+            }
+
+            let end_index = end_line;
+            if index >= original_len
+                || end_index > original_len
+                || !lines_match(&lines, index, end_index, &old_lines)
+            {
+                let new_end = index + new_lines.len();
+                if new_end <= original_len && lines_match(&lines, index, new_end, &new_lines) {
+                    continue;
+                }
+                return Err(ToolError::PatchApplyFailed {
+                    path: path.to_path_buf(),
+                    message: format_line_patch_mismatch(&lines, start_line, end_line, &old),
+                });
+            }
+            if old_lines.last().is_some_and(|line| !line_has_newline(line))
+                && lines
+                    .get(end_index - 1)
+                    .is_some_and(|line| line_has_newline(line))
+                && new_lines.last().is_some_and(|line| !line_has_newline(line))
+            {
+                new.push_str(newline.as_str());
+                new_lines = split_lines_lossless(&new);
+            }
+
+            normalized.push(NormalizedLineUpdate {
+                start_index: index,
+                end_index,
+                new_lines,
+                insertion: false,
+            });
+        }
+
+        normalized.sort_by(|left, right| {
+            right
+                .start_index
+                .cmp(&left.start_index)
+                .then_with(|| right.end_index.cmp(&left.end_index))
+        });
+
+        for pair in normalized.windows(2) {
+            let later = &pair[0];
+            let earlier = &pair[1];
+            if earlier.end_index > later.start_index {
+                return Err(ToolError::InvalidPatch(format!(
+                    "overlapping line-aware updates for {} around lines {} and {}",
+                    display_path.display(),
+                    earlier.start_index + 1,
+                    later.start_index + 1
+                )));
+            }
+            if earlier.insertion && later.insertion && earlier.start_index == later.start_index {
+                return Err(ToolError::InvalidPatch(format!(
+                    "multiple insertions at line {} in {} are ambiguous; combine them into one operation",
+                    earlier.start_index + 1,
+                    display_path.display()
+                )));
+            }
+        }
+
+        for update in normalized {
+            lines.splice(update.start_index..update.end_index, update.new_lines);
+        }
+
+        fs::write(path, lines.concat()).map_err(|err| ToolError::io(path, err))
     }
 
     pub fn grep(&self, pattern: impl AsRef<str>) -> Result<ToolResult, ToolError> {
@@ -1688,6 +2169,7 @@ pub enum ToolError {
     InvalidPath {
         path: PathBuf,
     },
+    MemoryUnavailable,
     PathEscapesWorkspace {
         path: PathBuf,
         workspace_root: PathBuf,
@@ -1773,6 +2255,10 @@ impl ToolError {
             source,
         }
     }
+
+    fn memory_unavailable() -> Self {
+        Self::MemoryUnavailable
+    }
 }
 
 impl fmt::Display for ToolError {
@@ -1796,6 +2282,7 @@ impl fmt::Display for ToolError {
                 )
             }
             Self::InvalidPath { path } => write!(f, "invalid tool path: {}", path.display()),
+            Self::MemoryUnavailable => write!(f, "repo memory is not configured for this run"),
             Self::PathEscapesWorkspace {
                 path,
                 workspace_root,
@@ -1951,6 +2438,15 @@ enum NewlineStyle {
     Crlf,
 }
 
+impl NewlineStyle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TextFile {
     text: String,
@@ -1995,6 +2491,36 @@ fn edit_target_hint(content: &str, old: &str) -> Option<String> {
 
 fn format_edit_hint(hint: &Option<String>) -> &str {
     hint.as_deref().unwrap_or("")
+}
+
+fn format_line_patch_mismatch(
+    lines: &[String],
+    start_line: usize,
+    end_line: usize,
+    expected: &str,
+) -> String {
+    let index = start_line.saturating_sub(1);
+    let nearby_start = index.saturating_sub(2);
+    let nearby_end = (index + 3).min(lines.len());
+    let nearby = if nearby_start < nearby_end {
+        lines[nearby_start..nearby_end]
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| {
+                let number = nearby_start + offset + 1;
+                format!("{number}: {}", line.trim_end_matches(['\r', '\n']))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        "<no nearby lines; start_line is beyond end of file>".to_string()
+    };
+
+    format!(
+        "line-aware update did not match at lines {start_line}-{end_line}. The tool does not search for anchors. Expected preview: {}. Nearby actual lines:\n{}",
+        edit_preview(expected),
+        nearby
+    )
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2046,6 +2572,30 @@ fn split_lines_lossless(text: &str) -> Vec<String> {
         lines.push(text[start..].to_string());
     }
     lines
+}
+
+fn lines_match(
+    lines: &[String],
+    start_index: usize,
+    end_index: usize,
+    expected: &[String],
+) -> bool {
+    if end_index < start_index || end_index > lines.len() {
+        return false;
+    }
+    let actual_lines = &lines[start_index..end_index];
+    if actual_lines.len() != expected.len() {
+        return false;
+    }
+
+    let actual = actual_lines.concat();
+    let expected = expected.concat();
+    actual == expected
+        || actual.trim_end_matches(['\r', '\n']) == expected.trim_end_matches(['\r', '\n'])
+}
+
+fn line_has_newline(line: &str) -> bool {
+    line.ends_with('\n')
 }
 
 #[derive(Debug)]
@@ -2344,10 +2894,33 @@ mod tests {
     }
 
     #[test]
+    fn read_file_range_returns_numbered_subset_with_full_file_hash() {
+        let temp = TempDir::new("read-range");
+        let body = "one\ntwo\nthree\nfour\n";
+        fs::write(temp.path().join("hello.txt"), body).unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let result = runtime
+            .read_file_range("hello.txt", Some(2), Some(3))
+            .unwrap();
+
+        assert_eq!(result.name, ToolName::ReadFile);
+        assert_eq!(result.output, "2: two\n3: three");
+        assert_eq!(result.metadata["path"], "hello.txt");
+        assert_eq!(result.metadata["bytes"], body.len());
+        assert_eq!(result.metadata["sha256"], sha256_hex(body.as_bytes()));
+        assert_eq!(result.metadata["total_lines"], 4);
+        assert_eq!(result.metadata["start_line"], 2);
+        assert_eq!(result.metadata["end_line"], 3);
+        assert_eq!(result.metadata["returned_lines"], 2);
+    }
+
+    #[test]
     fn advertised_tools_use_apply_patch_as_canonical_write_tool() {
         let names = tool_names();
 
         assert!(names.contains(&"apply_patch".to_string()));
+        assert!(names.contains(&"read_blob".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"multi_edit".to_string()));
@@ -2486,6 +3059,42 @@ mod tests {
         let written = outside.path().join("notes").join("new.md");
         runtime.write_file(&written, "new memory").unwrap();
         assert_eq!(fs::read_to_string(written).unwrap(), "new memory");
+    }
+
+    #[test]
+    fn memory_tools_read_and_write_configured_file_outside_workspace() {
+        let workspace = TempDir::new("memory-tool-workspace");
+        let source = TempDir::new("memory-tool-source");
+        let memory_file = source.path().join(".inductor").join("memory.md");
+        let runtime = ToolRuntime::new(workspace.path())
+            .unwrap()
+            .with_memory_file(memory_file.clone());
+
+        let initial = runtime.read_memory().unwrap();
+        assert_eq!(initial.metadata["exists"], false);
+
+        runtime
+            .write_memory("# Memory\n\n- Use cargo test.")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&memory_file).unwrap(),
+            "# Memory\n\n- Use cargo test."
+        );
+
+        let read = runtime.read_memory().unwrap();
+        assert_eq!(read.output, "# Memory\n\n- Use cargo test.");
+        assert_eq!(read.metadata["exists"], true);
+        assert_eq!(read.metadata["path"], memory_file.display().to_string());
+    }
+
+    #[test]
+    fn memory_tools_error_when_unconfigured() {
+        let workspace = TempDir::new("memory-tool-unconfigured");
+        let runtime = ToolRuntime::new(workspace.path()).unwrap();
+
+        let error = runtime.read_memory().unwrap_err();
+
+        assert!(matches!(error, ToolError::MemoryUnavailable));
     }
 
     #[test]
@@ -3027,6 +3636,177 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("src/new_file.rs")).unwrap(),
             "fn main() {\n    println!(\"hello\");\n}\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_updates_exact_line_without_anchor_search() {
+        let temp = TempDir::new("line-patch-update");
+        fs::write(temp.path().join("file.txt"), "same\nsame\nsame\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 2,
+                old: "same\n".to_string(),
+                new: "changed\n".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "same\nchanged\nsame\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_rejects_stale_line_without_searching_for_anchor() {
+        let temp = TempDir::new("line-patch-stale");
+        fs::write(temp.path().join("file.txt"), "same\nsame\nsame\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 3,
+                end_line: 3,
+                old: "missing\n".to_string(),
+                new: "changed\n".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        let error = runtime.apply_line_patch(&patch).unwrap_err();
+
+        assert!(matches!(error, ToolError::PatchApplyFailed { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("line-aware update did not match")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "same\nsame\nsame\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_applies_multiple_updates_to_one_file_against_original_snapshot() {
+        let temp = TempDir::new("line-patch-multiple-same-file");
+        fs::write(
+            temp.path().join("file.txt"),
+            "one\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let hash = runtime
+            .read_file_range("file.txt", None, None)
+            .unwrap()
+            .metadata["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let patch = LinePatch {
+            operations: vec![
+                LinePatchOperation::Update {
+                    path: PathBuf::from("file.txt"),
+                    start_line: 2,
+                    end_line: 2,
+                    old: "two\n".to_string(),
+                    new: "TWO\nTWO-B\n".to_string(),
+                    expected_hash: Some(hash.clone()),
+                },
+                LinePatchOperation::Update {
+                    path: PathBuf::from("file.txt"),
+                    start_line: 4,
+                    end_line: 4,
+                    old: "four\n".to_string(),
+                    new: "FOUR\n".to_string(),
+                    expected_hash: Some(hash),
+                },
+            ],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nTWO-B\nthree\nFOUR\nfive\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_accepts_old_text_without_final_copied_newline() {
+        let temp = TempDir::new("line-patch-missing-final-newline");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 3,
+                old: "two\nthree".to_string(),
+                new: "TWO\nTHREE".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nTHREE\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_treats_already_applied_update_as_success() {
+        let temp = TempDir::new("line-patch-idempotent-update");
+        fs::write(temp.path().join("file.txt"), "one\nTWO\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 2,
+                old: "two".to_string(),
+                new: "TWO".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_treats_already_present_insertion_as_success() {
+        let temp = TempDir::new("line-patch-idempotent-insert");
+        fs::write(temp.path().join("file.txt"), "one\ninserted\ntwo\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 2,
+                old: "".to_string(),
+                new: "inserted".to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ninserted\ntwo\n"
         );
     }
 

@@ -3545,6 +3545,8 @@ function editsArray(value: Record<string, unknown> | undefined) {
 }
 
 function patchPathFromToolInput(json: Record<string, unknown> | undefined) {
+  const operationPath = operationPathFromToolInput(json)
+  if (operationPath) return operationPath
   const patch = json?.patch
   if (typeof patch === "string") return patchFilesFromUnifiedPatch(patch)[0]?.path
   if (Array.isArray(patch)) {
@@ -3553,6 +3555,20 @@ function patchPathFromToolInput(json: Record<string, unknown> | undefined) {
   }
   const diff = stringField(json, ["diff"])
   return diff ? patchFilesFromUnifiedPatch(diff)[0]?.path : undefined
+}
+
+function operationPathFromToolInput(json: Record<string, unknown> | undefined) {
+  const operations = Array.isArray(json?.operations) ? json.operations : []
+  const paths = operations
+    .map((operation) => {
+      if (!operation || typeof operation !== "object") return undefined
+      return stringField(operation as Record<string, unknown>, ["path", "filepath", "file_path", "target", "filename", "from", "to"])
+    })
+    .filter((path): path is string => Boolean(path))
+  const uniquePaths = [...new Set(paths)]
+  if (uniquePaths.length === 0) return undefined
+  if (uniquePaths.length === 1) return uniquePaths[0]
+  return `${uniquePaths[0]} +${uniquePaths.length - 1}`
 }
 
 function prettyJson(value: string) {
