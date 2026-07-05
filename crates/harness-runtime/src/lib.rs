@@ -13,6 +13,7 @@
 //!
 //! ```text
 //! <inductor_tool_call>{"name":"read_file","input":{"path":"Cargo.toml"}}</inductor_tool_call>
+//! <inductor_tool_call>{"name":"grep","input":{"pattern":"fn main"}}</inductor_tool_call>
 //! ```
 
 use std::{
@@ -109,19 +110,21 @@ fn generic_tools_preamble() -> String {
         "You are an Inductor coding agent operating on the user's machine.\n\
 Create and maintain a todo list for every user task with todo_write: create todos before substantive work, keep exactly one in_progress item while working, mark items completed as soon as they are done, and update/replace the list when the user's prompt changes the plan.\n\
 When a feature, architecture, product, UX, data-loss, security, or other choice is ambiguous or important, ask the user instead of assuming. Use ask_questions with concrete options; every option needs a short description plus pros and cons, and mark your recommended option.\n\
-You can run tools by emitting EXACTLY ONE tool-call envelope at the end of your reply:\n\n\
+You can run tools by emitting one or more tool-call envelopes at the end of your reply:\n\n\
 <inductor_tool_call>{{\"name\":\"<tool>\",\"input\":{{ ... }}}}</inductor_tool_call>\n\n\
 Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - If the user prompt is just \"resume\" or asks to resume, treat it as a request to continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.\n\
-- Use apply_patch for all file changes. For edits, first read the target range and then provide operations with exact path, 1-based inclusive start_line and end_line, old text, and new text. Do not use anchor-only patches.\n\
+- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with the adjacent line from a recent read_file result instead of inventing an update range. For replacing existing lines, first read the target range and then provide exact path, 1-based inclusive start_line/end_line, old text, and new text. Do not use anchor-only patches.\n\
 - Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
-- Keep tool output small: prefer read_file with start_line/end_line over large reads, use rg with focused patterns instead of broad dumps, and avoid large sed commands.\n\
+- Keep tool output small: prefer read_file with start_line/end_line over large reads, use grep with focused regex patterns instead of broad dumps, and avoid large sed commands.\n\
 - If a tool result says it was truncated and gives a blob_id, use read_blob with a bounded start_byte/limit_bytes range to inspect more without rerunning the tool.\n\
+- Prefer app-owned code first. Inspect dependency or generated code only to resolve a specific unknown; once that unknown is resolved, stop rereading dependency internals and patch the app-owned code.\n\
+- Once you have a concrete cause, do not restate it in another progress message. Apply the fix, run the next verification, or report a blocker.\n\
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.\n\
-- Emit at most one envelope per reply. After a tool result is returned, continue.\n\
+- You may emit multiple independent read-only tool envelopes in one reply. Writes may also be listed together, but they are executed sequentially by the harness.\n\
 - Progress messages must be sparse: only report material new facts, decisions, blockers, failures, verification results, or completed phases.\n\
 - Do not repeat the same status or narrate routine reads/searches/inspections; keep working silently until something changes. No hidden chain-of-thought.\n\
 - When you have the final answer and need no more tools, reply with concise prose and NO envelope.",
@@ -258,28 +261,49 @@ impl std::error::Error for ToolCallParseError {}
 /// `Some(Ok(..))` for a well-formed call, and `Some(Err(..))` when an
 /// envelope exists but is malformed.
 pub fn parse_tool_call(text: &str) -> Option<Result<ParsedToolCall, ToolCallParseError>> {
-    let open = text.find(TOOL_CALL_OPEN)?;
-    let body_start = open + TOOL_CALL_OPEN.len();
+    parse_tool_calls(text).map(|result| result.map(|mut calls| calls.remove(0)))
+}
 
-    let close_rel = match text[body_start..].find(TOOL_CALL_CLOSE) {
-        Some(rel) => rel,
-        None => return Some(Err(ToolCallParseError::Unterminated)),
-    };
-    let body = text[body_start..body_start + close_rel].trim();
+/// Look for all tool-call envelopes in assistant text.
+///
+/// Returns `None` when no envelope is present, `Some(Ok(..))` for one or more
+/// well-formed calls, and `Some(Err(..))` when any envelope exists but is
+/// malformed.
+pub fn parse_tool_calls(text: &str) -> Option<Result<Vec<ParsedToolCall>, ToolCallParseError>> {
+    let mut calls = Vec::new();
+    let mut offset = 0usize;
 
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(err) => return Some(Err(ToolCallParseError::InvalidJson(err.to_string()))),
-    };
+    while let Some(open_rel) = text[offset..].find(TOOL_CALL_OPEN) {
+        let open = offset + open_rel;
+        let body_start = open + TOOL_CALL_OPEN.len();
 
-    let name = match value.get("name").and_then(Value::as_str) {
-        Some(name) if !name.trim().is_empty() => name.to_string(),
-        _ => return Some(Err(ToolCallParseError::MissingName)),
-    };
+        let close_rel = match text[body_start..].find(TOOL_CALL_CLOSE) {
+            Some(rel) => rel,
+            None => return Some(Err(ToolCallParseError::Unterminated)),
+        };
+        let body_end = body_start + close_rel;
+        let body = text[body_start..body_end].trim();
 
-    let input = value.get("input").cloned().unwrap_or_else(|| json!({}));
+        let value: Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(err) => return Some(Err(ToolCallParseError::InvalidJson(err.to_string()))),
+        };
 
-    Some(Ok(ParsedToolCall { name, input }))
+        let name = match value.get("name").and_then(Value::as_str) {
+            Some(name) if !name.trim().is_empty() => name.to_string(),
+            _ => return Some(Err(ToolCallParseError::MissingName)),
+        };
+
+        let input = value.get("input").cloned().unwrap_or_else(|| json!({}));
+        calls.push(ParsedToolCall { name, input });
+        offset = body_end + TOOL_CALL_CLOSE.len();
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(Ok(calls))
+    }
 }
 
 /// Errors raised while dispatching a parsed tool call to the runtime.
@@ -1057,26 +1081,29 @@ fn run_local_tool_call<'a>(
     }
 
     let targets = ToolTargets::capture(tools, &display_call);
-    yield LocalToolRunUpdate::Event(SessionEvent::ToolInputStart {
-        session_id,
-        tool_call_id,
-        name: display_call.name.clone(),
-    });
-    yield LocalToolRunUpdate::Event(SessionEvent::ToolInputEnd {
-        session_id,
-        tool_call_id,
-        input_json: preview_input.clone(),
-    });
-    yield LocalToolRunUpdate::Event(SessionEvent::ToolCallStart {
-        session_id,
-        tool_call_id,
-        name: display_call.name.clone(),
-        input_json: preview_input.clone(),
-    });
-    yield LocalToolRunUpdate::Event(SessionEvent::Status {
-        session_id,
-        status: SessionStatus::RunningTools,
-    });
+    let hidden_tool = display_call.name == ToolName::ReadBlob.as_str();
+    if !hidden_tool {
+        yield LocalToolRunUpdate::Event(SessionEvent::ToolInputStart {
+            session_id,
+            tool_call_id,
+            name: display_call.name.clone(),
+        });
+        yield LocalToolRunUpdate::Event(SessionEvent::ToolInputEnd {
+            session_id,
+            tool_call_id,
+            input_json: preview_input.clone(),
+        });
+        yield LocalToolRunUpdate::Event(SessionEvent::ToolCallStart {
+            session_id,
+            tool_call_id,
+            name: display_call.name.clone(),
+            input_json: preview_input.clone(),
+        });
+        yield LocalToolRunUpdate::Event(SessionEvent::Status {
+            session_id,
+            status: SessionStatus::RunningTools,
+        });
+    }
 
     let stale_line_patch_error = hash_cache.stale_line_patch_reason(tools, &execution_call);
     let unlocked_tools;
@@ -1189,14 +1216,16 @@ fn run_local_tool_call<'a>(
                 config.context.limits.tool_result_inline_bytes,
                 blob_store.as_ref(),
             )?;
-            yield LocalToolRunUpdate::Event(SessionEvent::ToolCallResult {
-                session_id,
-                tool_call_id,
-                title: Some(result.title.clone()),
-                metadata: result.metadata.clone(),
-                output: stubbed.inline_output.clone(),
-                exit_code: result.exit_code,
-            });
+            if !hidden_tool {
+                yield LocalToolRunUpdate::Event(SessionEvent::ToolCallResult {
+                    session_id,
+                    tool_call_id,
+                    title: Some(result.title.clone()),
+                    metadata: result.metadata.clone(),
+                    output: stubbed.inline_output.clone(),
+                    exit_code: result.exit_code,
+                });
+            }
             state.push(
                 Role::Tool,
                 format!("{} result:\n{}", display_call.name, stubbed.inline_output),
@@ -1226,7 +1255,8 @@ fn run_local_tool_call<'a>(
         Err(exec_error) => {
             let message = exec_error.to_string();
 
-            if matches!(config.approval_policy, ApprovalPolicy::OnFailure)
+            if !hidden_tool
+                && matches!(config.approval_policy, ApprovalPolicy::OnFailure)
                 && !permissions.is_allowed(&display_call)
             {
                 let pending = permissions.begin_request(
@@ -1261,11 +1291,13 @@ fn run_local_tool_call<'a>(
                 permissions.resolve(pending.request_id, decision, &display_call);
             }
 
-            yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
-                session_id,
-                tool_call_id,
-                message: message.clone(),
-            });
+            if !hidden_tool {
+                yield LocalToolRunUpdate::Event(SessionEvent::ToolCallError {
+                    session_id,
+                    tool_call_id,
+                    message: message.clone(),
+                });
+            }
             state.push(Role::Tool, format!("{} error: {message}", display_call.name));
             yield LocalToolRunUpdate::Done(LocalToolRunResult {
                 provider_response: ProviderToolResponse {
@@ -1927,7 +1959,7 @@ pub fn run_turn<'a>(
         yield SessionEvent::Status { session_id, status: SessionStatus::Starting };
 
         let mut round = 0usize;
-        loop {
+        'turns: loop {
             if cancel.is_cancelled() {
                 yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
                 return;
@@ -2228,8 +2260,8 @@ pub fn run_turn<'a>(
             state.push(Role::Assistant, assistant_text.clone());
 
             // --- Tool-call detection ---------------------------------------
-            match parse_tool_call(&assistant_text) {
-                // No envelope: the assistant produced its final answer.
+            match parse_tool_calls(&assistant_text) {
+                // No envelopes: the assistant produced its final answer.
                 None => {
                     yield SessionEvent::StepFinish {
                         session_id,
@@ -2250,79 +2282,80 @@ pub fn run_turn<'a>(
                     };
                     state.push(Role::Tool, format!("tool call error: {message}"));
                 }
-                // Well-formed envelope: gate it through approval, then execute.
-                Some(Ok(call)) => {
-                    let tool_call_id = ToolCallId::new();
-                    if cancel.is_cancelled() {
-                        yield SessionEvent::StepFinish {
-                            session_id,
-                            index: round as u32,
-                            stop_reason: StopReason::Interrupted,
-                        };
-                        yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
-                        return;
-                    }
-                    if call.name == ToolName::AskQuestions.as_str() {
-                        let questions = parse_agent_questions(&call.input);
-                        let result = provider_core::ask_questions(
-                            &question_requests,
-                            &mut question_responses,
-                            tool_call_id,
-                            questions,
-                        ).await;
-                        yield SessionEvent::QuestionsAnswered {
-                            session_id,
-                            tool_call_id,
-                            answers: result.answers.clone(),
-                        };
-                        state.push(Role::Tool, result.output);
-                        round += 1;
-                        continue;
-                    }
-                    let mut updates = run_local_tool_call(
-                        session_id,
-                        tool_call_id,
-                        tools,
-                        approver,
-                        &mut permissions,
-                        state,
-                        &call,
-                        &mut hash_cache,
-                        &config,
-                        cancel.clone(),
-                    );
-                    let mut run = None;
-                    while let Some(update) = updates.next().await {
-                        match update? {
-                            LocalToolRunUpdate::Event(event) => yield event,
-                            LocalToolRunUpdate::Done(result) => run = Some(result),
+                // Well-formed envelopes: gate them through approval, then execute.
+                Some(Ok(calls)) => {
+                    for call in calls {
+                        let tool_call_id = ToolCallId::new();
+                        if cancel.is_cancelled() {
+                            yield SessionEvent::StepFinish {
+                                session_id,
+                                index: round as u32,
+                                stop_reason: StopReason::Interrupted,
+                            };
+                            yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
+                            return;
                         }
-                    }
-                    drop(updates);
-                    let run = run.ok_or_else(|| anyhow::anyhow!("tool run ended without a result"))?;
-                    let denied = matches!(run.status, LocalToolRunStatus::Denied);
+                        if call.name == ToolName::AskQuestions.as_str() {
+                            let questions = parse_agent_questions(&call.input);
+                            let result = provider_core::ask_questions(
+                                &question_requests,
+                                &mut question_responses,
+                                tool_call_id,
+                                questions,
+                            ).await;
+                            yield SessionEvent::QuestionsAnswered {
+                                session_id,
+                                tool_call_id,
+                                answers: result.answers.clone(),
+                            };
+                            state.push(Role::Tool, result.output);
+                            continue;
+                        }
+                        let mut updates = run_local_tool_call(
+                            session_id,
+                            tool_call_id,
+                            tools,
+                            approver,
+                            &mut permissions,
+                            state,
+                            &call,
+                            &mut hash_cache,
+                            &config,
+                            cancel.clone(),
+                        );
+                        let mut run = None;
+                        while let Some(update) = updates.next().await {
+                            match update? {
+                                LocalToolRunUpdate::Event(event) => yield event,
+                                LocalToolRunUpdate::Done(result) => run = Some(result),
+                            }
+                        }
+                        drop(updates);
+                        let run = run.ok_or_else(|| anyhow::anyhow!("tool run ended without a result"))?;
+                        let denied = matches!(run.status, LocalToolRunStatus::Denied);
 
-                    if denied {
-                        round += 1;
-                        yield SessionEvent::StepFinish {
-                            session_id,
-                            index: (round - 1) as u32,
-                            stop_reason: StopReason::EndTurn,
-                        };
-                        continue;
-                    }
+                        if denied {
+                            yield SessionEvent::StepFinish {
+                                session_id,
+                                index: round as u32,
+                                stop_reason: StopReason::EndTurn,
+                            };
+                            round += 1;
+                            continue 'turns;
+                        }
 
-                    if cancel.is_cancelled() {
-                        yield SessionEvent::StepFinish {
-                            session_id,
-                            index: round as u32,
-                            stop_reason: StopReason::Interrupted,
-                        };
-                        yield SessionEvent::Result {
-                            session_id,
-                            stop_reason: StopReason::Interrupted,
-                        };
-                        return;
+                        if cancel.is_cancelled() {
+                            yield SessionEvent::StepFinish {
+                                session_id,
+                                index: round as u32,
+                                stop_reason: StopReason::Interrupted,
+                            };
+                            yield SessionEvent::Result {
+                                session_id,
+                                stop_reason: StopReason::Interrupted,
+                            };
+                            return;
+                        }
                     }
                 }
             }
@@ -2399,7 +2432,7 @@ Todo and question rules:
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
-- Use apply_patch for all file changes. For edits, provide operations with exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with an adjacent line from a recent read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.
 - Progress messages must be sparse: only report material new facts, decisions, blockers, failures, verification results, or completed phases.

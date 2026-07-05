@@ -2412,12 +2412,14 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
         | SessionEvent::PermissionRequest { session_id, .. }
         | SessionEvent::PermissionResolved { session_id, .. }
         | SessionEvent::TerminalOutput { session_id, .. }
+        | SessionEvent::SkillUsed { session_id, .. }
         | SessionEvent::Result { session_id, .. }
         | SessionEvent::Usage { session_id, .. }
         | SessionEvent::MetadataUpdated { session_id, .. }
         | SessionEvent::Error { session_id, .. } => {
             db.append_event(*session_id, event)?;
         }
+        SessionEvent::Unknown => {}
     }
 
     match event {

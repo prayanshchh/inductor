@@ -167,13 +167,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::ApplyPatch,
-            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; the tool will not search for ambiguous anchors. Multiple updates to the same file are applied against one original snapshot and written once. Use add_file for new files and delete_file for deletes.",
+            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Use insert_before/insert_after for pure insertions, update for replacing existing lines, add_file for new files, and delete_file for deletes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; insertions only need the adjacent line number and content. The tool will not search for ambiguous anchors. Multiple changes to the same file are applied against one original snapshot and written once.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "operations": {
                         "type": "array",
-                        "description": "Line-aware patch operations. For edits, first call read_file with start_line/end_line to get exact line numbers and old text.",
+                        "description": "Line-aware patch operations. First call read_file with start_line/end_line to get exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
                         "items": {
                             "oneOf": [
                                 {
@@ -187,6 +187,28 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                         "new": { "type": "string", "description": "Replacement text for the inclusive line range." }
                                     },
                                     "required": ["op", "path", "start_line", "end_line", "old", "new"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["insert_before"] },
+                                        "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
+                                        "line": { "type": "integer", "description": "1-based line to insert before; use total_lines + 1 to append at EOF." },
+                                        "content": { "type": "string", "description": "Text to insert. Include trailing newline when adding complete lines." },
+                                        "expected_line": { "type": "string", "description": "Optional exact current content of the target line, copied from read_file, to guard against stale line numbers." }
+                                    },
+                                    "required": ["op", "path", "line", "content"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": { "type": "string", "enum": ["insert_after"] },
+                                        "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
+                                        "line": { "type": "integer", "description": "1-based existing line to insert after; use line 0 only to insert at the beginning of an empty file." },
+                                        "content": { "type": "string", "description": "Text to insert. Include trailing newline when adding complete lines." },
+                                        "expected_line": { "type": "string", "description": "Optional exact current content of the target line, copied from read_file, to guard against stale line numbers." }
+                                    },
+                                    "required": ["op", "path", "line", "content"]
                                 },
                                 {
                                     "type": "object",
@@ -228,10 +250,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::Grep,
-            description: "Search text files for a substring or regular expression.",
+            description: "Search workspace text files with a regex pattern. Uses ignore-aware traversal and skips expensive dependency/build directories.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "pattern": { "type": "string", "description": "Search pattern" } },
+                "properties": { "pattern": { "type": "string", "description": "Regex pattern" } },
                 "required": ["pattern"]
             }),
             read_only: true,
@@ -453,6 +475,20 @@ pub enum LinePatchOperation {
         new: String,
         expected_hash: Option<String>,
     },
+    InsertBefore {
+        path: PathBuf,
+        line: usize,
+        content: String,
+        expected_line: Option<String>,
+        expected_hash: Option<String>,
+    },
+    InsertAfter {
+        path: PathBuf,
+        line: usize,
+        content: String,
+        expected_line: Option<String>,
+        expected_hash: Option<String>,
+    },
     AddFile {
         path: PathBuf,
         content: String,
@@ -477,10 +513,25 @@ struct PendingLineUpdate {
 }
 
 #[derive(Debug)]
+enum PendingLineInsertPosition {
+    Before,
+    After,
+}
+
+#[derive(Debug)]
+struct PendingLineInsert {
+    line: usize,
+    content: String,
+    expected_line: Option<String>,
+    position: PendingLineInsertPosition,
+}
+
+#[derive(Debug)]
 struct PendingFileLineUpdates {
     display_path: PathBuf,
     expected_hash: Option<String>,
     updates: Vec<PendingLineUpdate>,
+    inserts: Vec<PendingLineInsert>,
 }
 
 #[derive(Debug)]
@@ -976,6 +1027,7 @@ impl ToolRuntime {
                             display_path: path.clone(),
                             expected_hash: expected_hash.clone(),
                             updates: Vec::new(),
+                            inserts: Vec::new(),
                         }
                     });
                     if entry.expected_hash.is_none() {
@@ -991,6 +1043,52 @@ impl ToolRuntime {
                         end_line: *end_line,
                         old: old.clone(),
                         new: new.clone(),
+                    });
+                }
+                LinePatchOperation::InsertBefore {
+                    path,
+                    line,
+                    content,
+                    expected_line,
+                    expected_hash,
+                }
+                | LinePatchOperation::InsertAfter {
+                    path,
+                    line,
+                    content,
+                    expected_line,
+                    expected_hash,
+                } => {
+                    let resolved_path = self.resolve_existing_path(path)?;
+                    let entry = pending_updates.entry(resolved_path).or_insert_with(|| {
+                        PendingFileLineUpdates {
+                            display_path: path.clone(),
+                            expected_hash: expected_hash.clone(),
+                            updates: Vec::new(),
+                            inserts: Vec::new(),
+                        }
+                    });
+                    if entry.expected_hash.is_none() {
+                        entry.expected_hash = expected_hash.clone();
+                    } else if expected_hash.is_some() && entry.expected_hash != *expected_hash {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "conflicting expected_hash values for {}",
+                            path.display()
+                        )));
+                    }
+                    entry.inserts.push(PendingLineInsert {
+                        line: *line,
+                        content: content.clone(),
+                        expected_line: expected_line.clone(),
+                        position: match operation {
+                            LinePatchOperation::InsertBefore { .. } => {
+                                PendingLineInsertPosition::Before
+                            }
+                            LinePatchOperation::InsertAfter { .. } => {
+                                PendingLineInsertPosition::After
+                            }
+                            _ => unreachable!(),
+                        },
                     });
                 }
                 LinePatchOperation::AddFile { .. } | LinePatchOperation::DeleteFile { .. } => {
@@ -1028,16 +1126,19 @@ impl ToolRuntime {
                         .map_err(|err| ToolError::io(&resolved_path, err))?;
                     changed += 1;
                 }
-                LinePatchOperation::Update { .. } => {}
+                LinePatchOperation::Update { .. }
+                | LinePatchOperation::InsertBefore { .. }
+                | LinePatchOperation::InsertAfter { .. } => {}
             }
         }
 
         for (resolved_path, pending) in pending_updates {
-            let update_count = pending.updates.len();
+            let update_count = pending.updates.len() + pending.inserts.len();
             self.apply_line_updates(
                 &resolved_path,
                 &pending.display_path,
                 &pending.updates,
+                &pending.inserts,
                 pending.expected_hash.as_deref(),
             )?;
             changed += update_count;
@@ -1116,9 +1217,10 @@ impl ToolRuntime {
         path: &Path,
         display_path: &Path,
         updates: &[PendingLineUpdate],
+        inserts: &[PendingLineInsert],
         expected_hash: Option<&str>,
     ) -> Result<(), ToolError> {
-        if updates.is_empty() {
+        if updates.is_empty() && inserts.is_empty() {
             return Ok(());
         }
 
@@ -1150,7 +1252,7 @@ impl ToolRuntime {
             if text_matches_loose(&old, &new) {
                 continue;
             }
-            let old_lines = split_lines_lossless(&old);
+            let mut old_lines = split_lines_lossless(&old);
             let mut new_lines = split_lines_lossless(&new);
 
             if old.is_empty() {
@@ -1182,6 +1284,23 @@ impl ToolRuntime {
             }
 
             let expected_line_count = end_line - start_line + 1;
+            if old_lines.len() != expected_line_count
+                && old_lines.len() == expected_line_count + 1
+                && old_lines.first().is_some_and(|line| line_is_blank(line))
+            {
+                let trimmed_old_lines = old_lines[1..].to_vec();
+                if lines_match(
+                    &lines,
+                    index,
+                    index + trimmed_old_lines.len(),
+                    &trimmed_old_lines,
+                ) {
+                    old_lines = trimmed_old_lines;
+                    if new_lines.first().is_some_and(|line| line_is_blank(line)) {
+                        new_lines.remove(0);
+                    }
+                }
+            }
             if old_lines.len() != expected_line_count {
                 let corrected_end_line = start_line + old_lines.len().saturating_sub(1);
                 let corrected_end_index = index + old_lines.len();
@@ -1230,6 +1349,91 @@ impl ToolRuntime {
             });
         }
 
+        for insert in inserts {
+            let content = normalize_edit_text(&insert.content, newline);
+            if content.is_empty() {
+                continue;
+            }
+            let new_lines = split_lines_lossless(&content);
+            let index = match insert.position {
+                PendingLineInsertPosition::Before => {
+                    if insert.line == 0 {
+                        return Err(ToolError::InvalidPatch(format!(
+                            "line-aware insert_before line must be 1-based for {}",
+                            display_path.display()
+                        )));
+                    }
+                    let index = insert.line - 1;
+                    if index > original_len {
+                        return Err(ToolError::PatchApplyFailed {
+                            path: path.to_path_buf(),
+                            message: format!(
+                                "line-aware insert_before line {} is beyond end of file; file has {original_len} line(s)",
+                                insert.line
+                            ),
+                        });
+                    }
+                    if let Some(expected_line) = &insert.expected_line {
+                        validate_expected_adjacent_line(
+                            path,
+                            display_path,
+                            &lines,
+                            index,
+                            expected_line,
+                            newline,
+                            "insert_before",
+                        )?;
+                    }
+                    index
+                }
+                PendingLineInsertPosition::After => {
+                    if insert.line == 0 {
+                        if original_len != 0 {
+                            return Err(ToolError::InvalidPatch(format!(
+                                "line-aware insert_after line 0 is only valid for empty files in {}",
+                                display_path.display()
+                            )));
+                        }
+                        0
+                    } else {
+                        if insert.line > original_len {
+                            return Err(ToolError::PatchApplyFailed {
+                                path: path.to_path_buf(),
+                                message: format!(
+                                    "line-aware insert_after line {} is beyond end of file; file has {original_len} line(s)",
+                                    insert.line
+                                ),
+                            });
+                        }
+                        let actual_index = insert.line - 1;
+                        if let Some(expected_line) = &insert.expected_line {
+                            validate_expected_adjacent_line(
+                                path,
+                                display_path,
+                                &lines,
+                                actual_index,
+                                expected_line,
+                                newline,
+                                "insert_after",
+                            )?;
+                        }
+                        insert.line
+                    }
+                }
+            };
+
+            let new_end = index + new_lines.len();
+            if new_end <= original_len && lines_match(&lines, index, new_end, &new_lines) {
+                continue;
+            }
+            normalized.push(NormalizedLineUpdate {
+                start_index: index,
+                end_index: index,
+                new_lines,
+                insertion: true,
+            });
+        }
+
         normalized.sort_by(|left, right| {
             right
                 .start_index
@@ -1266,9 +1470,16 @@ impl ToolRuntime {
 
     pub fn grep(&self, pattern: impl AsRef<str>) -> Result<ToolResult, ToolError> {
         let pattern = pattern.as_ref();
+        if pattern.trim().is_empty() {
+            return Err(ToolError::InvalidPattern(pattern.to_string()));
+        }
+
+        if let Some(result) = self.grep_with_rg(pattern)? {
+            return Ok(result);
+        }
+
         let mut output = String::new();
         let mut matches = 0;
-
         self.grep_dir(&self.workspace_root, pattern, &mut output, &mut matches)?;
 
         Ok(ToolResult::success(
@@ -1276,6 +1487,80 @@ impl ToolRuntime {
             cap_output(output, self.output_limit_bytes),
         ))
         .map(|result| result.with_metadata(json!({ "pattern": pattern, "matches": matches })))
+    }
+
+    fn grep_with_rg(&self, pattern: &str) -> Result<Option<ToolResult>, ToolError> {
+        let output = match Command::new("rg")
+            .current_dir(&self.workspace_root)
+            .args([
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                "--path-separator",
+                "/",
+                "--hidden",
+                "--no-messages",
+                "--max-filesize",
+                "2M",
+                "--glob",
+                "!.git/**",
+                "--glob",
+                "!node_modules/**",
+                "--glob",
+                "!target/**",
+                "--glob",
+                "!dist/**",
+                "--glob",
+                "!build/**",
+                "--glob",
+                "!.next/**",
+                "--regexp",
+                pattern,
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ToolError::io(&self.workspace_root, error)),
+        };
+
+        if output.status.success() || output.status.code() == Some(1) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines = stdout
+                .lines()
+                .take(self.grep_match_limit)
+                .collect::<Vec<_>>();
+            let matches = stdout.lines().count();
+            let truncated = matches > lines.len();
+            let mut text = if lines.is_empty() {
+                "No matches found".to_string()
+            } else {
+                lines.join("\n")
+            };
+            if truncated {
+                text.push_str(&format!(
+                    "\n(Results truncated: showing first {} matches.)",
+                    lines.len()
+                ));
+            }
+            return Ok(Some(
+                ToolResult::success(ToolName::Grep, cap_output(text, self.output_limit_bytes))
+                    .with_metadata(json!({
+                        "pattern": pattern,
+                        "matches": matches,
+                        "engine": "rg",
+                        "truncated": truncated
+                    })),
+            ));
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(ToolError::InvalidPattern(if stderr.is_empty() {
+            pattern.to_string()
+        } else {
+            stderr
+        }))
     }
 
     pub fn glob(
@@ -1798,6 +2083,9 @@ impl ToolRuntime {
                 .map_err(|err| ToolError::io(&entry.path(), err))?;
 
             if metadata.is_dir() {
+                if is_ignored_search_dir(&path) {
+                    continue;
+                }
                 self.grep_dir(&path, pattern, output, matches)?;
             } else if metadata.is_file() {
                 self.grep_file(&path, pattern, output, matches)?;
@@ -1827,6 +2115,9 @@ impl ToolRuntime {
             let path = entry.path();
             let metadata = entry.metadata().map_err(|err| ToolError::io(&path, err))?;
             if metadata.is_dir() {
+                if is_ignored_search_dir(&path) {
+                    continue;
+                }
                 self.glob_dir(&path, pattern, output)?;
             } else if metadata.is_file() {
                 let relative = path.strip_prefix(&self.workspace_root).unwrap_or(&path);
@@ -2566,6 +2857,17 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     inner(pattern.as_bytes(), text.as_bytes())
 }
 
+fn is_ignored_search_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                ".git" | "node_modules" | "target" | "dist" | "build" | ".next"
+            )
+        })
+}
+
 fn split_lines_lossless(text: &str) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -2605,8 +2907,47 @@ fn lines_match(
         || actual.trim_end_matches(['\r', '\n']) == expected.trim_end_matches(['\r', '\n'])
 }
 
+fn validate_expected_adjacent_line(
+    path: &Path,
+    display_path: &Path,
+    lines: &[String],
+    index: usize,
+    expected_line: &str,
+    newline: NewlineStyle,
+    operation: &str,
+) -> Result<(), ToolError> {
+    let expected = normalize_edit_text(expected_line, newline);
+    let expected_lines = split_lines_lossless(&expected);
+    if expected_lines.len() != 1 {
+        return Err(ToolError::InvalidPatch(format!(
+            "line-aware {operation} expected_line for {} must contain exactly one line",
+            display_path.display()
+        )));
+    }
+    if !lines_match(lines, index, index + 1, &expected_lines) {
+        return Err(ToolError::PatchApplyFailed {
+            path: path.to_path_buf(),
+            message: format!(
+                "line-aware {operation} expected_line did not match at line {} in {}. Expected preview: {}. Actual line: {}",
+                index + 1,
+                display_path.display(),
+                edit_preview(&expected),
+                lines
+                    .get(index)
+                    .map(|line| edit_preview(line))
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn line_has_newline(line: &str) -> bool {
     line.ends_with('\n')
+}
+
+fn line_is_blank(line: &str) -> bool {
+    line.trim_end_matches(['\r', '\n']).is_empty()
 }
 
 fn text_matches_loose(left: &str, right: &str) -> bool {
@@ -3160,7 +3501,26 @@ mod tests {
         let result = runtime.grep("needle").unwrap();
 
         assert_eq!(result.name, ToolName::Grep);
-        assert_eq!(result.output, "src/lib.rs:2:needle\n");
+        assert_eq!(result.output.trim_end(), "src/lib.rs:2:needle");
+    }
+
+    #[test]
+    fn grep_supports_regex_and_ignores_expensive_dirs() {
+        if Command::new("rg").arg("--version").output().is_err() {
+            return;
+        }
+
+        let temp = TempDir::new("grep-regex");
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "alpha_123\nalpha_nope\n").unwrap();
+        fs::write(temp.path().join("node_modules/pkg/index.js"), "alpha_999\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+        let result = runtime.grep(r"alpha_\d+").unwrap();
+
+        assert!(result.output.contains("src/lib.rs:1:alpha_123"));
+        assert!(!result.output.contains("node_modules"));
     }
 
     #[test]
@@ -3699,6 +4059,104 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("file.txt")).unwrap(),
             "one\nTWO\nTHREE\nFOUR\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_trims_safe_accidental_leading_blank_line() {
+        let temp = TempDir::new("line-patch-leading-blank");
+        fs::write(
+            temp.path().join("file.txt"),
+            "one\nsetNotice(undefined)\nif (wasQueued) addUserMessage()\nconst run = startBackendTurn()\nfive\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::Update {
+                path: PathBuf::from("file.txt"),
+                start_line: 2,
+                end_line: 4,
+                old: "\nsetNotice(undefined)\nif (wasQueued) addUserMessage()\nconst run = startBackendTurn()\n".to_string(),
+                new: "\nsetNotice(undefined)\naddUserMessage()\nconst run = startBackendTurn()\n"
+                    .to_string(),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\nsetNotice(undefined)\naddUserMessage()\nconst run = startBackendTurn()\nfive\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_insert_after_adds_content_without_old_text() {
+        let temp = TempDir::new("line-patch-insert-after");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::InsertAfter {
+                path: PathBuf::from("file.txt"),
+                line: 2,
+                content: "inserted\n".to_string(),
+                expected_line: Some("two\n".to_string()),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ntwo\ninserted\nthree\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_insert_before_appends_at_eof() {
+        let temp = TempDir::new("line-patch-insert-before-eof");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::InsertBefore {
+                path: PathBuf::from("file.txt"),
+                line: 3,
+                content: "three\n".to_string(),
+                expected_line: None,
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_insert_after_rejects_stale_expected_line() {
+        let temp = TempDir::new("line-patch-insert-stale-expected-line");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::InsertAfter {
+                path: PathBuf::from("file.txt"),
+                line: 2,
+                content: "inserted\n".to_string(),
+                expected_line: Some("wrong\n".to_string()),
+                expected_hash: None,
+            }],
+        };
+
+        let error = runtime.apply_line_patch(&patch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("insert_after expected_line did not match")
         );
     }
 

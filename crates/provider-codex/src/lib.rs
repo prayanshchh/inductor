@@ -66,16 +66,21 @@ impl CodexProvider {
                 summary: what you are checking, what evidence you found, why the next step \
                 follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought. \
                 Keep tool output small: prefer read_file with start_line/end_line over large reads, \
-                use focused rg patterns instead of broad dumps, and avoid large sed commands. \
+                use focused grep regex patterns instead of broad dumps, and avoid large sed commands. \
                 If a tool result says it was truncated and gives a blob_id, call read_blob with a \
                 bounded start_byte/limit_bytes range to inspect more without rerunning the tool. \
-                For file edits, use apply_patch line-aware operations with exact path, 1-based \
-                inclusive start_line/end_line, old text, and new text from a recent read_file result; do not use \
-                anchor-only patches."),
+                Prefer app-owned code first. Inspect dependency or generated code only to resolve a \
+                specific unknown; once resolved, stop rereading dependency internals and patch the app code. \
+                Once you have a concrete cause, do not restate it in another progress message; apply the fix, \
+                run verification, or report a blocker. \
+                For file edits, use apply_patch line-aware operations. For pure insertions, use \
+                insert_before or insert_after with an adjacent line from a recent read_file result. \
+                For replacing existing lines, use exact path, 1-based inclusive start_line/end_line, \
+                old text, and new text from a recent read_file result; do not use anchor-only patches."),
             "input": input,
             "tools": codex_tools(),
             "tool_choice": "auto",
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": true,
             "stream": true,
             "store": false
         });

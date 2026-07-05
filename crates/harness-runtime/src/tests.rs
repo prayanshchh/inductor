@@ -35,6 +35,21 @@ fn parse_tool_call_extracts_name_and_input() {
 }
 
 #[test]
+fn parse_tool_calls_extracts_multiple_envelopes() {
+    let text = "\
+<inductor_tool_call>{\"name\":\"grep\",\"input\":{\"pattern\":\"foo\"}}</inductor_tool_call>
+<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"src/lib.rs\"}}</inductor_tool_call>";
+
+    let parsed = parse_tool_calls(text).unwrap().unwrap();
+
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].name, "grep");
+    assert_eq!(parsed[0].input, json!({ "pattern": "foo" }));
+    assert_eq!(parsed[1].name, "read_file");
+    assert_eq!(parsed[1].input, json!({ "path": "src/lib.rs" }));
+}
+
+#[test]
 fn parse_tool_call_defaults_missing_input_to_empty_object() {
     let parsed = parse_tool_call("<inductor_tool_call>{\"name\":\"grep\"}</inductor_tool_call>")
         .unwrap()
@@ -133,7 +148,7 @@ fn context_preparation_compacts_when_soft_limit_is_exceeded() {
     let prepared = prepare_context(
         &preamble,
         &state.context_messages(),
-        &ContextLimits::new(100, 2_000, 1024),
+        &ContextLimits::new(100, 3_000, 1024),
         &counter,
     )
     .unwrap();

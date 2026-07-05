@@ -485,6 +485,20 @@ pub enum SessionEvent {
         session_id: SessionId,
         chunk: String,
     },
+    /// A skill package was loaded into the model context for this turn.
+    ///
+    /// Older development builds emitted this event before every consumer had
+    /// learned the variant. Keep the fields optional so archived sessions with
+    /// partial skill metadata can still be replayed.
+    SkillUsed {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markdown: Option<String>,
+    },
     Result {
         session_id: SessionId,
         stop_reason: StopReason,
@@ -510,6 +524,11 @@ pub enum SessionEvent {
         worktree_path: Option<String>,
         branch_name: Option<String>,
     },
+    /// Preserve replay for archived sessions containing event variants from a
+    /// newer or experimental build. Unknown events are ignored by current
+    /// consumers instead of making the whole session fail to deserialize.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +593,40 @@ mod tests {
                 "text": "do all the tool calls"
             })
         );
+    }
+
+    #[test]
+    fn skill_used_event_deserializes_archived_rows() {
+        let event: SessionEvent = serde_json::from_value(json!({
+            "type": "skill_used",
+            "session_id": "01KT4H9V3W2M0W4Z5X6Y7Z8A9B",
+            "name": "Inductor Skills",
+            "path": "/tmp/SKILL.md",
+            "markdown": "# Skill"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            event,
+            SessionEvent::SkillUsed {
+                session_id: SessionId(Ulid::from_string("01KT4H9V3W2M0W4Z5X6Y7Z8A9B").unwrap()),
+                name: Some("Inductor Skills".to_string()),
+                path: Some("/tmp/SKILL.md".to_string()),
+                markdown: Some("# Skill".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_session_events_do_not_break_replay() {
+        let event: SessionEvent = serde_json::from_value(json!({
+            "type": "future_event",
+            "session_id": "01KT4H9V3W2M0W4Z5X6Y7Z8A9B",
+            "payload": "ignored"
+        }))
+        .unwrap();
+
+        assert_eq!(event, SessionEvent::Unknown);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { render } from "@opentui/solid"
 import { App } from "./app"
+import { isTerminalMouseSequence, terminalModeResetSequence } from "./terminal_sequences"
 
 type Args = {
   backendBin: string
@@ -31,6 +32,10 @@ const renderer = await createCliRenderer({
   },
   prependInputHandlers: [
     (sequence) => {
+      if (!isTerminalMouseSequence(sequence)) return false
+      return true
+    },
+    (sequence) => {
       if (sequence !== "\x03" || !rawCtrlCHandler) return false
       rawCtrlCHandler()
       return true
@@ -41,8 +46,18 @@ let exitRequested = false
 function exitApp(code = 0) {
   if (exitRequested) return
   exitRequested = true
+  resetTerminalModes()
   renderer.destroy()
+  resetTerminalModes()
   setTimeout(() => process.exit(code), 0)
+}
+
+function resetTerminalModes() {
+  try {
+    process.stdout.write(terminalModeResetSequence)
+  } catch {
+    // Best-effort cleanup; exit should continue even if stdout is gone.
+  }
 }
 
 process.once("SIGHUP", () => exitApp(129))

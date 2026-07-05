@@ -41,6 +41,7 @@ import {
 } from "./mentions"
 import { deletePromptPlaceholderAtCursor, expandPromptPlaceholders, insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState, type PromptPlaceholder } from "./prompt_input"
 import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
+import { isTerminalMouseSequence } from "./terminal_sequences"
 export type AppProps = BackendOptions & {
   exitApp(): void
   registerCtrlCHandler(handler: (() => void) | undefined): void
@@ -2098,6 +2099,11 @@ function TerminalPanel(props: {
     if (!running()) return
     const data = event.sequence
     if (!data) return
+    if (isTerminalMouseSequence(data)) {
+      event.preventDefault()
+      event.stopPropagation()
+      return
+    }
     props.write(data)
     event.preventDefault()
     event.stopPropagation()
