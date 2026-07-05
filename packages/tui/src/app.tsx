@@ -67,7 +67,8 @@ type AgentSlot = {
 }
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
-type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout> }
+type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[] }
+type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout>; queued: QueuedPrompt[]; activeQueued?: QueuedPrompt; steering?: QueuedPrompt }
 type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
 type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "pr" | "review" | "sessions" | "skills"
 type Command = { name: string; description: string; action: CommandAction }
@@ -275,10 +276,14 @@ export function App(props: AppProps) {
   function runFlagsFor(key: string): RunFlags {
     let flags = runFlags.get(key)
     if (!flags) {
-      flags = { stopping: false, exitAfter: false }
+      flags = { stopping: false, exitAfter: false, queued: [] }
       runFlags.set(key, flags)
     }
     return flags
+  }
+
+  function queuedPromptsFor(key: string) {
+    return runFlags.get(key)?.queued.filter((prompt) => !prompt.active) ?? []
   }
 
   // Composer settings are views of the focused slot, so existing call sites
@@ -338,6 +343,7 @@ export function App(props: AppProps) {
   const [worktreeBusy, setWorktreeBusy] = createSignal<string>()
   const [sessionListStatus, setSessionListStatus] = createSignal("")
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
+  const [queuedVersion, setQueuedVersion] = createSignal(0)
   const [now, setNow] = createSignal(Date.now())
   const [modelCatalogVersion, setModelCatalogVersion] = createSignal(0)
   const skillHighlightStyle = SyntaxStyle.fromStyles({ skill: { fg: theme.skillOrange, bold: true } })
@@ -347,7 +353,11 @@ export function App(props: AppProps) {
   const dimensions = useTerminalDimensions()
   const availableInputWidth = createMemo(() => Math.max(1, dimensions().width - 6))
   const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
-  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
+  const focusedQueuedPrompts = createMemo(() => {
+    queuedVersion()
+    return queuedPromptsFor(store.focusedKey)
+  })
+  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || focusedQueuedPrompts().length > 0 || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
   // Full filesystem path the focused agent runs in: its managed worktree when
   // one exists, otherwise the workspace Inductor was opened in.
   const focusedWorktreePath = createMemo(() => {
@@ -480,6 +490,12 @@ export function App(props: AppProps) {
     }
     if (event.eventType === "release") return
     if (event.repeated) return
+    if (isSteerSubmitShortcut(event)) {
+      event.preventDefault()
+      event.stopPropagation()
+      submit(true)
+      return
+    }
     if (isNewSessionShortcut(event)) {
       event.preventDefault()
       event.stopPropagation()
@@ -521,11 +537,10 @@ export function App(props: AppProps) {
     disarmStopWarning()
   })
 
-  function submit() {
+  function submit(steer = false) {
     const visiblePrompt = input.plainText.trim()
     const prompt = promptForSubmit(visiblePrompt, promptImages(), promptPastes()).trim()
     const promptSkills = extractSkillMentions(visiblePrompt, skills())
-    if (fstate().running) return
     if (palette()) {
       acceptPalette()
       return
@@ -540,70 +555,101 @@ export function App(props: AppProps) {
     }
     if (!visiblePrompt) return
 
+    const key = store.focusedKey
     const backendPrompt = resumePromptFromUserPrompt(visiblePrompt, fstate()) ?? prompt
-    startAgentTurn(store.focusedKey, backendPrompt, {
-      clearComposer: true,
-      recordHistoryText: visiblePrompt,
-      clearAttachments: true,
-      skills: uniqueStrings([...activeSkills(), ...promptSkills]),
-    })
+    const queued = { visiblePrompt, prompt: backendPrompt, skills: uniqueStrings([...activeSkills(), ...promptSkills]) }
+    const running = fstate().running || runs.has(key)
+    if (running) {
+      if (steer) replaceCurrentRun(key, queued)
+      else queuePrompt(key, queued)
+      return
+    }
+
+    consumePromptInput(visiblePrompt)
+    startTurn(key, queued)
   }
 
-  function startAgentTurn(
-    key: string,
-    prompt: string,
-    options: {
-      clearComposer?: boolean
-      recordHistoryText?: string
-      clearAttachments?: boolean
-      noticeText?: string
-      skills?: string[]
-    } = {},
-  ) {
-    const idx = agentIndex(key)
-    if (idx < 0) return
-    const slot = store.agents[idx]
-    if (slot.state.running || runs.has(key)) return
-    if (!prompt.trim()) return
+  function consumePromptInput(visiblePrompt: string) {
+    input.setText("")
+    setDraft("")
+    recordHistory(visiblePrompt)
+    setPromptImages([])
+    setPromptPastes([])
+    setPalette(undefined)
+    disarmStopWarning()
+  }
 
-    // Pin the turn to the currently focused slot so its events route here even
-    // after the user switches focus to another running agent.
+  function queuePrompt(key: string, prompt: QueuedPrompt) {
+    consumePromptInput(prompt.visiblePrompt)
     const flags = runFlagsFor(key)
+    flags.queued.push(prompt)
+    setQueuedVersion((version) => version + 1)
+    setNotice(undefined)
+  }
+
+  function replaceCurrentRun(key: string, prompt: QueuedPrompt) {
+    const run = runs.get(key)
+    if (!run) {
+      consumePromptInput(prompt.visiblePrompt)
+      startTurn(key, prompt)
+      return
+    }
+
+    consumePromptInput(prompt.visiblePrompt)
+    const flags = runFlagsFor(key)
+    flags.stopping = true
+    flags.exitAfter = false
+    flags.steering = prompt
+    flags.activeQueued = undefined
+    flags.queued = []
+    setQueuedVersion((version) => version + 1)
+    setStopArmed(undefined)
+    clearStopArmTimer()
+    setNotice({ text: "Stopping current agent, then starting new prompt...", tone: "cyan" })
+    updateAgentState(key, (next) => markAgentStopped(next))
+    run.interrupt()
+    if (flags.forceTimer) clearTimeout(flags.forceTimer)
+    flags.forceTimer = setTimeout(() => {
+      if (!flags.stopping) return
+      run.kill()
+    }, 5000)
+  }
+
+  function startTurn(key: string, queued: QueuedPrompt) {
+    const agentSlot = store.agents[agentIndex(key)]
+    if (!agentSlot) return
+
+    const flags = runFlagsFor(key)
+    const wasQueued = flags.activeQueued === queued || flags.queued.includes(queued)
     flags.stopping = false
     flags.exitAfter = false
+    if (wasQueued) {
+      queued.active = true
+      flags.activeQueued = queued
+      setQueuedVersion((version) => version + 1)
+    }
     if (flags.forceTimer) {
       clearTimeout(flags.forceTimer)
       flags.forceTimer = undefined
     }
 
-    if (options.clearComposer) {
-      input.setText("")
-      setDraft("")
-    }
-    if (options.recordHistoryText?.trim()) recordHistory(options.recordHistoryText)
-    if (options.clearAttachments) {
-      setPromptImages([])
-      setPromptPastes([])
-    }
-    setPalette(undefined)
-    disarmStopWarning()
-    setNotice(options.noticeText ? { text: options.noticeText, tone: "cyan" } : undefined)
-    updateAgentState(key, (next) => addUserMessage(next, prompt))
-    const run = startBackendTurn(prompt, {
+    setNotice(undefined)
+    updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
+    const run = startBackendTurn(queued.prompt, {
       ...props,
-      provider: slot.provider,
-      model: slot.model,
-      approval: slot.approval,
-      workspaceOnly: slot.workspaceOnly,
-      sessionId: slot.sessionId,
-      effort: backendEffort(slot.effort),
-      mode: slot.devMode,
+      provider: agentSlot.provider,
+      model: agentSlot.model,
+      approval: agentSlot.approval,
+      workspaceOnly: agentSlot.workspaceOnly,
+      sessionId: agentSlot.sessionId,
+      effort: backendEffort(agentSlot.effort),
+      mode: agentSlot.devMode,
       appDb: props.appDb,
       // Reuse the worktree once the session owns one; the backend creates it on
       // the first prompt (named after the work) when these are absent.
-      workspaceId: slot.workspaceId,
-      stateDb: slot.stateDb,
-      skills: options.skills ?? activeSkills(),
+      workspaceId: agentSlot.workspaceId,
+      stateDb: agentSlot.stateDb,
+      skills: queued.skills ?? activeSkills(),
     }, {
       onEvent(event) {
         if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) {
@@ -637,19 +683,36 @@ export function App(props: AppProps) {
           flags.forceTimer = undefined
         }
         runs.delete(key)
+        if (flags.activeQueued === queued) {
+          flags.activeQueued = undefined
+          flags.queued = flags.queued.filter((prompt) => prompt !== queued)
+          setQueuedVersion((version) => version + 1)
+        }
         if (flags.exitAfter) {
           props.exitApp()
           return
         }
         if (flags.stopping) {
+          const steering = flags.steering
           flags.stopping = false
-          setNotice({ text: "stopped agent", tone: "red" })
+          flags.steering = undefined
           updateAgentState(key, (next) => markAgentStopped(next))
           void refreshWorktrees()
+          if (steering) {
+            setNotice({ text: "Starting new prompt...", tone: "cyan" })
+            startTurn(key, steering)
+          } else {
+            setNotice({ text: "stopped agent", tone: "red" })
+          }
           return
         }
         updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
         void refreshWorktrees()
+        const nextPrompt = flags.queued.find((prompt) => !prompt.active)
+        if (nextPrompt) {
+          setNotice(undefined)
+          startTurn(key, nextPrompt)
+        }
       },
     })
     runs.set(key, run)
@@ -1477,9 +1540,8 @@ export function App(props: AppProps) {
       setStore("focusedKey", key)
       setExpanded(new Set<string>())
       queueMicrotask(() => {
-        startAgentTurn(key, autoResumeInstruction(latestPrompt), {
-          noticeText: "Resuming interrupted prompt after restart...",
-        })
+        setNotice({ text: "Resuming interrupted prompt after restart...", tone: "cyan" })
+        startTurn(key, { visiblePrompt: latestPrompt, prompt: autoResumeInstruction(latestPrompt), skills: activeSkills() })
       })
     }
   }
@@ -1833,6 +1895,7 @@ export function App(props: AppProps) {
               >
                 <Timeline
                   items={fstate().transcript}
+                  queuedPrompts={focusedQueuedPrompts()}
                   pendingPermission={fstate().pendingPermission}
                   pendingQuestions={fstate().pendingQuestions}
                   running={fstate().running}
@@ -2331,6 +2394,22 @@ function isCtrlC(event: KeyEvent) {
   return (event.ctrl && event.name.toLowerCase() === "c") || event.sequence === "\x03"
 }
 
+function isNavigationEnter(event: { name?: string; sequence?: string }) {
+  const name = (event.name || "").toLowerCase()
+  return name === "return" || name === "enter" || name === "kpenter" || name === "linefeed" || event.sequence === "\r" || event.sequence === "\n"
+}
+
+function isSteerSubmitShortcut(event: { name?: string; sequence?: string; meta?: boolean; super?: boolean; metaKey?: boolean; key?: string }) {
+  const name = (event.name || event.key || "").toLowerCase()
+  const sequence = event.sequence ?? ""
+  const command = Boolean(event.super || event.metaKey)
+  const altMeta = Boolean(event.meta && sequence.startsWith("\x1b"))
+  const cmdKittyReturn = /^\x1b\[(?:13|57345);9(?::[123])?u$/.test(sequence)
+  const altEscReturn = sequence === "\x1b\r" || sequence === "\x1b\n"
+  const enter = name === "return" || name === "enter" || name === "kpenter" || name === "linefeed" || sequence === "\r" || sequence === "\n" || altEscReturn || cmdKittyReturn
+  return enter && (command || altMeta || cmdKittyReturn || altEscReturn)
+}
+
 // Ctrl+N opens a new worktree/session — mirrors the /new command.
 function isNewSessionShortcut(event: KeyEvent) {
   return Boolean(event.ctrl) && event.name?.toLowerCase() === "n"
@@ -2372,6 +2451,7 @@ function StartScreen(_props: { height: number }) {
 
 function Timeline(props: {
   items: TranscriptItem[]
+  queuedPrompts: QueuedPrompt[]
   pendingPermission?: AppState["pendingPermission"]
   pendingQuestions?: AppState["pendingQuestions"]
   running: boolean
@@ -2427,6 +2507,9 @@ function Timeline(props: {
       <Show when={props.running && !props.pendingPermission && !props.pendingQuestions}>
         <AgentWorkingTimelineItem glyph={props.activityGlyph} status={props.runningStatus} />
       </Show>
+      <For each={props.queuedPrompts}>
+        {(prompt) => <QueuedUserPrompt text={prompt.visiblePrompt} />}
+      </For>
     </box>
   )
 }
@@ -2563,15 +2646,23 @@ function AssistantText(props: { text: string }) {
 }
 
 function UserPrompt(props: { text: string }) {
+  return <PromptCard text={props.text} fg={theme.text} backgroundColor="#3a3a3a" />
+}
+
+function QueuedUserPrompt(props: { text: string }) {
+  return <PromptCard text={props.text} fg={theme.dim} backgroundColor="#1f2224" />
+}
+
+function PromptCard(props: { text: string; fg: string; backgroundColor: string }) {
   return (
     <box width="100%" paddingLeft={2} paddingRight={2}>
       <box
         width="100%"
-        backgroundColor="#3a3a3a"
+        backgroundColor={props.backgroundColor}
         paddingLeft={1}
         paddingRight={1}
       >
-        <text fg={theme.text} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.text}</text>
+        <text fg={props.fg} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.text}</text>
       </box>
     </box>
   )
@@ -2774,7 +2865,7 @@ function Composer(props: {
   draft: () => string
   inputWidth: number
   setDraft: (value: string) => void
-  submit: () => void
+  submit: (steer?: boolean) => void
   palette: () => PaletteKind
   paletteItems: () => readonly PaletteItem[]
   skillsStatus: string
@@ -2793,7 +2884,7 @@ function Composer(props: {
 }) {
   let textarea!: TextareaRenderable
   const showActivity = () => Boolean(props.state.pendingPermission) || props.notice.tone !== "muted"
-  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "agent running..." : props.activeSkills.length ? `Ask INDUCTOR with ${props.activeSkills.join(", ")}...` : "Ask INDUCTOR..."
+  const composerPlaceholder = (state: AppState) => state.pendingPermission ? "approval required: press 1, 2, or 3" : state.running ? "Enter queues • Cmd+Enter steers" : props.activeSkills.length ? `Ask INDUCTOR with ${props.activeSkills.join(", ")}...` : "Ask INDUCTOR..."
   const inputRows = createMemo(() => promptVisualRows(props.draft(), props.inputWidth))
   return (
     <box flexShrink={0} flexDirection="column" paddingLeft={2} paddingRight={2} paddingBottom={1}>
@@ -2862,7 +2953,7 @@ function Composer(props: {
               { name: "j", ctrl: true, action: "newline" },
             ]}
             onContentChange={() => props.setDraft(textarea.plainText)}
-            onSubmit={props.submit}
+            onSubmit={() => props.submit(false)}
             onPaste={async (event: { bytes?: Uint8Array; preventDefault(): void }) => {
               const text = decodePasteBytes(event.bytes).replace(/\r\n/g, "\n").replace(/\r/g, "\n")
               if (!text.trim()) {
@@ -2874,32 +2965,38 @@ function Composer(props: {
               event.preventDefault()
               props.insertPromptText(text)
             }}
-            onKeyDown={(event: { key?: string; name?: string; ctrl?: boolean; meta?: boolean; super?: boolean; ctrlKey?: boolean; metaKey?: boolean; preventDefault(): void; stopPropagation?: () => void; sequence?: string }) => {
-              const key = event.key ?? event.name
+            onKeyDown={(event: KeyEvent) => {
+              const key = event.name
               const normalized = key?.toLowerCase()
-              const ctrl = Boolean(event.ctrlKey || event.ctrl)
-              const meta = Boolean(event.metaKey || event.meta || event.super)
-              const permissionNav = key === "ArrowUp" || key === "up" || key === "ArrowDown" || key === "down" || key === "Enter" || key === "enter" || key === "return"
+              const ctrl = Boolean(event.ctrl)
+              const meta = Boolean(event.meta || event.super)
+              const permissionNav = isNavigationEnter(event) || key === "up" || key === "down"
               if ((props.state.pendingPermission || props.state.pendingQuestions) && permissionNav) return
-              if (props.palette() && (key === "Escape" || key === "Esc" || key === "escape" || key === "esc")) {
+              if (!props.palette() && isSteerSubmitShortcut(event)) {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.submit(true)
+                return
+              }
+              if (props.palette() && isEscape(event)) {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.dismissPalette()
                 return
               }
-              if (props.palette() && (key === "ArrowUp" || key === "up")) {
+              if (props.palette() && key === "up") {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.moveSelection(-1)
                 return
               }
-              if (props.palette() && (key === "ArrowDown" || key === "down")) {
+              if (props.palette() && key === "down") {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.moveSelection(1)
                 return
               }
-              if (props.palette() && (key === "Enter" || key === "enter" || key === "return")) {
+              if (props.palette() && isNavigationEnter(event)) {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.acceptPalette(Boolean(meta || ctrl))
@@ -2954,7 +3051,7 @@ function Composer(props: {
               if (!props.palette() && (key === "Enter" || key === "enter" || key === "return")) {
                 event.preventDefault()
                 event.stopPropagation?.()
-                props.submit()
+                props.submit(Boolean(meta))
                 return
               }
               if (!props.palette() && key === "Tab") {
