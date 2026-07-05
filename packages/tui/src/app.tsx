@@ -490,6 +490,12 @@ export function App(props: AppProps) {
     }
     if (event.eventType === "release") return
     if (event.repeated) return
+    if (isSteerSubmitShortcut(event)) {
+      event.preventDefault()
+      event.stopPropagation()
+      submit(true)
+      return
+    }
     if (isNewSessionShortcut(event)) {
       event.preventDefault()
       event.stopPropagation()
@@ -554,7 +560,7 @@ export function App(props: AppProps) {
     const queued = { visiblePrompt, prompt: backendPrompt, skills: uniqueStrings([...activeSkills(), ...promptSkills]) }
     const running = fstate().running || runs.has(key)
     if (running) {
-      if (steer) steerCurrentRun(queued)
+      if (steer) replaceCurrentRun(key, queued)
       else queuePrompt(key, queued)
       return
     }
@@ -581,8 +587,7 @@ export function App(props: AppProps) {
     setNotice(undefined)
   }
 
-  function steerCurrentRun(prompt: QueuedPrompt) {
-    const key = store.focusedKey
+  function replaceCurrentRun(key: string, prompt: QueuedPrompt) {
     const run = runs.get(key)
     if (!run) {
       consumePromptInput(prompt.visiblePrompt)
@@ -600,7 +605,7 @@ export function App(props: AppProps) {
     setQueuedVersion((version) => version + 1)
     setStopArmed(undefined)
     clearStopArmTimer()
-    setNotice({ text: "Steering agent: cancelling current model request...", tone: "cyan" })
+    setNotice({ text: "Stopping current agent, then starting new prompt...", tone: "cyan" })
     updateAgentState(key, (next) => markAgentStopped(next))
     run.interrupt()
     if (flags.forceTimer) clearTimeout(flags.forceTimer)
@@ -629,7 +634,7 @@ export function App(props: AppProps) {
     }
 
     setNotice(undefined)
-    if (!wasQueued) updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
+    updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
     const run = startBackendTurn(queued.prompt, {
       ...props,
       provider: agentSlot.provider,
@@ -694,7 +699,7 @@ export function App(props: AppProps) {
           updateAgentState(key, (next) => markAgentStopped(next))
           void refreshWorktrees()
           if (steering) {
-            setNotice({ text: "Starting steered prompt...", tone: "cyan" })
+            setNotice({ text: "Starting new prompt...", tone: "cyan" })
             startTurn(key, steering)
           } else {
             setNotice({ text: "stopped agent", tone: "red" })
@@ -2389,6 +2394,22 @@ function isCtrlC(event: KeyEvent) {
   return (event.ctrl && event.name.toLowerCase() === "c") || event.sequence === "\x03"
 }
 
+function isNavigationEnter(event: { name?: string; sequence?: string }) {
+  const name = (event.name || "").toLowerCase()
+  return name === "return" || name === "enter" || name === "kpenter" || name === "linefeed" || event.sequence === "\r" || event.sequence === "\n"
+}
+
+function isSteerSubmitShortcut(event: { name?: string; sequence?: string; meta?: boolean; super?: boolean; metaKey?: boolean; key?: string }) {
+  const name = (event.name || event.key || "").toLowerCase()
+  const sequence = event.sequence ?? ""
+  const command = Boolean(event.super || event.metaKey)
+  const altMeta = Boolean(event.meta && sequence.startsWith("\x1b"))
+  const cmdKittyReturn = /^\x1b\[(?:13|57345);9(?::[123])?u$/.test(sequence)
+  const altEscReturn = sequence === "\x1b\r" || sequence === "\x1b\n"
+  const enter = name === "return" || name === "enter" || name === "kpenter" || name === "linefeed" || sequence === "\r" || sequence === "\n" || altEscReturn || cmdKittyReturn
+  return enter && (command || altMeta || cmdKittyReturn || altEscReturn)
+}
+
 // Ctrl+N opens a new worktree/session — mirrors the /new command.
 function isNewSessionShortcut(event: KeyEvent) {
   return Boolean(event.ctrl) && event.name?.toLowerCase() === "n"
@@ -2944,32 +2965,38 @@ function Composer(props: {
               event.preventDefault()
               props.insertPromptText(text)
             }}
-            onKeyDown={(event: { key?: string; name?: string; ctrl?: boolean; meta?: boolean; super?: boolean; ctrlKey?: boolean; metaKey?: boolean; preventDefault(): void; stopPropagation?: () => void; sequence?: string }) => {
-              const key = event.key ?? event.name
+            onKeyDown={(event: KeyEvent) => {
+              const key = event.name
               const normalized = key?.toLowerCase()
-              const ctrl = Boolean(event.ctrlKey || event.ctrl)
-              const meta = Boolean(event.metaKey || event.meta || event.super)
-              const permissionNav = key === "ArrowUp" || key === "up" || key === "ArrowDown" || key === "down" || key === "Enter" || key === "enter" || key === "return"
+              const ctrl = Boolean(event.ctrl)
+              const meta = Boolean(event.meta || event.super)
+              const permissionNav = isNavigationEnter(event) || key === "up" || key === "down"
               if ((props.state.pendingPermission || props.state.pendingQuestions) && permissionNav) return
-              if (props.palette() && (key === "Escape" || key === "Esc" || key === "escape" || key === "esc")) {
+              if (!props.palette() && isSteerSubmitShortcut(event)) {
+                event.preventDefault()
+                event.stopPropagation?.()
+                props.submit(true)
+                return
+              }
+              if (props.palette() && isEscape(event)) {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.dismissPalette()
                 return
               }
-              if (props.palette() && (key === "ArrowUp" || key === "up")) {
+              if (props.palette() && key === "up") {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.moveSelection(-1)
                 return
               }
-              if (props.palette() && (key === "ArrowDown" || key === "down")) {
+              if (props.palette() && key === "down") {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.moveSelection(1)
                 return
               }
-              if (props.palette() && (key === "Enter" || key === "enter" || key === "return")) {
+              if (props.palette() && isNavigationEnter(event)) {
                 event.preventDefault()
                 event.stopPropagation?.()
                 props.acceptPalette(Boolean(meta || ctrl))

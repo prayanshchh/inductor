@@ -10,6 +10,20 @@ describe("transcript reducer", () => {
     expect(state.transcript).toEqual([{ id: expect.any(String), kind: "assistant", text: "hello world" }])
   })
 
+  test("starts a new assistant row after each user turn", () => {
+    let state = addUserMessage(createInitialState(), "first prompt")
+    state = applySessionEvent(state, { type: "text_delta", text: "first answer" })
+    state = addUserMessage(state, "queued prompt")
+    state = applySessionEvent(state, { type: "text_delta", text: "second answer" })
+
+    expect(state.transcript).toMatchObject([
+      { kind: "user", text: "first prompt" },
+      { kind: "assistant", text: "first answer" },
+      { kind: "user", text: "queued prompt" },
+      { kind: "assistant", text: "second answer" },
+    ])
+  })
+
   test("keeps permission requests inline in state", () => {
     let state = addUserMessage(createInitialState(), "edit the file")
     state = applySessionEvent(state, {
