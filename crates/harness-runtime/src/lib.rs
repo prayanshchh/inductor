@@ -29,7 +29,7 @@ use ::time::OffsetDateTime;
 use async_stream::try_stream;
 use context::{
     ApproxTokenCounter, BlobStore, ContextLimits, ContextMessage, ModelEffort, ProviderFamily,
-    prepare_context, stub_tool_output, translate_effort,
+    StubbedToolOutput, prepare_context, stub_tool_output, translate_effort,
 };
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -116,10 +116,11 @@ Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - If the user prompt is just \"resume\" or asks to resume, treat it as a request to continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.\n\
-- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with the adjacent line from a recent read_file result instead of inventing an update range. For replacing existing lines, first read the target range and then provide exact path, 1-based inclusive start_line/end_line, old text, and new text. Do not use anchor-only patches.\n\
+- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with the adjacent line from a recent read_file result instead of inventing an update range. For replacing existing lines, first read the file, then provide exact path, 1-based inclusive start_line/end_line, old text, and new text. Do not use anchor-only patches.\n\
 - Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
-- Keep tool output small: prefer read_file with start_line/end_line over large reads, use grep with focused regex patterns instead of broad dumps, and avoid large sed commands.\n\
+- read_file returns the whole file; prefer one full read per relevant file instead of repeated ranged reads. Use grep with focused regex patterns instead of broad dumps, and avoid large sed commands.\n\
+- When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.\n\
 - If a tool result says it was truncated and gives a blob_id, use read_blob with a bounded start_byte/limit_bytes range to inspect more without rerunning the tool.\n\
 - Prefer app-owned code first. Inspect dependency or generated code only to resolve a specific unknown; once that unknown is resolved, stop rereading dependency internals and patch the app-owned code.\n\
 - Once you have a concrete cause, do not restate it in another progress message. Apply the fix, run the next verification, or report a blocker.\n\
@@ -941,7 +942,7 @@ impl ToolHashCache {
                 let key = workspace_relative_key(tools, &path)?;
                 self.dirty_since_read.get(&key).map(|reason| {
                     format!(
-                        "line-aware apply_patch for {key} requires a fresh read_file because this file changed after the last read ({reason}). Re-read the exact target range with read_file start_line/end_line, then retry with current line numbers and old text."
+                        "line-aware apply_patch for {key} requires a fresh read_file because this file changed after the last read ({reason}). Re-read the file, then retry with current line numbers and old text."
                     )
                 })
             })
@@ -1210,12 +1211,19 @@ fn run_local_tool_call<'a>(
             }
             hash_cache.record_success(tools, &execution_call, &result);
             let patch = targets.patch(tools);
-            let blob_store = config.context.blob_store();
-            let stubbed = stub_tool_output(
-                &result.output,
-                config.context.limits.tool_result_inline_bytes,
-                blob_store.as_ref(),
-            )?;
+            let stubbed = if execution_call.name == ToolName::ReadFile.as_str() {
+                StubbedToolOutput {
+                    inline_output: result.output.clone(),
+                    blob: None,
+                }
+            } else {
+                let blob_store = config.context.blob_store();
+                stub_tool_output(
+                    &result.output,
+                    config.context.limits.tool_result_inline_bytes,
+                    blob_store.as_ref(),
+                )?
+            };
             if !hidden_tool {
                 yield LocalToolRunUpdate::Event(SessionEvent::ToolCallResult {
                     session_id,
@@ -2432,7 +2440,8 @@ Todo and question rules:
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
-- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with an adjacent line from a recent read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with an adjacent line from a recent read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent full-file read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.
 - Progress messages must be sparse: only report material new facts, decisions, blockers, failures, verification results, or completed phases.

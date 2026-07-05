@@ -1467,11 +1467,10 @@ async fn loop_allows_repeated_identical_tool_calls() {
 #[tokio::test]
 async fn loop_stubs_large_tool_output_and_writes_blob() {
     let temp = TempDir::new("loop-blob");
-    fs::write(temp.path().join("large.txt"), "x".repeat(512)).unwrap();
     let runtime = ToolRuntime::new(temp.path()).unwrap();
 
     let provider = ScriptedProvider::new([
-        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"large.txt\"}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"bash\",\"input\":{\"command\":\"python3 -c \\\"print('x'*512)\\\"\"}}</inductor_tool_call>",
         "done",
     ]);
     let auth = test_auth();
@@ -1488,7 +1487,7 @@ async fn loop_stubs_large_tool_output_and_writes_blob() {
         &AutoApprove,
         &mut allow,
         &mut state,
-        "read large.txt".to_string(),
+        "emit large output".to_string(),
         config,
         CancellationToken::new(),
         provider_core::empty_permission_responses(),

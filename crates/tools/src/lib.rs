@@ -109,13 +109,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: ToolName::ReadFile,
-            description: "Read a UTF-8 text file. Paths may be workspace-relative or absolute when unrestricted access is enabled. Prefer start_line/end_line for large files.",
+            description: "Read an entire UTF-8 text file. Paths may be workspace-relative or absolute when unrestricted access is enabled.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path" },
-                    "start_line": { "type": "integer", "description": "Optional 1-based first line to return" },
-                    "end_line": { "type": "integer", "description": "Optional 1-based last line to return, inclusive" }
+                    "path": { "type": "string", "description": "File path" }
                 },
                 "required": ["path"]
             }),
@@ -173,7 +171,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "operations": {
                         "type": "array",
-                        "description": "Line-aware patch operations. First call read_file with start_line/end_line to get exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
+                        "description": "Line-aware patch operations. First call read_file to get the full current file and exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
                         "items": {
                             "oneOf": [
                                 {
@@ -713,50 +711,22 @@ impl ToolRuntime {
     pub fn read_file_range(
         &self,
         path: impl AsRef<Path>,
-        start_line: Option<usize>,
-        end_line: Option<usize>,
+        _start_line: Option<usize>,
+        _end_line: Option<usize>,
     ) -> Result<ToolResult, ToolError> {
         let path = self.resolve_existing_path(path.as_ref())?;
         let output = fs::read_to_string(&path).map_err(|err| ToolError::io(&path, err))?;
         let sha256 = sha256_hex(output.as_bytes());
         let bytes = output.len();
         let total_lines = output.lines().count();
-        let requested_start = start_line.unwrap_or(1).max(1);
-        let requested_end = end_line.unwrap_or(total_lines).max(requested_start);
-        let ranged = start_line.is_some() || end_line.is_some();
-        let output = if ranged {
-            output
-                .lines()
-                .enumerate()
-                .filter_map(|(index, line)| {
-                    let line_number = index + 1;
-                    (line_number >= requested_start && line_number <= requested_end)
-                        .then(|| format!("{line_number}: {line}"))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            output
-        };
-        let returned_lines = if ranged {
-            output.lines().count()
-        } else {
-            total_lines
-        };
 
-        Ok(ToolResult::success(
-            ToolName::ReadFile,
-            cap_output(output, self.output_limit_bytes),
-        ))
-        .map(|result| {
+        Ok(ToolResult::success_uncapped(ToolName::ReadFile, output)).map(|result| {
             result.with_metadata(json!({
                 "path": self.relative_path(&path),
                 "bytes": bytes,
                 "sha256": sha256,
                 "total_lines": total_lines,
-                "start_line": if ranged { Some(requested_start) } else { None },
-                "end_line": if ranged { Some(requested_end.min(total_lines)) } else { None },
-                "returned_lines": returned_lines,
+                "returned_lines": total_lines,
             }))
         })
     }
@@ -2428,6 +2398,17 @@ impl ToolResult {
         }
     }
 
+    fn success_uncapped(name: ToolName, output: String) -> Self {
+        Self {
+            name,
+            title: name.title().to_string(),
+            metadata: serde_json::Value::Null,
+            output,
+            exit_code: Some(0),
+            truncated: false,
+        }
+    }
+
     fn with_output_cap(mut self, limit: usize) -> Self {
         let capped = cap_output(self.output, limit);
         self.output = capped.text;
@@ -3250,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_range_returns_numbered_subset_with_full_file_hash() {
+    fn read_file_range_compatibility_arguments_still_return_whole_file() {
         let temp = TempDir::new("read-range");
         let body = "one\ntwo\nthree\nfour\n";
         fs::write(temp.path().join("hello.txt"), body).unwrap();
@@ -3261,14 +3242,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.name, ToolName::ReadFile);
-        assert_eq!(result.output, "2: two\n3: three");
+        assert_eq!(result.output, body);
         assert_eq!(result.metadata["path"], "hello.txt");
         assert_eq!(result.metadata["bytes"], body.len());
         assert_eq!(result.metadata["sha256"], sha256_hex(body.as_bytes()));
         assert_eq!(result.metadata["total_lines"], 4);
-        assert_eq!(result.metadata["start_line"], 2);
-        assert_eq!(result.metadata["end_line"], 3);
-        assert_eq!(result.metadata["returned_lines"], 2);
+        assert_eq!(result.metadata["returned_lines"], 4);
+        assert!(result.metadata.get("start_line").is_none());
+        assert!(result.metadata.get("end_line").is_none());
     }
 
     #[test]

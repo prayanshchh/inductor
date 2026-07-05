@@ -65,8 +65,9 @@ impl CodexProvider {
                 before verification. In progress updates, share a concise public reasoning \
                 summary: what you are checking, what evidence you found, why the next step \
                 follows, and any uncertainty or blocker. Do not reveal hidden chain-of-thought. \
-                Keep tool output small: prefer read_file with start_line/end_line over large reads, \
-                use focused grep regex patterns instead of broad dumps, and avoid large sed commands. \
+                read_file returns the whole file; prefer one full read per relevant file instead of repeated ranged reads. \
+                When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time. \
+                Use focused grep regex patterns instead of broad dumps, and avoid large sed commands. \
                 If a tool result says it was truncated and gives a blob_id, call read_blob with a \
                 bounded start_byte/limit_bytes range to inspect more without rerunning the tool. \
                 Prefer app-owned code first. Inspect dependency or generated code only to resolve a \
