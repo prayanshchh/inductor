@@ -47,6 +47,12 @@ use tools::{StructuredPatch, TextEdit, ToolRuntime};
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_REPO_MEMORY_BYTES: usize = 32 * 1024;
 const ORPHANED_SESSION_RECOVERY_MESSAGE: &str = "Recovered after Inductor restarted: the previous agent run was interrupted before it could finish. Inductor will automatically resume the latest interrupted prompt when this session is loaded.";
+const RESUME_PROMPT_MARKER: &str = "__INDUCTOR_RESUME__";
+const RESUME_ACTIVITY_MAX_BYTES: usize = 24 * 1024;
+const RESUME_TOOL_OUTPUT_MAX_BYTES: usize = 2 * 1024;
+const RESUME_TOOL_INPUT_MAX_BYTES: usize = 2 * 1024;
+const RESUME_ASSISTANT_OUTPUT_MAX_BYTES: usize = 2 * 1024;
+const RESUME_ERROR_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -2091,7 +2097,13 @@ async fn run_harness_command(
 
     let approval_policy_dbg = config.approval_policy;
     let prompt = attach_prompt_image_mentions(&workspace_path, &source_workspace, &prompt);
-    persist_submitted_user_message(&workspace_db, session_id, &state.transcript, &prompt)
+    let submitted_prompt = prepare_submitted_prompt(&workspace_db, session_id, &prompt)?;
+    persist_submitted_user_message(
+        &workspace_db,
+        session_id,
+        &state.transcript,
+        &submitted_prompt.visible_prompt,
+    )
         .map_err(|err| err.to_string())?;
 
     if should_silently_name
@@ -2099,7 +2111,7 @@ async fn run_harness_command(
             provider,
             &model,
             &workspace_path,
-            &prompt,
+            &submitted_prompt.visible_prompt,
             &mut session_record,
             &workspace_db,
             live_app_db.as_ref(),
@@ -2150,7 +2162,7 @@ async fn run_harness_command(
         approver,
         &mut allow,
         &mut state,
-        prompt,
+        submitted_prompt.model_prompt.clone(),
         config,
         cancel,
         perm_rx,
@@ -2302,6 +2314,18 @@ async fn run_harness_command(
             serde_json::to_string(&result_event).map_err(|err| err.to_string())?
         );
         final_status = SessionStatus::Failed;
+    }
+
+    if submitted_prompt.model_prompt != submitted_prompt.visible_prompt
+        && let Some(message) = state
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|message| {
+                message.role == Role::User && message.content == submitted_prompt.model_prompt
+            })
+    {
+        message.content = submitted_prompt.visible_prompt.clone();
     }
 
     let stored_messages = state
@@ -2461,6 +2485,231 @@ fn stored_message_to_transcript(message: StoredMessage) -> Result<TranscriptMess
         .parse::<Role>()
         .map_err(|err| err.to_string())?;
     Ok(TranscriptMessage::new(role, message.content))
+}
+
+#[derive(Debug, Clone)]
+struct SubmittedPrompt {
+    visible_prompt: String,
+    model_prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumePromptPayload {
+    visible_prompt: Option<String>,
+}
+
+fn prepare_submitted_prompt(
+    db: &WorkspaceDb,
+    session_id: SessionId,
+    prompt: &str,
+) -> Result<SubmittedPrompt, String> {
+    let visible_text = prompt_transcript_text(prompt);
+    if let Some(visible_prompt) = resume_visible_prompt(&visible_text) {
+        let model_prompt = resume_model_prompt(db, session_id)?;
+        return Ok(SubmittedPrompt {
+            visible_prompt,
+            model_prompt,
+        });
+    }
+
+    Ok(SubmittedPrompt {
+        visible_prompt: visible_text.clone(),
+        model_prompt: prompt.to_string(),
+    })
+}
+
+fn resume_visible_prompt(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if is_resume_command(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    if trimmed == RESUME_PROMPT_MARKER {
+        return Some("/resume".to_string());
+    }
+    let Some(payload) = trimmed.strip_prefix(&format!("{RESUME_PROMPT_MARKER}:")) else {
+        return None;
+    };
+    let visible = serde_json::from_str::<ResumePromptPayload>(payload)
+        .ok()
+        .and_then(|payload| payload.visible_prompt)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/resume".to_string());
+    Some(visible)
+}
+
+fn is_resume_command(prompt: &str) -> bool {
+    let normalized = prompt
+        .trim()
+        .trim_end_matches(|ch: char| ch.is_ascii_punctuation() && ch != '/')
+        .trim();
+    let normalized = normalized.strip_prefix('/').unwrap_or(normalized);
+    let normalized_lower = normalized.to_ascii_lowercase();
+    let normalized = normalized_lower
+        .strip_prefix("inductor ")
+        .unwrap_or(normalized)
+        .trim();
+    matches!(
+        normalized,
+        "resume"
+            | "resume please"
+            | "resume this"
+            | "resume it"
+            | "resume that"
+            | "resume thing"
+            | "resume thingy"
+    )
+}
+
+fn resume_model_prompt(db: &WorkspaceDb, session_id: SessionId) -> Result<String, String> {
+    let events = db.events(session_id).map_err(|err| err.to_string())?;
+    let latest_user_event = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, event)| match event {
+            SessionEvent::UserMessage { text, .. } if !is_resume_command(text) => {
+                Some((index, text.trim().to_string()))
+            }
+            _ => None,
+        });
+    let (latest_index, latest_prompt) = if let Some(found) = latest_user_event {
+        found
+    } else {
+        let messages = db.messages(session_id).map_err(|err| err.to_string())?;
+        let latest = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role.eq_ignore_ascii_case(Role::User.label())
+                    && !is_resume_command(&message.content)
+            })
+            .map(|message| message.content.trim().to_string())
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "the previous interrupted task".to_string());
+        (events.len(), latest)
+    };
+
+    let activity = resume_activity_after_latest_prompt(&events[latest_index.saturating_add(1)..]);
+    Ok(format!(
+        "The agent was stopped or Inductor restarted before the previous work could finish.\n\
+Resume from where the previous run left off. Do not treat `/resume` or `resume` as the task.\n\
+Use the already-recorded tool calls/results below as hidden resume context so you do not redo work unnecessarily. Continue with the next useful action, verify if needed, and finish the original request.\n\n\
+Most recent substantive user request:\n{latest_prompt}\n\n\
+What happened after that request before the stop:\n{activity}"
+    ))
+}
+
+fn resume_activity_after_latest_prompt(events: &[SessionEvent]) -> String {
+    let mut lines = Vec::new();
+    for event in events {
+        match event {
+            SessionEvent::TextEnd { text, .. } if !text.trim().is_empty() => {
+                lines.push(format!(
+                    "assistant_output:\n{}",
+                    truncate_resume_text(text.trim(), RESUME_ASSISTANT_OUTPUT_MAX_BYTES)
+                ));
+            }
+            SessionEvent::ToolCallStart {
+                tool_call_id,
+                name,
+                input_json,
+                ..
+            }
+            | SessionEvent::ToolCallRequested {
+                tool_call_id,
+                name,
+                input_json,
+                ..
+            } => {
+                let input = serde_json::to_string_pretty(input_json)
+                    .unwrap_or_else(|_| input_json.to_string());
+                lines.push(format!(
+                    "tool_call {} {} input:\n{}",
+                    tool_call_id,
+                    name,
+                    truncate_resume_text(&input, RESUME_TOOL_INPUT_MAX_BYTES)
+                ));
+            }
+            SessionEvent::ToolCallResult {
+                tool_call_id,
+                output,
+                exit_code,
+                ..
+            } => {
+                lines.push(format!(
+                    "tool_result {} exit={:?} output:\n{}",
+                    tool_call_id,
+                    exit_code,
+                    truncate_resume_text(output, RESUME_TOOL_OUTPUT_MAX_BYTES)
+                ));
+            }
+            SessionEvent::ToolCallError {
+                tool_call_id,
+                message,
+                ..
+            } => {
+                lines.push(format!(
+                    "tool_error {}:\n{}",
+                    tool_call_id,
+                    truncate_resume_text(message, RESUME_ERROR_MAX_BYTES)
+                ));
+            }
+            SessionEvent::Patch {
+                files,
+                additions,
+                deletions,
+                ..
+            } => {
+                let paths = files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "patch_event additions={additions} deletions={deletions} files={paths}"
+                ));
+            }
+            SessionEvent::Diagnostics { files, .. } => {
+                let paths = files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("diagnostics_event files={paths}"));
+            }
+            SessionEvent::Error { message, .. } => {
+                lines.push(format!(
+                    "error_event:\n{}",
+                    truncate_resume_text(message, RESUME_ERROR_MAX_BYTES)
+                ));
+            }
+            SessionEvent::Result { stop_reason, .. } => {
+                lines.push(format!("turn_result: {stop_reason:?}"));
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        "No tool calls or assistant output were recorded after that request. Inspect current workspace state briefly, then continue.".to_string()
+    } else {
+        truncate_resume_text(&lines.join("\n\n---\n\n"), RESUME_ACTIVITY_MAX_BYTES)
+    }
+}
+
+fn truncate_resume_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = text.len().saturating_sub(end);
+    format!(
+        "{}\n[truncated resume context: omitted {omitted} byte(s); inspect current files or rerun a focused command if more detail is needed]",
+        &text[..end]
+    )
 }
 
 fn persist_submitted_user_message(
@@ -3780,6 +4029,115 @@ mod tests {
                     .to_string()
             }]
         );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn resume_marker_builds_hidden_prompt_from_latest_user_tool_history() {
+        let workspace = temp_workspace("resume-marker-hidden-context");
+        let db = WorkspaceDb::open(workspace.join("state.db")).unwrap();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            WorkspaceId::new(),
+            ProviderId("codex".to_string()),
+            "gpt-5.5".to_string(),
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        let tool_call_id = ToolCallId::new();
+
+        db.append_event(
+            session_id,
+            &SessionEvent::UserMessage {
+                session_id,
+                text: "fix the binary distribution build".to_string(),
+            },
+        )
+        .unwrap();
+        db.append_event(
+            session_id,
+            &SessionEvent::ToolCallStart {
+                session_id,
+                tool_call_id,
+                name: "read_file".to_string(),
+                input_json: json!({ "path": "README.md" }),
+            },
+        )
+        .unwrap();
+        db.append_event(
+            session_id,
+            &SessionEvent::ToolCallResult {
+                session_id,
+                tool_call_id,
+                title: None,
+                metadata: Value::Null,
+                output: "README contents".to_string(),
+                exit_code: Some(0),
+            },
+        )
+        .unwrap();
+
+        let submitted = prepare_submitted_prompt(
+            &db,
+            session_id,
+            r#"__INDUCTOR_RESUME__:{"visible_prompt":"/resume"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(submitted.visible_prompt, "/resume");
+        assert!(submitted.model_prompt.contains("fix the binary distribution build"));
+        assert!(submitted.model_prompt.contains("tool_call"));
+        assert!(submitted.model_prompt.contains("read_file"));
+        assert!(submitted.model_prompt.contains("README contents"));
+        assert!(!submitted.model_prompt.contains("__INDUCTOR_RESUME__"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn resume_marker_truncates_large_tool_outputs() {
+        let workspace = temp_workspace("resume-marker-truncates-output");
+        let db = WorkspaceDb::open(workspace.join("state.db")).unwrap();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            WorkspaceId::new(),
+            ProviderId("codex".to_string()),
+            "gpt-5.5".to_string(),
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        let tool_call_id = ToolCallId::new();
+
+        db.append_event(
+            session_id,
+            &SessionEvent::UserMessage {
+                session_id,
+                text: "finish binary distribution".to_string(),
+            },
+        )
+        .unwrap();
+        db.append_event(
+            session_id,
+            &SessionEvent::ToolCallResult {
+                session_id,
+                tool_call_id,
+                title: None,
+                metadata: Value::Null,
+                output: "x".repeat(100_000),
+                exit_code: Some(0),
+            },
+        )
+        .unwrap();
+
+        let submitted = prepare_submitted_prompt(&db, session_id, "/resume").unwrap();
+
+        assert_eq!(submitted.visible_prompt, "/resume");
+        assert!(submitted.model_prompt.contains("finish binary distribution"));
+        assert!(submitted.model_prompt.contains("truncated resume context"));
+        assert!(submitted.model_prompt.len() < 32 * 1024);
 
         let _ = std::fs::remove_dir_all(workspace);
     }

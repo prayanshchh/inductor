@@ -165,13 +165,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::ApplyPatch,
-            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Use insert_before/insert_after for pure insertions, update for replacing existing lines, add_file for new files, and delete_file for deletes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; insertions must include the adjacent line number, exact expected_line copied from the latest file inspection, and content. The tool will not search for ambiguous anchors. Multiple changes to the same file are applied against one original snapshot and written once.",
+            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Use insert_before/insert_after for pure insertions, update for replacing existing lines, add_file for new files, and delete_file for deletes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; insertions must include the adjacent line number, exact expected_line copied from the latest file inspection, and content. The tool will not search for ambiguous anchors. Multiple changes to the same file are applied against one original snapshot and written once, so include all edits for a file in one operations array instead of splitting same-file edits across separate apply_patch calls.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "operations": {
                         "type": "array",
-                        "description": "Line-aware patch operations. First inspect the full current file with read_file or an explicit bash command that names the file and gives exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
+                        "description": "Line-aware patch operations. First inspect the full current file with read_file or an explicit bash command that names the file and gives exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced. If changing a file in multiple places, put all operations for that file in this one operations array.",
                         "items": {
                             "oneOf": [
                                 {
@@ -4120,6 +4120,29 @@ mod tests {
                 line: 2,
                 content: "inserted\n".to_string(),
                 expected_line: Some("two\n".to_string()),
+                expected_hash: None,
+            }],
+        };
+
+        runtime.apply_line_patch(&patch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "one\ntwo\ninserted\nthree\n"
+        );
+    }
+
+    #[test]
+    fn line_patch_insert_after_accepts_expected_line_without_trailing_newline() {
+        let temp = TempDir::new("line-patch-insert-after-no-newline");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::InsertAfter {
+                path: PathBuf::from("file.txt"),
+                line: 2,
+                content: "inserted\n".to_string(),
+                expected_line: Some("two".to_string()),
                 expected_hash: None,
             }],
         };

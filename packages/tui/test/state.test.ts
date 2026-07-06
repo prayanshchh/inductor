@@ -243,6 +243,40 @@ describe("transcript reducer", () => {
     })
   })
 
+  test("derives line-aware apply_patch operation diffs", () => {
+    let state = createInitialState()
+    state = applySessionEvent(state, {
+      type: "tool_call_start",
+      tool_call_id: "call-line-aware",
+      name: "apply_patch",
+      input_json: {
+        operations: [
+          {
+            op: "insert_before",
+            path: "README.md",
+            line: 42,
+            expected_line: "### Build from source",
+            content: "### Install from GitHub Releases\n\nUse the installer.\n",
+          },
+        ],
+      },
+    })
+
+    expect(state.modifiedFiles).toEqual([
+      expect.objectContaining({
+        file: "README.md",
+        additions: 3,
+        deletions: 0,
+        diff: expect.stringContaining("+### Install from GitHub Releases"),
+      }),
+    ])
+    expect(state.transcript.at(-1)).toMatchObject({
+      kind: "tool",
+      name: "apply_patch",
+      diff: expect.stringContaining(" ### Build from source"),
+    })
+  })
+
   test("keeps diagnostics metadata out of the transcript", () => {
     let state = createInitialState()
     state = applySessionEvent(state, {
