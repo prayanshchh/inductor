@@ -34,9 +34,9 @@ use context::{
 use futures_core::Stream;
 use futures_util::StreamExt;
 use harness_core::{
-    ApprovalPolicy, DiagnosticFile, ImageAttachment, MessagePart, ModelMessage, PatchFile,
-    PermissionDecision, PermissionRequestId, RiskFlag, SessionEvent, SessionId, SessionStatus,
-    StopReason, ToolCallId, TurnRequest,
+    ApprovalPolicy, DiagnosticFile, ImageAttachment, MessagePart, ModelMessage, ModelRole,
+    PatchFile, PermissionDecision, PermissionRequestId, RiskFlag, SessionEvent, SessionId,
+    SessionStatus, StopReason, ToolCallId, TurnRequest,
 };
 use provider_core::{ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Map, Value, json};
@@ -624,6 +624,7 @@ pub struct HarnessConfig {
     pub hooks: PluginHooks,
     pub model_effort: ModelEffort,
     pub provider_family: ProviderFamily,
+    pub model_role: ModelRole,
 }
 
 impl HarnessConfig {
@@ -638,6 +639,7 @@ impl HarnessConfig {
             hooks: PluginHooks::default(),
             model_effort: ModelEffort::default(),
             provider_family: ProviderFamily::Generic,
+            model_role: ModelRole::Reasoning,
         }
     }
 }
@@ -754,8 +756,11 @@ fn advertised_tool_names() -> Vec<String> {
     tools::tool_names()
 }
 
-fn advertised_tool_names_for_hooks(hooks: &PluginHooks) -> Vec<String> {
-    let mut names = advertised_tool_names();
+fn advertised_tool_names_for_role(role: ModelRole, hooks: &PluginHooks) -> Vec<String> {
+    let mut names = match role {
+        ModelRole::Reasoning | ModelRole::Reviewer => Vec::new(),
+        ModelRole::Executor => advertised_tool_names(),
+    };
     for name in &hooks.advertised_tool_names {
         if !names.contains(name) {
             names.push(name.clone());
@@ -770,6 +775,7 @@ fn request_metadata(config: &HarnessConfig, round: usize) -> Value {
     metadata.insert("model_effort".to_string(), json!(config.model_effort));
     metadata.insert("approval_policy".to_string(), json!(config.approval_policy));
     metadata.insert("round".to_string(), json!(round));
+    metadata.insert("model_role".to_string(), json!(config.model_role));
     for (key, value) in &config.hooks.request_metadata {
         metadata.insert(key.clone(), value.clone());
     }
@@ -805,6 +811,7 @@ impl ProviderRequestPreparer {
         let system_preamble = PromptComposer::compose(
             input.config.provider_family,
             input.config.model_effort,
+            input.config.model_role,
             &environment,
             &input.config.prompt,
             &input.config.hooks,
@@ -830,7 +837,7 @@ impl ProviderRequestPreparer {
             prompt: prepared_context.prompt,
             system_prompt: Some(system_preamble),
             messages: request_messages(&prepared_context.messages, input.turn_images.clone()),
-            tool_names: advertised_tool_names_for_hooks(&input.config.hooks),
+            tool_names: advertised_tool_names_for_role(input.config.model_role, &input.config.hooks),
             metadata: request_metadata(input.config, input.round),
             images: input.turn_images,
         };
@@ -1957,6 +1964,12 @@ pub fn run_turn<'a>(
         let mut hash_cache = ToolHashCache::default();
 
         yield SessionEvent::Status { session_id, status: SessionStatus::Starting };
+        yield SessionEvent::ModelRoleChanged {
+            session_id,
+            role: config.model_role,
+            model: config.model.clone(),
+            effort: config.model_effort.as_str().to_string(),
+        };
 
         let mut round = 0usize;
         'turns: loop {
@@ -2500,17 +2513,26 @@ struct PromptLayer {
     content: String,
 }
 
+fn model_role_prompt(role: ModelRole) -> String {
+    match role {
+        ModelRole::Reasoning => "Model role: reasoning. You are the frontier reasoning model. Decide the complete diff and the next exact executor actions. Do not call tools or edit files directly; instead produce a concise implementation plan/instructions for the executor. After reviewer feedback, decide whether it is valid; you may explicitly disagree and continue with your own plan.".to_string(),
+        ModelRole::Executor => "Model role: executor. You are the lower-cost executor. Do not redesign the solution. Follow the reasoning model's instructions as faithfully as possible, use tools correctly to inspect/edit/run commands, report concrete tool results, and ask for updated reasoning instructions when blocked or when the requested diff is complete.".to_string(),
+        ModelRole::Reviewer => "Model role: reviewer. You are the frontier reviewer. Review the executor's work for correctness, regressions, safety, and missed requirements. Do not call tools and do not fix code. Return only review findings and whether the reasoning model should accept them or continue.".to_string(),
+    }
+}
+
 struct PromptComposer;
 
 impl PromptComposer {
     fn compose(
         provider: ProviderFamily,
         effort: ModelEffort,
+        role: ModelRole,
         environment: &SystemEnvironment,
         prompt: &PromptRuntimeConfig,
         hooks: &PluginHooks,
     ) -> String {
-        Self::layers(provider, effort, environment, prompt, hooks)
+        Self::layers(provider, effort, role, environment, prompt, hooks)
             .into_iter()
             .map(|layer| layer.content)
             .filter(|content| !content.trim().is_empty())
@@ -2521,6 +2543,7 @@ impl PromptComposer {
     fn layers(
         provider: ProviderFamily,
         effort: ModelEffort,
+        role: ModelRole,
         environment: &SystemEnvironment,
         prompt: &PromptRuntimeConfig,
         hooks: &PluginHooks,
@@ -2534,6 +2557,10 @@ impl PromptComposer {
                     }
                     _ => generic_tools_preamble(),
                 },
+            },
+            PromptLayer {
+                name: "model-role",
+                content: model_role_prompt(role),
             },
             PromptLayer {
                 name: "environment",
@@ -2582,6 +2609,7 @@ fn system_preamble_for_effort(
     PromptComposer::compose(
         provider,
         effort,
+        ModelRole::Reasoning,
         environment,
         &PromptRuntimeConfig::default(),
         &PluginHooks::default(),

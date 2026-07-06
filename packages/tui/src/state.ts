@@ -156,6 +156,8 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
       return { ...state, pendingPermission: undefined, status: "running_tools" }
     case "context_prepared":
       return { ...state, tokens: Number(event.token_count ?? state.tokens) }
+    case "model_role_changed":
+      return { ...state, status: `${event.role ?? "model"}:${event.model ?? ""}:${event.effort ?? ""}` }
     case "step_start":
     case "step_finish":
       return state
