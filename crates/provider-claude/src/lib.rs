@@ -392,20 +392,20 @@ impl ProviderPlugin for ClaudeProvider {
                         last_activity = Instant::now();
                         match resp {
                             Some(resp) => {
-                                if let Some(bridge_id) = pending_tools.remove(&resp.tool_call_id.to_string()) {
-                                    if let Err(error) = send_bridge_value_or_timeout(&mut bridge, idle_timeout, json!({
+                                if let Some(bridge_id) = pending_tools.remove(&resp.tool_call_id.to_string())
+                                    && let Err(error) = send_bridge_value_or_timeout(&mut bridge, idle_timeout, json!({
                                         "type": "tool_result",
                                         "id": bridge_id,
                                         "output": resp.output,
                                         "is_error": resp.is_error,
-                                    })).await {
-                                        bridge.cancel_with_grace(DEFAULT_CLAUDE_CANCEL_GRACE).await;
-                                        yield SessionEvent::Error {
-                                            session_id,
-                                            message: error.to_string(),
-                                        };
-                                        return;
-                                    }
+                                    })).await
+                                {
+                                    bridge.cancel_with_grace(DEFAULT_CLAUDE_CANCEL_GRACE).await;
+                                    yield SessionEvent::Error {
+                                        session_id,
+                                        message: error.to_string(),
+                                    };
+                                    return;
                                 }
                             }
                             None => tool_results_open = false,
@@ -547,13 +547,13 @@ impl SdkBridge {
             tokio::spawn(async move {
                 let mut buf = String::new();
                 let _ = child_stderr.read_to_string(&mut buf).await;
-                if !buf.is_empty() {
-                    if let Ok(mut guard) = sink.lock() {
-                        guard.push_str(&buf);
-                        if guard.len() > MAX_BRIDGE_STDERR {
-                            let start = guard.len() - MAX_BRIDGE_STDERR;
-                            *guard = guard[start..].to_string();
-                        }
+                if !buf.is_empty()
+                    && let Ok(mut guard) = sink.lock()
+                {
+                    guard.push_str(&buf);
+                    if guard.len() > MAX_BRIDGE_STDERR {
+                        let start = guard.len() - MAX_BRIDGE_STDERR;
+                        *guard = guard[start..].to_string();
                     }
                 }
             });

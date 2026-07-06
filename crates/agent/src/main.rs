@@ -1024,16 +1024,6 @@ async fn run_opentui_command(
     approval: ApprovalArg,
     workspace_only: bool,
 ) -> Result<(), String> {
-    let repo_root = resolve_repo_root()?;
-    let tui_dir = repo_root.join("packages").join("tui");
-    if !tui_dir.join("src").join("index.tsx").exists() {
-        return Err(format!(
-            "OpenTUI frontend not found at {}",
-            tui_dir.display()
-        ));
-    }
-    ensure_opentui_dependencies(&repo_root, &tui_dir)?;
-
     let backend_bin = std::env::current_exe()
         .map_err(|err| format!("could not resolve current executable: {err}"))?;
     let workspace = workspace
@@ -1049,26 +1039,44 @@ async fn run_opentui_command(
         eprintln!("Recovered {recovered} interrupted Inductor session(s) from a previous process.");
     }
 
-    let mut command = std::process::Command::new("bun");
+    let source_repo_root = resolve_repo_root().ok();
+    let frontend = select_opentui_frontend(source_repo_root.as_deref(), &backend_bin, &workspace)?;
+    let (mut command, repo_root) = match frontend {
+        OpenTuiFrontend::Source { repo_root, tui_dir } => {
+            ensure_opentui_dependencies(&repo_root, &tui_dir)?;
+            let mut command = std::process::Command::new("bun");
+            command
+                .arg("run")
+                .arg("./src/index.tsx")
+                .current_dir(&tui_dir);
+            (command, repo_root)
+        }
+        OpenTuiFrontend::Packaged {
+            frontend_bin,
+            backend_cwd,
+        } => {
+            let mut command = std::process::Command::new(frontend_bin);
+            command.current_dir(&backend_cwd);
+            (command, backend_cwd)
+        }
+    };
+
     command
-        .arg("run")
-        .arg("./src/index.tsx")
         .arg("--backend-bin")
-        .arg(backend_bin)
+        .arg(&backend_bin)
         .arg("--workspace")
-        .arg(workspace)
+        .arg(&workspace)
         .arg("--provider")
         .arg(provider.to_string())
         .arg("--approval")
         .arg(approval.to_string())
         .arg("--repo-root")
-        .arg(repo_root)
+        .arg(&repo_root)
         .arg("--app-db")
         .arg(app_db);
     if workspace_only {
         command.arg("--workspace-only");
     }
-    command.current_dir(&tui_dir);
 
     if let Some(model) = model {
         command.arg("--model").arg(model);
@@ -1084,13 +1092,54 @@ async fn run_opentui_command(
 
     let status = command
         .status()
-        .map_err(|err| format!("failed to launch OpenTUI frontend with bun: {err}"))?;
+        .map_err(|err| format!("failed to launch OpenTUI frontend: {err}"))?;
 
     if status.success() {
         Ok(())
     } else {
         Err(format!("OpenTUI frontend exited with {status}"))
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenTuiFrontend {
+    Source {
+        repo_root: PathBuf,
+        tui_dir: PathBuf,
+    },
+    Packaged {
+        frontend_bin: PathBuf,
+        backend_cwd: PathBuf,
+    },
+}
+
+fn select_opentui_frontend(
+    source_repo_root: Option<&Path>,
+    backend_bin: &Path,
+    workspace: &Path,
+) -> Result<OpenTuiFrontend, String> {
+    if let Some(repo_root) = source_repo_root {
+        let tui_dir = opentui_dir(repo_root);
+        if opentui_entrypoint(&tui_dir).exists() {
+            return Ok(OpenTuiFrontend::Source {
+                repo_root: repo_root.to_path_buf(),
+                tui_dir,
+            });
+        }
+    }
+
+    let frontend_bin = packaged_opentui_binary(backend_bin);
+    if frontend_bin.exists() {
+        return Ok(OpenTuiFrontend::Packaged {
+            frontend_bin,
+            backend_cwd: workspace.to_path_buf(),
+        });
+    }
+
+    Err(format!(
+        "OpenTUI frontend is unavailable. Expected either a source checkout at packages/tui/src/index.tsx or a packaged frontend at {}. Build it with `bun run build:tui` or download a release bundle.",
+        frontend_bin.display()
+    ))
 }
 
 fn ensure_opentui_dependencies(repo_root: &Path, tui_dir: &Path) -> Result<(), String> {
@@ -1150,6 +1199,33 @@ fn opentui_preload_exists(repo_root: &Path, tui_dir: &Path) -> bool {
     })
 }
 
+fn opentui_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join("packages").join("tui")
+}
+
+fn opentui_entrypoint(tui_dir: &Path) -> PathBuf {
+    tui_dir.join("src").join("index.tsx")
+}
+
+fn packaged_opentui_binary(backend_bin: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("INDUCTOR_OPEN_TUI_BIN") {
+        return PathBuf::from(path);
+    }
+
+    backend_bin
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(opentui_binary_name())
+}
+
+fn opentui_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "inductor-open-tui.exe"
+    } else {
+        "inductor-open-tui"
+    }
+}
+
 /// Locate the inductor repository root that ships the OpenTUI frontend.
 ///
 /// The binary is typically `cargo install`ed globally, so the compile-time
@@ -1160,14 +1236,10 @@ fn opentui_preload_exists(repo_root: &Path, tui_dir: &Path) -> bool {
 ///   1. an explicit `INDUCTOR_REPO_ROOT` override,
 ///   2. the nearest ancestor of the current directory that contains
 ///      `packages/tui/src/index.tsx`,
-///   3. the compile-time manifest dir as a last-resort fallback.
+///   3. the compile-time manifest dir if it still contains the frontend.
 fn resolve_repo_root() -> Result<PathBuf, String> {
     fn has_tui(root: &Path) -> bool {
-        root.join("packages")
-            .join("tui")
-            .join("src")
-            .join("index.tsx")
-            .exists()
+        opentui_entrypoint(&opentui_dir(root)).exists()
     }
 
     if let Some(root) = std::env::var_os("INDUCTOR_REPO_ROOT") {
@@ -1183,11 +1255,20 @@ fn resolve_repo_root() -> Result<PathBuf, String> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
+    let repo_root = manifest_dir
         .parent()
         .and_then(|path| path.parent())
         .map(Path::to_path_buf)
-        .ok_or_else(|| "could not resolve repository root from Cargo manifest path".to_string())
+        .ok_or_else(|| "could not resolve repository root from Cargo manifest path".to_string())?;
+
+    if has_tui(&repo_root) {
+        Ok(repo_root)
+    } else {
+        Err(
+            "could not find an inductor source checkout with packages/tui/src/index.tsx"
+                .to_string(),
+        )
+    }
 }
 
 async fn run_context_command(command: ContextCommand) -> Result<(), String> {
@@ -1321,8 +1402,14 @@ fn discover_skills(workspace: &Path) -> Result<Vec<SkillInfo>, String> {
 
     for root in workspace_skill_roots(workspace, repo_root.as_deref()) {
         roots.push((root.join(".agents").join("skills"), "repo".to_string()));
-        roots.push((root.join(".claude").join("skills"), "claude-project".to_string()));
-        roots.push((root.join(".github").join("skills"), "copilot-project".to_string()));
+        roots.push((
+            root.join(".claude").join("skills"),
+            "claude-project".to_string(),
+        ));
+        roots.push((
+            root.join(".github").join("skills"),
+            "copilot-project".to_string(),
+        ));
     }
 
     // Back-compatibility for skills created by the first Inductor skill MVP.
@@ -1338,16 +1425,28 @@ fn discover_skills(workspace: &Path) -> Result<Vec<SkillInfo>, String> {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         roots.push((home.join(".agents").join("skills"), "user".to_string()));
-        roots.push((home.join(".claude").join("skills"), "claude-user".to_string()));
-        roots.push((home.join(".copilot").join("skills"), "copilot-user".to_string()));
-        roots.push((home.join(".codex").join("skills"), "codex-user-legacy".to_string()));
+        roots.push((
+            home.join(".claude").join("skills"),
+            "claude-user".to_string(),
+        ));
+        roots.push((
+            home.join(".copilot").join("skills"),
+            "copilot-user".to_string(),
+        ));
+        roots.push((
+            home.join(".codex").join("skills"),
+            "codex-user-legacy".to_string(),
+        ));
         roots.push((
             home.join(".inductor").join("skills"),
             "legacy-inductor-user".to_string(),
         ));
     }
 
-    roots.push((PathBuf::from("/etc/codex/skills"), "codex-admin".to_string()));
+    roots.push((
+        PathBuf::from("/etc/codex/skills"),
+        "codex-admin".to_string(),
+    ));
 
     let mut skills = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1450,8 +1549,7 @@ fn compose_skill_prompt_layer(
 
     Ok(Some(format!(
         "# Skills\n\nSkills are provider-standard SKILL.md capability packages from Codex, Claude, Copilot, and compatible locations. All discovered skill names, descriptions, and paths are listed below so you can choose the right skill without the user tagging it.\n\nBe proactive: whenever a task matches a skill description, invoke that skill by reading its SKILL.md at the listed path, then follow the skill instructions. Do not wait for the user to tag the skill. If the user explicitly mentions a $skill, prefer that skill. If a skill conflicts with higher-priority system or developer instructions, follow the higher-priority instruction.\n\n## Available skills\n\n{}\n\n## Explicitly tagged/preloaded skills\n\n{}",
-        catalog_rows,
-        preloaded
+        catalog_rows, preloaded
     )))
 }
 
@@ -1846,7 +1944,7 @@ async fn run_harness_command(
     let blob_root = blob_root.or_else(|| default_blob_root(&state_db_path));
     let workspace_db = WorkspaceDb::open(&state_db_path).map_err(|err| err.to_string())?;
     let model = model.unwrap_or_else(|| default_provider_model(provider).to_string());
-    let session_id = requested_session_id.unwrap_or_else(SessionId::new);
+    let session_id = requested_session_id.unwrap_or_default();
     let existing_session = workspace_db
         .get_session(session_id)
         .map_err(|err| err.to_string())?;
@@ -1972,8 +2070,8 @@ async fn run_harness_command(
     persist_submitted_user_message(&workspace_db, session_id, &state.transcript, &prompt)
         .map_err(|err| err.to_string())?;
 
-    if should_silently_name {
-        if let Some(event) = silently_name_session_and_worktree(
+    if should_silently_name
+        && let Some(event) = silently_name_session_and_worktree(
             provider,
             &model,
             &workspace_path,
@@ -1984,43 +2082,41 @@ async fn run_harness_command(
             worktree_rename_candidate.as_ref(),
         )
         .await
+    {
+        // The silent rename may have `git worktree move`d the placeholder
+        // directory out from under us. The tool runtime and Claude's cwd
+        // cached the old path, so rebind them to the new one — otherwise
+        // every bash/read/list/grep runs in a directory that no longer
+        // exists and fails with ENOENT.
+        if let SessionEvent::MetadataUpdated {
+            worktree_path: Some(renamed),
+            ..
+        } = &event
         {
-            // The silent rename may have `git worktree move`d the placeholder
-            // directory out from under us. The tool runtime and Claude's cwd
-            // cached the old path, so rebind them to the new one — otherwise
-            // every bash/read/list/grep runs in a directory that no longer
-            // exists and fails with ENOENT.
-            if let SessionEvent::MetadataUpdated {
-                worktree_path: Some(renamed),
-                ..
-            } = &event
-            {
-                let renamed = PathBuf::from(renamed);
-                if renamed != workspace_path {
-                    workspace_path = renamed;
-                    // The directory the process sits in was just moved on disk;
-                    // follow it so cwd-relative work keeps landing in the
-                    // worktree rather than the repo root.
-                    set_process_cwd(&workspace_path);
-                    tools = (if workspace_only {
-                        ToolRuntime::sandboxed(workspace_path.clone())
-                    } else {
-                        ToolRuntime::unrestricted(workspace_path.clone())
-                    })
-                    .map_err(|err| err.to_string())?
-                    .with_memory_file(memory_file.clone());
-                    if matches!(provider, ProviderKind::Claude) {
-                        provider_plugin =
-                            Box::new(ClaudeProvider::with_cwd(workspace_path.clone()));
-                    }
+            let renamed = PathBuf::from(renamed);
+            if renamed != workspace_path {
+                workspace_path = renamed;
+                // The directory the process sits in was just moved on disk;
+                // follow it so cwd-relative work keeps landing in the
+                // worktree rather than the repo root.
+                set_process_cwd(&workspace_path);
+                tools = (if workspace_only {
+                    ToolRuntime::sandboxed(workspace_path.clone())
+                } else {
+                    ToolRuntime::unrestricted(workspace_path.clone())
+                })
+                .map_err(|err| err.to_string())?
+                .with_memory_file(memory_file.clone());
+                if matches!(provider, ProviderKind::Claude) {
+                    provider_plugin = Box::new(ClaudeProvider::with_cwd(workspace_path.clone()));
                 }
             }
-            persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string(&event).map_err(|err| err.to_string())?
-            );
         }
+        persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string(&event).map_err(|err| err.to_string())?
+        );
     }
 
     let mut stream = run_turn(
@@ -2148,10 +2244,10 @@ async fn run_harness_command(
             if let Err(err) = workspace_db.set_session_status(session_id, *status) {
                 dlog(&format!("set_session_status (workspace) failed: {err}"));
             }
-            if let Some(ref db) = live_app_db {
-                if let Err(err) = db.set_session_status(session_id, *status) {
-                    dlog(&format!("set_session_status (app) failed: {err}"));
-                }
+            if let Some(ref db) = live_app_db
+                && let Err(err) = db.set_session_status(session_id, *status)
+            {
+                dlog(&format!("set_session_status (app) failed: {err}"));
             }
         }
         persist_event(&workspace_db, &event).map_err(|err| err.to_string())?;
@@ -2236,6 +2332,7 @@ async fn run_harness_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn silently_name_session_and_worktree(
     provider: ProviderKind,
     model: &str,
@@ -2265,16 +2362,16 @@ async fn silently_name_session_and_worktree(
         dlog(&format!("silent session name update failed: {err}"));
         return None;
     }
-    if let Some(db) = app_db {
-        if let Err(err) = db.upsert_session(session_record) {
-            dlog(&format!("silent app session name update failed: {err}"));
-        }
+    if let Some(db) = app_db
+        && let Err(err) = db.upsert_session(session_record)
+    {
+        dlog(&format!("silent app session name update failed: {err}"));
     }
 
-    if let Some(db) = app_db {
-        if let Err(err) = db.upsert_workspace(session_record.workspace_id, workspace_path, &name) {
-            dlog(&format!("silent workspace name update failed: {err}"));
-        }
+    if let Some(db) = app_db
+        && let Err(err) = db.upsert_workspace(session_record.workspace_id, workspace_path, &name)
+    {
+        dlog(&format!("silent workspace name update failed: {err}"));
     }
 
     let mut workspace_id = None;
@@ -2665,7 +2762,7 @@ fn image_mentions(prompt: &str) -> Vec<String> {
             .trim_matches(|ch: char| {
                 matches!(ch, ',' | '.' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
             })
-            .trim_start_matches(|ch: char| matches!(ch, '(' | '[' | '{' | '"' | '\''));
+            .trim_start_matches(['(', '[', '{', '"', '\'']);
         let Some(path) = token.strip_prefix('@') else {
             continue;
         };
@@ -2728,10 +2825,10 @@ fn ensure_attachment_in_workspace(workspace: &Path, source_workspace: &Path, rel
     if !src.exists() {
         return;
     }
-    if let Some(parent) = dest.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    if let Some(parent) = dest.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
     }
     let _ = std::fs::copy(&src, &dest);
 }
@@ -3146,19 +3243,20 @@ fn run_terminal_serve(workspace: PathBuf, rows: u16, cols: u16) -> Result<(), St
             };
             match value.get("type").and_then(|v| v.as_str()) {
                 Some("input") => {
-                    if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
-                        if let Ok(mut guard) = reader_manager.lock() {
-                            let _ = guard.write(id, data);
-                        }
+                    if let Some(data) = value.get("data").and_then(|v| v.as_str())
+                        && let Ok(mut guard) = reader_manager.lock()
+                    {
+                        let _ = guard.write(id, data);
                     }
                 }
                 Some("resize") => {
                     let new_rows = value.get("rows").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                     let new_cols = value.get("cols").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-                    if new_rows > 0 && new_cols > 0 {
-                        if let Ok(mut guard) = reader_manager.lock() {
-                            let _ = guard.resize(id, TerminalSize::new(new_rows, new_cols));
-                        }
+                    if new_rows > 0
+                        && new_cols > 0
+                        && let Ok(mut guard) = reader_manager.lock()
+                    {
+                        let _ = guard.resize(id, TerminalSize::new(new_rows, new_cols));
                     }
                 }
                 _ => {}
@@ -3573,6 +3671,7 @@ fn recover_orphaned_sessions(registry: &AppDb) -> Result<usize, String> {
     Ok(recovered)
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3802,6 +3901,68 @@ mod tests {
         std::fs::create_dir_all(package_preload.parent().unwrap()).unwrap();
         std::fs::write(&package_preload, "").unwrap();
         assert!(opentui_preload_exists(&repo, &tui));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn packaged_opentui_binary_defaults_to_backend_sibling() {
+        let backend = PathBuf::from("/tmp/inductor/bin/inductor");
+        assert_eq!(
+            packaged_opentui_binary(&backend),
+            PathBuf::from("/tmp/inductor/bin").join(opentui_binary_name())
+        );
+    }
+
+    #[test]
+    fn select_opentui_frontend_prefers_source_checkout() {
+        let repo = temp_workspace("opentui-source-preferred");
+        let workspace = repo.join("workspace");
+        let tui_dir = opentui_dir(&repo);
+        let backend_dir = repo.join("target").join("release");
+        let backend_bin = backend_dir.join("inductor");
+        let packaged_frontend = backend_dir.join(opentui_binary_name());
+
+        std::fs::create_dir_all(opentui_entrypoint(&tui_dir).parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(opentui_entrypoint(&tui_dir), "").unwrap();
+        std::fs::write(&backend_bin, "").unwrap();
+        std::fs::write(&packaged_frontend, "").unwrap();
+
+        let selected = select_opentui_frontend(Some(&repo), &backend_bin, &workspace).unwrap();
+        assert_eq!(
+            selected,
+            OpenTuiFrontend::Source {
+                repo_root: repo.clone(),
+                tui_dir,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn select_opentui_frontend_uses_packaged_binary_when_source_is_missing() {
+        let repo = temp_workspace("opentui-packaged-fallback");
+        let workspace = repo.join("workspace");
+        let backend_dir = repo.join("target").join("release");
+        let backend_bin = backend_dir.join("inductor");
+        let packaged_frontend = backend_dir.join(opentui_binary_name());
+
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(&backend_bin, "").unwrap();
+        std::fs::write(&packaged_frontend, "").unwrap();
+
+        let selected = select_opentui_frontend(None, &backend_bin, &workspace).unwrap();
+        assert_eq!(
+            selected,
+            OpenTuiFrontend::Packaged {
+                frontend_bin: packaged_frontend,
+                backend_cwd: workspace.clone(),
+            }
+        );
 
         let _ = std::fs::remove_dir_all(repo);
     }

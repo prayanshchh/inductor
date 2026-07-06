@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "bun run ./build.ts",
     "dev": "bun run src/index.tsx",
     "typecheck": "tsc --noEmit",
     "test": "bun test --timeout 30000"

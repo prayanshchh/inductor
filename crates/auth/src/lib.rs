@@ -423,10 +423,10 @@ fn find_identity_hint(json: &Value) -> Option<String> {
     }
 
     for object_key in ["account", "profile", "user"] {
-        if let Some(object) = json.get(object_key) {
-            if let Some(value) = find_identity_hint(object) {
-                return Some(value);
-            }
+        if let Some(object) = json.get(object_key)
+            && let Some(value) = find_identity_hint(object)
+        {
+            return Some(value);
         }
     }
 
@@ -437,10 +437,10 @@ fn find_secret_string(json: &Value, keys: &[&str]) -> Option<String> {
     match json {
         Value::Object(object) => {
             for key in keys {
-                if let Some(value) = object.get(*key).and_then(Value::as_str) {
-                    if !value.trim().is_empty() {
-                        return Some(value.to_string());
-                    }
+                if let Some(value) = object.get(*key).and_then(Value::as_str)
+                    && !value.trim().is_empty()
+                {
+                    return Some(value.to_string());
                 }
             }
 

@@ -259,7 +259,7 @@ impl WorktreeStatus {
         }
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_db_value(value: &str) -> Self {
         match value {
             "pr_open" => WorktreeStatus::PrOpen,
             "merged" => WorktreeStatus::Merged,
@@ -1152,10 +1152,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     let needs_migration = migrations
         .iter()
         .any(|migration| migration.version > current);
-    if needs_migration {
-        if let Some(backup) = backup {
-            fs::copy(backup_source(&backup), &backup)?;
-        }
+    if needs_migration && let Some(backup) = backup {
+        fs::copy(backup_source(&backup), &backup)?;
     }
 
     for migration in migrations {
@@ -1225,7 +1223,7 @@ fn map_worktree_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRecord>
         branch_name: row.get(3)?,
         base_branch: row.get(4)?,
         base_commit: row.get(5)?,
-        status: WorktreeStatus::from_str(&row.get::<_, String>(6)?),
+        status: WorktreeStatus::from_db_value(&row.get::<_, String>(6)?),
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })

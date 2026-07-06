@@ -413,7 +413,7 @@ fn untracked_file_diffs(repo_root: &Path) -> Result<Vec<FileDiff>, DiffError> {
             path: full_path.clone(),
             source,
         })?;
-        if bytes.iter().any(|byte| *byte == 0) {
+        if bytes.contains(&0) {
             files.push(FileDiff {
                 old_path: None,
                 new_path: Some(path),

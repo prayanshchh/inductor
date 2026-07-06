@@ -22,7 +22,7 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Command,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use ::time::OffsetDateTime;
@@ -116,10 +116,11 @@ Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - If the user prompt is just \"resume\" or asks to resume, treat it as a request to continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.\n\
-- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with the adjacent line from a recent read_file result instead of inventing an update range. For replacing existing lines, first read the file, then provide exact path, 1-based inclusive start_line/end_line, old text, and new text. Do not use anchor-only patches.\n\
-- Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.\n\
+- Use apply_patch for all file changes. Before editing an existing file, establish a fresh full-file view with read_file or an explicit bash inspection command that names the file, then base every line number/old text/expected_line on that latest file view. For pure insertions, use insert_before or insert_after with expected_line copied from the adjacent current line instead of inventing an update range. For replacing existing lines, provide exact path, 1-based inclusive start_line/end_line, old text, and new text from the latest file view. Do not use anchor-only patches.\n\
+- If apply_patch says read_file is required or a line/hash is stale, re-inspect the whole file once, recompute all remaining changes for that file, and retry with one consolidated patch for that file.\n\
+- Batch edits per file: think through all related changes for the current file, apply them in one larger patch when practical, then move to the next file. Avoid multiple tiny edits to the same file in short intervals.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
-- read_file returns the whole file; prefer one full read per relevant file instead of repeated ranged reads. Use grep with focused regex patterns instead of broad dumps, and avoid large sed commands.\n\
+- read_file returns the whole file; prefer one full read per relevant file instead of repeated ranged reads or sed chunks. Use grep with focused regex patterns to locate files, then read the full file before editing.\n\
 - When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.\n\
 - If a tool result says it was truncated and gives a blob_id, use read_blob with a bounded start_byte/limit_bytes range to inspect more without rerunning the tool.\n\
 - Prefer app-owned code first. Inspect dependency or generated code only to resolve a specific unknown; once that unknown is resolved, stop rereading dependency internals and patch the app-owned code.\n\
@@ -643,19 +644,10 @@ impl HarnessConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContextRuntimeConfig {
     pub limits: ContextLimits,
     pub blob_root: Option<PathBuf>,
-}
-
-impl Default for ContextRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            limits: ContextLimits::default(),
-            blob_root: None,
-        }
-    }
 }
 
 impl ContextRuntimeConfig {
@@ -734,18 +726,17 @@ fn request_messages(
         .map(|message| ModelMessage::text(message.role.to_lowercase(), message.content.clone()))
         .collect::<Vec<_>>();
 
-    if !first_turn_images.is_empty() {
-        if let Some(last_user) = request_messages
+    if !first_turn_images.is_empty()
+        && let Some(last_user) = request_messages
             .iter_mut()
             .rev()
             .find(|message| message.role == "user")
-        {
-            last_user.parts.extend(
-                first_turn_images
-                    .into_iter()
-                    .map(|image| MessagePart::Image { image }),
-            );
-        }
+    {
+        last_user.parts.extend(
+            first_turn_images
+                .into_iter()
+                .map(|image| MessagePart::Image { image }),
+        );
     }
 
     request_messages
@@ -885,10 +876,32 @@ struct LocalToolRunResult {
     status: LocalToolRunStatus,
 }
 
+#[derive(Debug, Clone)]
+struct ReadSnapshot {
+    sha256: String,
+    lines: Vec<String>,
+    revision: u64,
+    read_id: String,
+    timestamp: SystemTime,
+}
+
+impl ReadSnapshot {
+    fn age_label(&self) -> String {
+        self.timestamp
+            .elapsed()
+            .ok()
+            .map(format_elapsed)
+            .unwrap_or_else(|| "unknown age".to_string())
+    }
+}
+
 #[derive(Debug, Default)]
 struct ToolHashCache {
     hashes_by_path: HashMap<String, String>,
+    read_snapshots: HashMap<String, ReadSnapshot>,
     dirty_since_read: HashMap<String, String>,
+    path_revisions: HashMap<String, u64>,
+    next_read_revision: u64,
 }
 
 impl ToolHashCache {
@@ -898,10 +911,22 @@ impl ToolHashCache {
         call
     }
 
-    fn execution_call(&self, tools: &ToolRuntime, call: &ParsedToolCall) -> ParsedToolCall {
+    fn execution_call(
+        &self,
+        tools: &ToolRuntime,
+        call: &ParsedToolCall,
+    ) -> Result<ParsedToolCall, String> {
         let mut call = self.model_visible_call(call);
+        self.validate_and_rewrite_line_patch(tools, &mut call.input, &call.name)?;
         attach_cached_hashes(tools, &mut call.input, &call.name, &self.hashes_by_path);
-        call
+        attach_cached_read_provenance(
+            tools,
+            &mut call.input,
+            &call.name,
+            &self.read_snapshots,
+            &self.path_revisions,
+        );
+        Ok(call)
     }
 
     fn record_success(
@@ -915,11 +940,15 @@ impl ToolHashCache {
                 result.metadata.get("path").and_then(Value::as_str),
                 result.metadata.get("sha256").and_then(Value::as_str),
             ) {
-                self.hashes_by_path
-                    .insert(path.to_string(), hash.to_string());
-                self.dirty_since_read.remove(path);
+                self.record_read_snapshot(path, hash, &result.output);
             }
             return;
+        }
+
+        if call.name == ToolName::Bash.as_str() && result.exit_code == Some(0) {
+            if let Some(command) = call.input.get("command").and_then(Value::as_str) {
+                self.record_bash_read_snapshots(tools, command);
+            }
         }
 
         for path in tool_target_paths(call) {
@@ -927,25 +956,41 @@ impl ToolHashCache {
         }
     }
 
-    fn stale_line_patch_reason(
-        &self,
-        tools: &ToolRuntime,
-        call: &ParsedToolCall,
-    ) -> Option<String> {
-        if call.name != ToolName::ApplyPatch.as_str() || !is_line_aware_patch(&call.input) {
-            return None;
-        }
+    fn record_read_snapshot(&mut self, path: &str, hash: &str, output: &str) {
+        self.next_read_revision = self.next_read_revision.saturating_add(1);
+        let revision = *self.path_revisions.entry(path.to_string()).or_default();
+        let read_id = format!("read-{}", self.next_read_revision);
+        self.hashes_by_path
+            .insert(path.to_string(), hash.to_string());
+        self.read_snapshots.insert(
+            path.to_string(),
+            ReadSnapshot {
+                sha256: hash.to_string(),
+                lines: split_lines_lossless_local(output),
+                revision,
+                read_id,
+                timestamp: SystemTime::now(),
+            },
+        );
+        self.dirty_since_read.remove(path);
+    }
 
-        line_patch_paths(&call.input)?
+    fn record_bash_read_snapshots(&mut self, tools: &ToolRuntime, command: &str) {
+        if !looks_like_file_inspection_command(command) {
+            return;
+        }
+        for key in bash_workspace_file_candidates(tools, command)
             .into_iter()
-            .find_map(|path| {
-                let key = workspace_relative_key(tools, &path)?;
-                self.dirty_since_read.get(&key).map(|reason| {
-                    format!(
-                        "line-aware apply_patch for {key} requires a fresh read_file because this file changed after the last read ({reason}). Re-read the file, then retry with current line numbers and old text."
-                    )
-                })
-            })
+            .take(8)
+        {
+            let Ok(result) = tools.read_file(&key) else {
+                continue;
+            };
+            let Some(hash) = result.metadata.get("sha256").and_then(Value::as_str) else {
+                continue;
+            };
+            self.record_read_snapshot(&key, hash, &result.output);
+        }
     }
 
     fn mark_written(&mut self, tools: &ToolRuntime, path: &str) {
@@ -953,8 +998,367 @@ impl ToolHashCache {
             return;
         };
         self.hashes_by_path.remove(&key);
+        self.read_snapshots.remove(&key);
+        *self.path_revisions.entry(key.clone()).or_default() += 1;
         self.dirty_since_read
             .insert(key, "previous tool write".to_string());
+    }
+
+    fn validate_and_rewrite_line_patch(
+        &self,
+        tools: &ToolRuntime,
+        input: &mut Value,
+        tool_name: &str,
+    ) -> Result<(), String> {
+        if tool_name != ToolName::ApplyPatch.as_str() || !is_line_aware_patch(input) {
+            return Ok(());
+        }
+
+        let mut patch = serde_json::from_value::<LinePatch>(input.clone()).map_err(|err| {
+            format!("invalid line-aware apply_patch input; expected operations array: {err}")
+        })?;
+        let mut current_hashes = HashMap::new();
+        let mut rewritten = false;
+
+        for operation in &mut patch.operations {
+            match operation {
+                tools::LinePatchOperation::Update {
+                    path,
+                    start_line,
+                    end_line,
+                    old,
+                    ..
+                } => {
+                    let key = self.require_latest_snapshot(tools, path, &mut current_hashes)?;
+                    let snapshot = self.read_snapshots.get(&key).ok_or_else(|| {
+                        format!("read_file required before applying line-aware patch to {key}")
+                    })?;
+                    let (new_start, new_end) =
+                        validate_or_relocate_update(&key, snapshot, *start_line, *end_line, old)?;
+                    if new_start != *start_line || new_end != *end_line {
+                        *start_line = new_start;
+                        *end_line = new_end;
+                        rewritten = true;
+                    }
+                }
+                tools::LinePatchOperation::InsertBefore {
+                    path,
+                    line,
+                    expected_line,
+                    ..
+                } => {
+                    let key = self.require_latest_snapshot(tools, path, &mut current_hashes)?;
+                    let snapshot = self.read_snapshots.get(&key).ok_or_else(|| {
+                        format!("read_file required before applying line-aware patch to {key}")
+                    })?;
+                    let expected = expected_line.as_ref().ok_or_else(|| {
+                        format!(
+                            "line-aware insert_before for {key} requires expected_line copied from the latest read_file result"
+                        )
+                    })?;
+                    let new_line = validate_or_relocate_insert(
+                        &key,
+                        snapshot,
+                        *line,
+                        expected,
+                        LineInsertKind::Before,
+                    )?;
+                    if new_line != *line {
+                        *line = new_line;
+                        rewritten = true;
+                    }
+                }
+                tools::LinePatchOperation::InsertAfter {
+                    path,
+                    line,
+                    expected_line,
+                    ..
+                } => {
+                    let key = self.require_latest_snapshot(tools, path, &mut current_hashes)?;
+                    let snapshot = self.read_snapshots.get(&key).ok_or_else(|| {
+                        format!("read_file required before applying line-aware patch to {key}")
+                    })?;
+                    let expected = expected_line.as_ref().ok_or_else(|| {
+                        format!(
+                            "line-aware insert_after for {key} requires expected_line copied from the latest read_file result"
+                        )
+                    })?;
+                    let new_line = validate_or_relocate_insert(
+                        &key,
+                        snapshot,
+                        *line,
+                        expected,
+                        LineInsertKind::After,
+                    )?;
+                    if new_line != *line {
+                        *line = new_line;
+                        rewritten = true;
+                    }
+                }
+                tools::LinePatchOperation::AddFile { .. }
+                | tools::LinePatchOperation::DeleteFile { .. } => {}
+            }
+        }
+
+        if rewritten {
+            *input = serde_json::to_value(patch)
+                .map_err(|err| format!("failed to rewrite line-aware apply_patch input: {err}"))?;
+        }
+
+        Ok(())
+    }
+
+    fn require_latest_snapshot(
+        &self,
+        tools: &ToolRuntime,
+        path: &Path,
+        current_hashes: &mut HashMap<String, String>,
+    ) -> Result<String, String> {
+        let path_text = path.to_string_lossy();
+        let key = workspace_relative_key(tools, &path_text).ok_or_else(|| {
+            format!(
+                "read_file required before applying line-aware patch to {}",
+                path.display()
+            )
+        })?;
+        let snapshot = self.read_snapshots.get(&key).ok_or_else(|| {
+            format!("read_file required before applying line-aware patch to {key}")
+        })?;
+        if let Some(reason) = self.dirty_since_read.get(&key) {
+            return Err(format!(
+                "line-aware apply_patch for {key} requires a fresh read_file because this file changed after the last read ({reason}). Re-read the whole file, then retry with current line numbers and old text."
+            ));
+        }
+        let current_revision = self.path_revisions.get(&key).copied().unwrap_or_default();
+        if current_revision != snapshot.revision {
+            return Err(format!(
+                "line-aware apply_patch for {key} requires a fresh read_file because the path revision changed after {}. Re-read the whole file, then retry.",
+                snapshot.read_id
+            ));
+        }
+        let current_hash = if let Some(hash) = current_hashes.get(&key) {
+            hash.clone()
+        } else {
+            let result = tools
+                .read_file(path)
+                .map_err(|err| format!("failed to validate current hash for {key}: {err}"))?;
+            let hash = result
+                .metadata
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("read_file did not return sha256 metadata for {key}"))?
+                .to_string();
+            current_hashes.insert(key.clone(), hash.clone());
+            hash
+        };
+        if current_hash != snapshot.sha256 {
+            return Err(format!(
+                "line-aware apply_patch for {key} requires a fresh read_file because the current file hash changed since {} ({} old). Re-read the whole file, then retry with current line numbers and old text.",
+                snapshot.read_id,
+                snapshot.age_label()
+            ));
+        }
+
+        Ok(key)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LineInsertKind {
+    Before,
+    After,
+}
+
+fn split_lines_lossless_local(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            lines.push(text[start..=index].to_string());
+            start = index + ch.len_utf8();
+        }
+    }
+    if start < text.len() {
+        lines.push(text[start..].to_string());
+    }
+    lines
+}
+
+fn snapshot_lines_match(
+    lines: &[String],
+    start_line: usize,
+    end_line: usize,
+    expected_lines: &[String],
+) -> bool {
+    if expected_lines.is_empty() {
+        return start_line == end_line && start_line <= lines.len() + 1;
+    }
+    if start_line == 0 || end_line < start_line {
+        return false;
+    }
+    let start_index = start_line - 1;
+    let end_index = end_line;
+    start_index < lines.len()
+        && end_index <= lines.len()
+        && end_index - start_index == expected_lines.len()
+        && lines[start_index..end_index] == *expected_lines
+}
+
+fn snapshot_sequence_matches(
+    lines: &[String],
+    start_line: usize,
+    expected_lines: &[String],
+) -> bool {
+    if expected_lines.is_empty() || start_line == 0 {
+        return false;
+    }
+    let start_index = start_line - 1;
+    let end_index = start_index + expected_lines.len();
+    end_index <= lines.len() && lines[start_index..end_index] == *expected_lines
+}
+
+fn find_unique_sequence_nearby(
+    lines: &[String],
+    center_line: usize,
+    expected_lines: &[String],
+    window: usize,
+) -> Result<Option<usize>, Vec<usize>> {
+    if expected_lines.is_empty() {
+        return Ok(None);
+    }
+    let min_line = center_line.saturating_sub(window).max(1);
+    let max_line = (center_line + window).min(lines.len().saturating_sub(expected_lines.len()) + 1);
+    let mut candidates = Vec::new();
+    for line in min_line..=max_line {
+        if snapshot_sequence_matches(lines, line, expected_lines) {
+            candidates.push(line);
+        }
+    }
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.first().copied()),
+        _ => Err(candidates),
+    }
+}
+
+fn validate_or_relocate_update(
+    key: &str,
+    snapshot: &ReadSnapshot,
+    start_line: usize,
+    end_line: usize,
+    old: &str,
+) -> Result<(usize, usize), String> {
+    let old_lines = split_lines_lossless_local(old);
+    if old_lines.is_empty() {
+        if start_line == end_line && start_line <= snapshot.lines.len() + 1 {
+            return Ok((start_line, end_line));
+        }
+        return Err(format!(
+            "line-aware apply_patch for {key} has an empty old text insertion at invalid line {start_line}; use insert_before or insert_after with expected_line from read_file."
+        ));
+    }
+
+    if snapshot_lines_match(&snapshot.lines, start_line, end_line, &old_lines) {
+        return Ok((start_line, end_line));
+    }
+
+    if snapshot_sequence_matches(&snapshot.lines, start_line, &old_lines) {
+        return Ok((start_line, start_line + old_lines.len() - 1));
+    }
+
+    match find_unique_sequence_nearby(&snapshot.lines, start_line, &old_lines, 80) {
+        Ok(Some(candidate)) => Ok((candidate, candidate + old_lines.len() - 1)),
+        Ok(None) => Err(format!(
+            "line-aware apply_patch for {key} does not match the latest read snapshot at lines {start_line}..{end_line}, and the old text was not found uniquely within ±80 lines. Re-read the whole file and retry."
+        )),
+        Err(candidates) => Err(format!(
+            "line-aware apply_patch for {key} does not match lines {start_line}..{end_line}; the same old text appears multiple times nearby at lines {}. Re-read the whole file and use the exact target line.",
+            candidates
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn validate_or_relocate_insert(
+    key: &str,
+    snapshot: &ReadSnapshot,
+    line: usize,
+    expected_line: &str,
+    kind: LineInsertKind,
+) -> Result<usize, String> {
+    let expected_lines = split_lines_lossless_local(expected_line);
+    let operation = match kind {
+        LineInsertKind::Before => "insert_before",
+        LineInsertKind::After => "insert_after",
+    };
+    if expected_lines.len() > 1 {
+        return Err(format!(
+            "line-aware {operation} for {key} expected_line must contain exactly one line copied from read_file"
+        ));
+    }
+
+    match kind {
+        LineInsertKind::Before if line == snapshot.lines.len() + 1 && expected_line.is_empty() => {
+            return Ok(line);
+        }
+        LineInsertKind::After
+            if line == 0 && snapshot.lines.is_empty() && expected_line.is_empty() =>
+        {
+            return Ok(line);
+        }
+        LineInsertKind::Before if line == 0 => {
+            return Err(format!(
+                "line-aware insert_before for {key} line must be 1-based"
+            ));
+        }
+        LineInsertKind::After if line == 0 => {
+            return Err(format!(
+                "line-aware insert_after line 0 for {key} is only valid for an empty file"
+            ));
+        }
+        _ => {}
+    }
+
+    let Some(expected) = expected_lines.first() else {
+        return Err(format!(
+            "line-aware {operation} for {key} requires expected_line copied from read_file"
+        ));
+    };
+
+    if line >= 1
+        && line <= snapshot.lines.len()
+        && snapshot
+            .lines
+            .get(line - 1)
+            .is_some_and(|actual| actual == expected)
+    {
+        return Ok(line);
+    }
+
+    match find_unique_sequence_nearby(
+        &snapshot.lines,
+        line.max(1),
+        std::slice::from_ref(expected),
+        80,
+    ) {
+        Ok(Some(candidate)) => Ok(candidate),
+        Ok(None) => Err(format!(
+            "line-aware {operation} for {key} expected_line did not match line {line}, and the same line was not found uniquely within ±80 lines. Re-read the whole file and retry."
+        )),
+        Err(candidates) => Err(format!(
+            "line-aware {operation} for {key} expected_line did not match line {line}; the same line appears multiple times nearby at lines {}. Re-read the whole file and use the exact target line.",
+            candidates
+                .iter()
+                .map(|candidate| candidate.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -985,7 +1389,6 @@ fn run_local_tool_call<'a>(
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<LocalToolRunUpdate>> + Send + 'a>> {
     Box::pin(try_stream! {
     let display_call = hash_cache.model_visible_call(call);
-    let execution_call = hash_cache.execution_call(tools, call);
     let risk_flags = risk::classify(&display_call);
     let outside_path = get_outside_path(&display_call);
     let preview_input = permission_preview_input(tools, &display_call);
@@ -1106,7 +1509,6 @@ fn run_local_tool_call<'a>(
         });
     }
 
-    let stale_line_patch_error = hash_cache.stale_line_patch_reason(tools, &execution_call);
     let unlocked_tools;
     let execution_tools = if approved_unlocked_execution {
         unlocked_tools = tools.approved_outside_access();
@@ -1115,32 +1517,39 @@ fn run_local_tool_call<'a>(
         tools
     };
 
-    let result = if execution_call.name == ToolName::ReadBlob.as_str() {
-        read_blob_tool_result(&config, &execution_call.input)
-    } else if let Some(message) = stale_line_patch_error {
-        Err(ToolExecError::Harness(message))
-    } else {
-        let mut execution = execute_tool_call_with_progress(
-            session_id,
-            tool_call_id,
-            execution_tools,
-            &execution_call,
-            cancel.clone(),
-            config.tool_model_checkpoint_after,
-        );
-        let result = loop {
-            let Some(update) = execution.next().await else {
-                break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
-                    command: display_call.name.clone(),
-                }));
+    let (execution_call, result) = match hash_cache.execution_call(execution_tools, call) {
+        Ok(execution_call) => {
+            let result = if execution_call.name == ToolName::ReadBlob.as_str() {
+                read_blob_tool_result(config, &execution_call.input)
+            } else {
+                let mut execution = execute_tool_call_with_progress(
+                    session_id,
+                    tool_call_id,
+                    execution_tools,
+                    &execution_call,
+                    cancel.clone(),
+                    config.tool_model_checkpoint_after,
+                );
+                let result = loop {
+                    let Some(update) = execution.next().await else {
+                        break Err(ToolExecError::Runtime(tools::ToolError::CommandCancelled {
+                            command: display_call.name.clone(),
+                        }));
+                    };
+                    match update? {
+                        ToolExecutionUpdate::Event(event) => yield LocalToolRunUpdate::Event(event),
+                        ToolExecutionUpdate::Done(result) => break result,
+                    }
+                };
+                drop(execution);
+                result
             };
-            match update? {
-                ToolExecutionUpdate::Event(event) => yield LocalToolRunUpdate::Event(event),
-                ToolExecutionUpdate::Done(result) => break result,
-            }
-        };
-        drop(execution);
-        result
+            (execution_call, result)
+        }
+        Err(message) => (
+            display_call.clone(),
+            Err(ToolExecError::Harness(message)),
+        ),
     };
 
     match result {
@@ -1506,6 +1915,47 @@ fn attach_cached_hashes(
     }
 }
 
+fn attach_cached_read_provenance(
+    tools: &ToolRuntime,
+    input: &mut Value,
+    tool_name: &str,
+    snapshots_by_path: &HashMap<String, ReadSnapshot>,
+    path_revisions: &HashMap<String, u64>,
+) {
+    match tool_name {
+        "apply_patch" | "apply_patch_structured" => {
+            if let Some(operations) = input.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    let Some(object) = operation.as_object_mut() else {
+                        continue;
+                    };
+                    let path = object
+                        .get("path")
+                        .or_else(|| object.get("from"))
+                        .and_then(Value::as_str);
+                    let Some(path) = path else {
+                        continue;
+                    };
+                    let Some(key) = workspace_relative_key(tools, path) else {
+                        continue;
+                    };
+                    if let Some(snapshot) = snapshots_by_path.get(&key) {
+                        object.insert(
+                            "_read_id".to_string(),
+                            Value::String(snapshot.read_id.clone()),
+                        );
+                        object.insert("_read_revision".to_string(), json!(snapshot.revision));
+                    }
+                    if let Some(revision) = path_revisions.get(&key) {
+                        object.insert("_path_revision".to_string(), json!(revision));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn cached_hash_for_path(
     tools: &ToolRuntime,
     path: &str,
@@ -1524,6 +1974,68 @@ fn workspace_relative_key(tools: &ToolRuntime, path: &str) -> Option<String> {
     let canonical = absolute.canonicalize().ok()?;
     let relative = canonical.strip_prefix(tools.workspace_root()).ok()?;
     Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn looks_like_file_inspection_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains(" > ")
+        || lower.contains(">>")
+        || lower.contains("tee ")
+        || lower.contains("sed -i")
+        || lower.contains("perl -pi")
+        || lower.contains("rm ")
+        || lower.contains("mv ")
+        || lower.contains("cp ")
+    {
+        return false;
+    }
+
+    [
+        "cat ", "sed ", "nl ", "awk ", "grep ", "rg ", "head ", "tail ", "less ", "bat ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn bash_workspace_file_candidates(tools: &ToolRuntime, command: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for raw in command.split(|ch: char| ch.is_whitespace() || matches!(ch, '|' | ';' | ',')) {
+        let token = raw
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+                )
+            })
+            .trim();
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+        let token = strip_line_suffix(token);
+        if token.is_empty() {
+            continue;
+        }
+        let Some(key) = workspace_relative_key(tools, token) else {
+            continue;
+        };
+        let path = tools.workspace_root().join(&key);
+        if !path.is_file() || candidates.iter().any(|existing| existing == &key) {
+            continue;
+        }
+        candidates.push(key);
+    }
+    candidates
+}
+
+fn strip_line_suffix(token: &str) -> &str {
+    let Some((path, suffix)) = token.rsplit_once(':') else {
+        return token;
+    };
+    if !path.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        path
+    } else {
+        token
+    }
 }
 
 fn structured_patch_paths(input: &Value) -> Vec<String> {
@@ -1570,7 +2082,7 @@ fn is_line_aware_patch(input: &Value) -> bool {
                 operation
                     .get("op")
                     .and_then(Value::as_str)
-                    .is_some_and(|op| op == "update")
+                    .is_some_and(|op| matches!(op, "update" | "insert_before" | "insert_after"))
             })
         })
 }
@@ -1922,11 +2434,11 @@ fn diff_hunk_ranges(lines: &[GeneratedDiffLine], context: usize) -> Vec<(usize, 
         }
         let end = (last_change + context + 1).min(lines.len());
 
-        if let Some((_, previous_end)) = ranges.last_mut() {
-            if start <= *previous_end {
-                *previous_end = (*previous_end).max(end);
-                continue;
-            }
+        if let Some((_, previous_end)) = ranges.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+            continue;
         }
         ranges.push((start, end));
     }
@@ -2440,7 +2952,8 @@ Todo and question rules:
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
-- Use apply_patch for all file changes. For pure insertions, use insert_before or insert_after with an adjacent line from a recent read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from a recent full-file read_file result. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Use apply_patch for all file changes. Before editing an existing file, read the whole file with read_file and base every line number/old text/expected_line on that latest full-file snapshot. For pure insertions, use insert_before or insert_after with expected_line copied from that read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from that latest read. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- If apply_patch says read_file is required or a line/hash is stale, re-read the whole file once, recompute the patch from the fresh contents, and retry with one consolidated patch for that file.
 - When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
 - Run focused verification when practical.

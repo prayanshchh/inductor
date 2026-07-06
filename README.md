@@ -16,7 +16,7 @@ talks to providers like **Claude** (via the Claude Agent SDK) and **Codex**.
 Before running Inductor, make sure you have:
 
 - **Rust** (stable toolchain, edition 2024) — <https://rustup.rs>
-- **Bun** `>= 1.3` — <https://bun.sh> (runs the TUI frontend)
+- **Bun** `>= 1.3` — <https://bun.sh> (only needed when building from source or developing the TUI)
 - **Node.js + npm** — needed for the Claude provider's JS bridge
 - A logged-in provider:
   - **Claude**: a working [Claude Code](https://docs.anthropic.com/en/docs/claude-code) login
@@ -34,6 +34,19 @@ inductor auth detect
 
 ## Install
 
+### Download a release bundle
+
+Release bundles ship both executables side by side:
+
+- `inductor` — the Rust backend/CLI
+- `inductor-open-tui` — the self-contained OpenTUI frontend
+
+Unpack a release archive, keep both binaries in the same directory, and add
+that directory to your `PATH`. `inductor open-tui` will automatically launch
+the packaged frontend without requiring Bun.
+
+### Build from source
+
 Clone the repo and install dependencies:
 
 ```sh
@@ -43,12 +56,20 @@ cd inductor
 # JS/TUI dependencies (also wires up the Claude bridge via postinstall)
 bun install
 
-# Build the Rust binary (named `inductor`)
+# Build the Rust binary and self-contained OpenTUI frontend
 cargo build --release
+INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui
 ```
 
-The compiled binary lands at `target/release/inductor`. Add it to your `PATH`
-or install it:
+The compiled binaries land at `target/release/inductor` and
+`target/release/inductor-open-tui`. Keep them side by side if you want
+`inductor open-tui` to run without Bun. For a packaged archive, run:
+
+```sh
+bun run bundle:release
+```
+
+If you only want the Rust CLI on your `PATH`, you can still install it with:
 
 ```sh
 cargo install --path crates/agent
@@ -123,13 +144,26 @@ actions are gated and rendered consistently, regardless of provider.
   setting source for credentials.
 - **`inductor auth detect` shows `status: none`:** no provider login was found.
   Sign in to Claude Code or Codex, then retry.
-- **`OpenTUI dependencies are missing`:** run `bun install` from the repo root.
+- **`OpenTUI dependencies are missing`:** if you're running from a source checkout, run `bun install` from the repo root.
+- **`OpenTUI frontend is unavailable`:** either run `INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui` from the repo root or use a release archive that includes `inductor-open-tui` next to `inductor`.
 
 ---
 
 ## Development
 
 ```sh
+# One-time local hook setup
+bash scripts/setup-git-hooks.sh
+
+# Fast pre-commit gate
+bash scripts/checks/pre-commit.sh
+
+# Full pre-push / CI-equivalent gate
+bash scripts/checks/pre-push.sh
+
+# Build a distributable release bundle for the current platform
+bun run bundle:release
+
 # Run the TUI frontend directly during development
 bun run tui
 
@@ -140,3 +174,11 @@ bun run test:tui
 # Rust tests
 cargo test
 ```
+
+GitHub Actions lives under `.github/workflows/`:
+
+- `ci.yml` runs Rust formatting, strict clippy, Rust tests, TUI type-checks/tests, and startup smoke checks on Ubuntu and macOS.
+- `coverage.yml` records Rust and TUI coverage with default 70% line-coverage thresholds.
+- `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases on `v*` tags.
+
+To enforce these before merge, configure branch protection in GitHub so the CI and coverage jobs are required status checks.

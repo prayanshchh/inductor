@@ -524,10 +524,10 @@ impl PendingAssistantMessage {
             });
         }
         let call = &mut self.tool_calls[index];
-        if let Some(id) = id {
-            if !id.is_empty() {
-                call.provider_id = id.to_string();
-            }
+        if let Some(id) = id
+            && !id.is_empty()
+        {
+            call.provider_id = id.to_string();
         }
         call
     }
@@ -888,6 +888,7 @@ fn provider_event_is_visible(event: &SessionEvent) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_stream_decode_error(
     provider: &str,
     error: &reqwest::Error,

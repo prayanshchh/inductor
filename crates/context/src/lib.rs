@@ -6,23 +6,18 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelEffort {
     None,
     Minimal,
     Low,
+    #[default]
     Medium,
     High,
     #[serde(rename = "xhigh", alias = "x_high", alias = "x-high")]
     XHigh,
     Max,
-}
-
-impl Default for ModelEffort {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 impl ModelEffort {

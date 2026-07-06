@@ -146,6 +146,7 @@ pub trait ProviderPlugin: Send + Sync {
 
     async fn list_models(&self, auth: &ProviderAuth) -> anyhow::Result<Vec<ModelInfo>>;
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_turn(
         &self,
         auth: &ProviderAuth,

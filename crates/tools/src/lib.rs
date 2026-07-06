@@ -165,13 +165,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolName::ApplyPatch,
-            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Use insert_before/insert_after for pure insertions, update for replacing existing lines, add_file for new files, and delete_file for deletes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; insertions only need the adjacent line number and content. The tool will not search for ambiguous anchors. Multiple changes to the same file are applied against one original snapshot and written once.",
+            description: "Apply exact line-aware file changes in the workspace. Prefer this for all file writes. Use insert_before/insert_after for pure insertions, update for replacing existing lines, add_file for new files, and delete_file for deletes. Updates must include the exact 1-based inclusive start_line/end_line range plus the old text expected in that range; insertions must include the adjacent line number, exact expected_line copied from the latest file inspection, and content. The tool will not search for ambiguous anchors. Multiple changes to the same file are applied against one original snapshot and written once.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "operations": {
                         "type": "array",
-                        "description": "Line-aware patch operations. First call read_file to get the full current file and exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
+                        "description": "Line-aware patch operations. First inspect the full current file with read_file or an explicit bash command that names the file and gives exact line numbers. Use insert_before/insert_after instead of update whenever no existing lines are being replaced.",
                         "items": {
                             "oneOf": [
                                 {
@@ -193,9 +193,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                         "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
                                         "line": { "type": "integer", "description": "1-based line to insert before; use total_lines + 1 to append at EOF." },
                                         "content": { "type": "string", "description": "Text to insert. Include trailing newline when adding complete lines." },
-                                        "expected_line": { "type": "string", "description": "Optional exact current content of the target line, copied from read_file, to guard against stale line numbers." }
+                                        "expected_line": { "type": "string", "description": "Required exact current content of the target line, copied from the latest file inspection, to guard against stale line numbers. Use an empty string only when line is total_lines + 1 to append at EOF." }
                                     },
-                                    "required": ["op", "path", "line", "content"]
+                                    "required": ["op", "path", "line", "content", "expected_line"]
                                 },
                                 {
                                     "type": "object",
@@ -204,9 +204,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                         "path": { "type": "string", "description": "Workspace-relative or allowed absolute path" },
                                         "line": { "type": "integer", "description": "1-based existing line to insert after; use line 0 only to insert at the beginning of an empty file." },
                                         "content": { "type": "string", "description": "Text to insert. Include trailing newline when adding complete lines." },
-                                        "expected_line": { "type": "string", "description": "Optional exact current content of the target line, copied from read_file, to guard against stale line numbers." }
+                                        "expected_line": { "type": "string", "description": "Required exact current content of the target line, copied from the latest file inspection, to guard against stale line numbers. Use an empty string only when line is 0 for an empty file." }
                                     },
-                                    "required": ["op", "path", "line", "content"]
+                                    "required": ["op", "path", "line", "content", "expected_line"]
                                 },
                                 {
                                     "type": "object",
@@ -1343,7 +1343,24 @@ impl ToolRuntime {
                             ),
                         });
                     }
-                    if let Some(expected_line) = &insert.expected_line {
+                    let expected_line = insert.expected_line.as_ref().ok_or_else(|| {
+                        ToolError::InvalidPatch(format!(
+                            "line-aware insert_before for {} requires expected_line copied from read_file",
+                            display_path.display()
+                        ))
+                    })?;
+                    if index == original_len {
+                        if !expected_line.is_empty() {
+                            return Err(ToolError::PatchApplyFailed {
+                                path: path.to_path_buf(),
+                                message: format!(
+                                    "line-aware insert_before at EOF for {} requires expected_line to be empty; got {:?}",
+                                    display_path.display(),
+                                    expected_line
+                                ),
+                            });
+                        }
+                    } else {
                         validate_expected_adjacent_line(
                             path,
                             display_path,
@@ -1364,6 +1381,22 @@ impl ToolRuntime {
                                 display_path.display()
                             )));
                         }
+                        let expected_line = insert.expected_line.as_ref().ok_or_else(|| {
+                            ToolError::InvalidPatch(format!(
+                                "line-aware insert_after for {} requires expected_line copied from read_file",
+                                display_path.display()
+                            ))
+                        })?;
+                        if !expected_line.is_empty() {
+                            return Err(ToolError::PatchApplyFailed {
+                                path: path.to_path_buf(),
+                                message: format!(
+                                    "line-aware insert_after line 0 for {} requires expected_line to be empty; got {:?}",
+                                    display_path.display(),
+                                    expected_line
+                                ),
+                            });
+                        }
                         0
                     } else {
                         if insert.line > original_len {
@@ -1376,17 +1409,21 @@ impl ToolRuntime {
                             });
                         }
                         let actual_index = insert.line - 1;
-                        if let Some(expected_line) = &insert.expected_line {
-                            validate_expected_adjacent_line(
-                                path,
-                                display_path,
-                                &lines,
-                                actual_index,
-                                expected_line,
-                                newline,
-                                "insert_after",
-                            )?;
-                        }
+                        let expected_line = insert.expected_line.as_ref().ok_or_else(|| {
+                            ToolError::InvalidPatch(format!(
+                                "line-aware insert_after for {} requires expected_line copied from read_file",
+                                display_path.display()
+                            ))
+                        })?;
+                        validate_expected_adjacent_line(
+                            path,
+                            display_path,
+                            &lines,
+                            actual_index,
+                            expected_line,
+                            newline,
+                            "insert_after",
+                        )?;
                         insert.line
                     }
                 }
@@ -2269,21 +2306,21 @@ impl ToolRuntime {
         expected_hash: Option<&str>,
     ) -> Result<TextFile, ToolError> {
         let bytes = fs::read(path).map_err(|err| ToolError::io(path, err))?;
-        if bytes.iter().any(|byte| *byte == 0) {
+        if bytes.contains(&0) {
             return Err(ToolError::BinaryFile {
                 path: path.to_path_buf(),
             });
         }
 
         let actual_hash = sha256_hex(&bytes);
-        if let Some(expected_hash) = expected_hash.filter(|hash| !hash.trim().is_empty()) {
-            if !hashes_equal(expected_hash, &actual_hash) {
-                return Err(ToolError::StaleFile {
-                    path: path.to_path_buf(),
-                    expected_hash: expected_hash.to_string(),
-                    actual_hash,
-                });
-            }
+        if let Some(expected_hash) = expected_hash.filter(|hash| !hash.trim().is_empty())
+            && !hashes_equal(expected_hash, &actual_hash)
+        {
+            return Err(ToolError::StaleFile {
+                path: path.to_path_buf(),
+                expected_hash: expected_hash.to_string(),
+                actual_hash,
+            });
         }
 
         let text = String::from_utf8(bytes).map_err(|_| ToolError::BinaryFile {
@@ -3542,7 +3579,7 @@ mod tests {
         let _ = fs::remove_file(&escape_target);
 
         let result = runtime
-            .bash(&format!("echo nope > {}", escape_target.display()))
+            .bash(format!("echo nope > {}", escape_target.display()))
             .unwrap();
 
         assert_ne!(result.exit_code, Some(0));
@@ -4105,7 +4142,7 @@ mod tests {
                 path: PathBuf::from("file.txt"),
                 line: 3,
                 content: "three\n".to_string(),
-                expected_line: None,
+                expected_line: Some(String::new()),
                 expected_hash: None,
             }],
         };
@@ -4116,6 +4153,25 @@ mod tests {
             fs::read_to_string(temp.path().join("file.txt")).unwrap(),
             "one\ntwo\nthree\n"
         );
+    }
+
+    #[test]
+    fn line_patch_insert_before_requires_expected_line() {
+        let temp = TempDir::new("line-patch-insert-before-needs-expected");
+        fs::write(temp.path().join("file.txt"), "one\ntwo\n").unwrap();
+        let runtime = ToolRuntime::new(temp.path()).unwrap();
+        let patch = LinePatch {
+            operations: vec![LinePatchOperation::InsertBefore {
+                path: PathBuf::from("file.txt"),
+                line: 2,
+                content: "inserted\n".to_string(),
+                expected_line: None,
+                expected_hash: None,
+            }],
+        };
+
+        let error = runtime.apply_line_patch(&patch).unwrap_err().to_string();
+        assert!(error.contains("requires expected_line"));
     }
 
     #[test]

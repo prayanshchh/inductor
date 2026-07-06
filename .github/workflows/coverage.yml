@@ -1,0 +1,55 @@
+name: Coverage
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_COVERAGE_THRESHOLD: "70"
+  TUI_COVERAGE_THRESHOLD: "70"
+
+jobs:
+  rust-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Rust coverage
+        run: bash scripts/checks/rust-coverage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: coverage/rust-summary.txt
+          if-no-files-found: error
+
+  tui-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+      - name: TUI coverage
+        run: bash scripts/checks/tui-coverage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-coverage
+          path: coverage/tui-coverage.txt
+          if-no-files-found: error

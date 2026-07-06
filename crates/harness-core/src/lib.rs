@@ -11,6 +11,12 @@ impl WorkspaceId {
     }
 }
 
+impl Default for WorkspaceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for WorkspaceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -31,6 +37,12 @@ pub struct SessionId(pub Ulid);
 impl SessionId {
     pub fn new() -> Self {
         Self(Ulid::new())
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -57,6 +69,12 @@ impl ToolCallId {
     }
 }
 
+impl Default for ToolCallId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for ToolCallId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -77,6 +95,12 @@ pub struct PermissionRequestId(pub Ulid);
 impl PermissionRequestId {
     pub fn new() -> Self {
         Self(Ulid::new())
+    }
+}
+
+impl Default for PermissionRequestId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -236,12 +260,13 @@ pub struct QuestionResponse {
 }
 
 /// When the harness should pause a tool call for human approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
     /// Never ask; auto-approve everything.
     Never,
     /// Ask only when the risk classifier flags the action.
+    #[default]
     OnRequest,
     /// Ask before any tool that changes state (writes, edits, patches, bash);
     /// read-only tools (read_file, grep) run without asking.
@@ -250,12 +275,6 @@ pub enum ApprovalPolicy {
     OnFailure,
     /// Ask before every tool call.
     Always,
-}
-
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self::OnRequest
-    }
 }
 
 /// A reason a tool call was flagged as risky.

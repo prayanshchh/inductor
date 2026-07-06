@@ -74,10 +74,14 @@ impl CodexProvider {
                 specific unknown; once resolved, stop rereading dependency internals and patch the app code. \
                 Once you have a concrete cause, do not restate it in another progress message; apply the fix, \
                 run verification, or report a blocker. \
-                For file edits, use apply_patch line-aware operations. For pure insertions, use \
-                insert_before or insert_after with an adjacent line from a recent read_file result. \
-                For replacing existing lines, use exact path, 1-based inclusive start_line/end_line, \
-                old text, and new text from a recent read_file result; do not use anchor-only patches."),
+                For file edits, use apply_patch line-aware operations. Before editing an existing file, \
+                establish a fresh full-file view with read_file or an explicit bash inspection command that names the file, \
+                then base every line number, old text, and expected_line on that latest file view. For pure insertions, \
+                use insert_before or insert_after with expected_line copied from the adjacent current line. For replacing \
+                existing lines, use exact path, 1-based inclusive start_line/end_line, old text, and new text from the \
+                latest file view; do not use anchor-only patches. Plan all related changes for one file and apply them \
+                in one consolidated patch when practical before moving to the next file. If apply_patch reports stale \
+                lines or read_file required, re-inspect the whole file once and retry with one consolidated patch for that file."),
             "input": input,
             "tools": codex_tools(),
             "tool_choice": "auto",
@@ -521,6 +525,7 @@ fn provider_event_is_visible(event: &SessionEvent) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_stream_decode_error(
     provider: &str,
     error: &reqwest::Error,
@@ -716,7 +721,7 @@ fn parse_response_stream_event_detail(
                         .unwrap_or_else(|| json!({}));
                     parsed.events.push(SessionEvent::ToolCallRequested {
                         session_id,
-                        tool_call_id: tool_call_id.clone(),
+                        tool_call_id,
                         name: name.to_string(),
                         input_json: input,
                     });
@@ -1216,7 +1221,7 @@ data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_06
         let output = function_call_output_item(
             &pending,
             ProviderToolResponse {
-                tool_call_id: pending.tool_call_id.clone(),
+                tool_call_id: pending.tool_call_id,
                 output: "file contents".to_string(),
                 is_error: false,
             },
@@ -1237,7 +1242,7 @@ data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_06
         let output = function_call_output_item(
             &pending,
             ProviderToolResponse {
-                tool_call_id: pending.tool_call_id.clone(),
+                tool_call_id: pending.tool_call_id,
                 output: "not found".to_string(),
                 is_error: true,
             },

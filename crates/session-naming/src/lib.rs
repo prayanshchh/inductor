@@ -210,7 +210,7 @@ fn limit_words(name: &str, max_words: usize) -> String {
         .take(max_words)
         .collect::<Vec<_>>()
         .join(" ")
-        .trim_end_matches(|c: char| c == ',' || c == '.' || c == ':' || c == ';')
+        .trim_end_matches([',', '.', ':', ';'])
         .to_string()
 }
 
