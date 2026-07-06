@@ -955,10 +955,11 @@ impl ToolHashCache {
             return;
         }
 
-        if call.name == ToolName::Bash.as_str() && result.exit_code == Some(0) {
-            if let Some(command) = call.input.get("command").and_then(Value::as_str) {
-                self.record_bash_read_snapshots(tools, command);
-            }
+        if call.name == ToolName::Bash.as_str()
+            && result.exit_code == Some(0)
+            && let Some(command) = call.input.get("command").and_then(Value::as_str)
+        {
+            self.record_bash_read_snapshots(tools, command);
         }
 
         for path in tool_target_paths(call) {

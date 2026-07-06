@@ -2104,7 +2104,7 @@ async fn run_harness_command(
         &state.transcript,
         &submitted_prompt.visible_prompt,
     )
-        .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?;
 
     if should_silently_name
         && let Some(event) = silently_name_session_and_worktree(
@@ -2317,13 +2317,9 @@ async fn run_harness_command(
     }
 
     if submitted_prompt.model_prompt != submitted_prompt.visible_prompt
-        && let Some(message) = state
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|message| {
-                message.role == Role::User && message.content == submitted_prompt.model_prompt
-            })
+        && let Some(message) = state.transcript.iter_mut().rev().find(|message| {
+            message.role == Role::User && message.content == submitted_prompt.model_prompt
+        })
     {
         message.content = submitted_prompt.visible_prompt.clone();
     }
@@ -2526,9 +2522,7 @@ fn resume_visible_prompt(prompt: &str) -> Option<String> {
     if trimmed == RESUME_PROMPT_MARKER {
         return Some("/resume".to_string());
     }
-    let Some(payload) = trimmed.strip_prefix(&format!("{RESUME_PROMPT_MARKER}:")) else {
-        return None;
-    };
+    let payload = trimmed.strip_prefix(&format!("{RESUME_PROMPT_MARKER}:"))?;
     let visible = serde_json::from_str::<ResumePromptPayload>(payload)
         .ok()
         .and_then(|payload| payload.visible_prompt)
@@ -2563,16 +2557,17 @@ fn is_resume_command(prompt: &str) -> bool {
 
 fn resume_model_prompt(db: &WorkspaceDb, session_id: SessionId) -> Result<String, String> {
     let events = db.events(session_id).map_err(|err| err.to_string())?;
-    let latest_user_event = events
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, event)| match event {
-            SessionEvent::UserMessage { text, .. } if !is_resume_command(text) => {
-                Some((index, text.trim().to_string()))
-            }
-            _ => None,
-        });
+    let latest_user_event =
+        events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match event {
+                SessionEvent::UserMessage { text, .. } if !is_resume_command(text) => {
+                    Some((index, text.trim().to_string()))
+                }
+                _ => None,
+            });
     let (latest_index, latest_prompt) = if let Some(found) = latest_user_event {
         found
     } else {
@@ -4087,7 +4082,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(submitted.visible_prompt, "/resume");
-        assert!(submitted.model_prompt.contains("fix the binary distribution build"));
+        assert!(
+            submitted
+                .model_prompt
+                .contains("fix the binary distribution build")
+        );
         assert!(submitted.model_prompt.contains("tool_call"));
         assert!(submitted.model_prompt.contains("read_file"));
         assert!(submitted.model_prompt.contains("README contents"));
@@ -4135,7 +4134,11 @@ mod tests {
         let submitted = prepare_submitted_prompt(&db, session_id, "/resume").unwrap();
 
         assert_eq!(submitted.visible_prompt, "/resume");
-        assert!(submitted.model_prompt.contains("finish binary distribution"));
+        assert!(
+            submitted
+                .model_prompt
+                .contains("finish binary distribution")
+        );
         assert!(submitted.model_prompt.contains("truncated resume context"));
         assert!(submitted.model_prompt.len() < 32 * 1024);
 

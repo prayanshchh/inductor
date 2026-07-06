@@ -489,7 +489,10 @@ fn copilot_part_is_empty_text(part: &Value) -> bool {
 }
 
 fn copilot_tools(tool_names: &[String]) -> Value {
-    let allowed = tool_names.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+    let allowed = tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
     Value::Array(
         tools::tool_definitions()
             .into_iter()
