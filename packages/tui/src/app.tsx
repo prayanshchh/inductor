@@ -61,6 +61,7 @@ type AgentSlot = {
   provider: string
   model: string
   effort: EffortValue
+  modelFamilyEnabled: boolean
   modelFamily: ModelFamily
   activeModelRole?: ModelRole
   devMode: DevMode
@@ -75,7 +76,7 @@ type AgentSlot = {
 type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[]; modelRole?: ModelRole; orchestrationRound?: number }
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout>; queued: QueuedPrompt[]; activeQueued?: QueuedPrompt; steering?: QueuedPrompt }
 type PaletteKind = "commands" | "models" | "model_family" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "model_family" | "new" | "permissions" | "pr" | "review" | "sessions" | "skills"
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "model_family" | "new" | "permissions" | "pr" | "resume" | "review" | "sessions" | "skills"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
 type ModelFamilyChoice = { role: ModelRole; setting: "model" | "effort"; provider?: string; model?: string; effort?: EffortValue; label: string; description: string }
@@ -94,6 +95,7 @@ type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
 const RECOVERED_RESTART_MARKER = "Recovered after Inductor restarted"
+const RESUME_PROMPT_MARKER = "__INDUCTOR_RESUME__"
 
 const theme = {
   bg: "transparent",
@@ -145,6 +147,7 @@ const commands: Command[] = [
   { name: "/new", description: "New session", action: "new" },
   { name: "/permissions", description: "Switch agent permissions", action: "permissions" },
   { name: "/pr", description: "Create pull request", action: "pr" },
+  { name: "/resume", description: "Resume latest interrupted prompt", action: "resume" },
   { name: "/review", description: "Review changes", action: "review" },
   { name: "/sessions", description: "Open sessions", action: "sessions" },
   { name: "/skill", description: "Create a reusable skill", action: "skills" },
@@ -224,6 +227,28 @@ function savePromptHistoryFile(filePath: string, entries: string[]) {
   }
 }
 
+type ModelFamilyPreference = { enabled: boolean; family: ModelFamily }
+
+function loadModelFamilyPreference(filePath: string, fallback: ModelFamily): ModelFamilyPreference {
+  try {
+    if (!existsSync(filePath)) return { enabled: false, family: cloneModelFamily(fallback) }
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Partial<ModelFamilyPreference>
+    if (typeof parsed.enabled !== "boolean" || !isModelFamily(parsed.family)) return { enabled: false, family: cloneModelFamily(fallback) }
+    return { enabled: parsed.enabled, family: cloneModelFamily(parsed.family) }
+  } catch {
+    return { enabled: false, family: cloneModelFamily(fallback) }
+  }
+}
+
+function saveModelFamilyPreference(filePath: string, preference: ModelFamilyPreference) {
+  try {
+    mkdirSync(path.dirname(filePath), { recursive: true })
+    writeFileSync(filePath, JSON.stringify({ enabled: preference.enabled, family: preference.family }, null, 2))
+  } catch {
+    // model-family persistence is best-effort; ignore write failures
+  }
+}
+
 function defaultModelFamily(provider: string, model?: string, effort: EffortValue = "medium"): ModelFamily {
   const primaryModel = model ?? defaultModel(provider)
   return {
@@ -239,6 +264,19 @@ function cloneModelFamily(family: ModelFamily): ModelFamily {
     executor: { ...family.executor },
     reviewer: { ...family.reviewer },
   }
+}
+
+function isModelFamily(value: unknown): value is ModelFamily {
+  if (!value || typeof value !== "object") return false
+  const family = value as Record<ModelRole, Partial<ModelRoleConfig> | undefined>
+  return modelFamilyWizardRoles.every((role) => {
+    const cfg = family[role]
+    return Boolean(cfg && typeof cfg.provider === "string" && typeof cfg.model === "string" && isEffortValue(cfg.effort))
+  })
+}
+
+function isEffortValue(value: unknown): value is EffortValue {
+  return value === "none" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultracode"
 }
 
 function coerceFamilyEffort(effort: EffortValue): EffortValue {
@@ -260,6 +298,10 @@ export function App(props: AppProps) {
   let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
   const startedAt = Date.now()
+  const modelFamilyPreferencePath = path.join(props.workspace, ".inductor", "model-family.json")
+  const loadedModelFamilyPreference = loadModelFamilyPreference(modelFamilyPreferencePath, defaultModelFamily(props.provider, props.model, "medium"))
+  let defaultModelFamilySelection = cloneModelFamily(loadedModelFamilyPreference.family)
+  let defaultModelFamilyEnabled = loadedModelFamilyPreference.enabled
 
   // Each concurrent agent is a slot: its own session id, worktree, provider/
   // model, and AppState transcript. `runs`/`runFlags` hold the live subprocess
@@ -276,7 +318,8 @@ export function App(props: AppProps) {
       provider: init.provider ?? props.provider,
       model: init.model ?? props.model ?? defaultModel(props.provider),
       effort: init.effort ?? "medium",
-      modelFamily: init.modelFamily ? cloneModelFamily(init.modelFamily) : defaultModelFamily(init.provider ?? props.provider, init.model ?? props.model, init.effort ?? "medium"),
+      modelFamilyEnabled: init.modelFamilyEnabled ?? defaultModelFamilyEnabled,
+      modelFamily: init.modelFamily ? cloneModelFamily(init.modelFamily) : cloneModelFamily(defaultModelFamilySelection),
       activeModelRole: init.activeModelRole,
       devMode: init.devMode ?? "worktree",
       approval: init.approval ?? props.approval,
@@ -331,17 +374,26 @@ export function App(props: AppProps) {
   const provider = () => focusedAgent().provider
   const setProvider = (value: string) => {
     const current = focusedAgent()
-    patchFocused({ provider: value, modelFamily: defaultModelFamily(value, current.model, current.effort) })
+    defaultModelFamilyEnabled = false
+    saveModelFamilyPreference(modelFamilyPreferencePath, { enabled: false, family: defaultModelFamilySelection })
+    patchFocused({
+      provider: value,
+      modelFamilyEnabled: false,
+      activeModelRole: undefined,
+      modelFamily: defaultModelFamily(value, current.model, current.effort),
+    })
   }
   const model = () => focusedAgent().model
   const setModel = (value: string) => {
-    const current = focusedAgent()
-    patchFocused({ model: value, modelFamily: { ...current.modelFamily, reasoning: { ...current.modelFamily.reasoning, model: value }, reviewer: { ...current.modelFamily.reviewer, model: value } } })
+    defaultModelFamilyEnabled = false
+    saveModelFamilyPreference(modelFamilyPreferencePath, { enabled: false, family: defaultModelFamilySelection })
+    patchFocused({ model: value, modelFamilyEnabled: false, activeModelRole: undefined })
   }
   const mode = () => focusedAgent().effort
   const setMode = (value: EffortValue) => {
-    const current = focusedAgent()
-    patchFocused({ effort: value, modelFamily: { ...current.modelFamily, reasoning: { ...current.modelFamily.reasoning, effort: value } } })
+    defaultModelFamilyEnabled = false
+    saveModelFamilyPreference(modelFamilyPreferencePath, { enabled: false, family: defaultModelFamilySelection })
+    patchFocused({ effort: value, modelFamilyEnabled: false, activeModelRole: undefined })
   }
   const devMode = () => focusedAgent().devMode
   const approval = () => focusedAgent().approval
@@ -351,8 +403,12 @@ export function App(props: AppProps) {
   const agent = () => focusedAgent().role
   const setAgent = (value: string) => patchFocused({ role: value })
   const sessionId = () => focusedAgent().sessionId
-  const activeModelRole = () => focusedAgent().activeModelRole ?? "reasoning"
-  const activeRoleConfig = () => focusedAgent().modelFamily[activeModelRole()]
+  const activeModelRole = () => focusedAgent().modelFamilyEnabled ? (focusedAgent().activeModelRole ?? "reasoning") : "reasoning"
+  const activeRoleConfig = () => {
+    const current = focusedAgent()
+    if (!current.modelFamilyEnabled) return { provider: current.provider, model: current.model, effort: current.effort }
+    return current.modelFamily[activeModelRole()]
+  }
   // The worktree (and its branch) is created on the first prompt, so derive the
   // branch from the matched worktree once it exists; until then the session has
   // no worktree of its own yet.
@@ -716,9 +772,11 @@ export function App(props: AppProps) {
 
     setNotice(undefined)
     updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
-    const runRole = queued.modelRole ?? "reasoning"
-    const runConfig = agentSlot.modelFamily[runRole]
-    patchAgent(key, { activeModelRole: runRole })
+    const runRole = agentSlot.modelFamilyEnabled ? (queued.modelRole ?? "reasoning") : "reasoning"
+    const runConfig = agentSlot.modelFamilyEnabled
+      ? agentSlot.modelFamily[runRole]
+      : { provider: agentSlot.provider, model: agentSlot.model, effort: agentSlot.effort }
+    patchAgent(key, { activeModelRole: agentSlot.modelFamilyEnabled ? runRole : undefined })
     const run = startBackendTurn(queued.prompt, {
       ...props,
       provider: runConfig.provider,
@@ -727,7 +785,7 @@ export function App(props: AppProps) {
       workspaceOnly: agentSlot.workspaceOnly,
       sessionId: agentSlot.sessionId,
       effort: backendEffort(runConfig.effort),
-      modelRole: runRole,
+      modelRole: agentSlot.modelFamilyEnabled ? runRole : undefined,
       mode: agentSlot.devMode,
       appDb: props.appDb,
       // Reuse the worktree once the session owns one; the backend creates it on
@@ -791,15 +849,15 @@ export function App(props: AppProps) {
           }
           return
         }
-        patchAgent(key, { activeModelRole: undefined })
-        updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
         void refreshWorktrees()
-        const followup = orchestrationFollowup(queued)
+        const followup = orchestrationFollowup(key, queued)
         if (followup) {
           setNotice({ text: `Starting ${roleLabel(followup.modelRole ?? "reasoning").toLowerCase()} role...`, tone: "cyan" })
           startTurn(key, followup)
           return
         }
+        patchAgent(key, { activeModelRole: undefined })
+        updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
         const nextPrompt = flags.queued.find((prompt) => !prompt.active)
         if (nextPrompt) {
           setNotice(undefined)
@@ -810,13 +868,17 @@ export function App(props: AppProps) {
     runs.set(key, run)
   }
 
-  function orchestrationFollowup(queued: QueuedPrompt): QueuedPrompt | undefined {
+  function orchestrationFollowup(key: string, queued: QueuedPrompt): QueuedPrompt | undefined {
+    const slot = store.agents[agentIndex(key)]
+    if (!slot?.modelFamilyEnabled) return undefined
     const round = queued.orchestrationRound ?? 0
-    if (round > 0) return undefined
     if (queued.modelRole === "reasoning") {
+      if (round > 0 && !reasoningRequestsAnotherExecutorCycle(fstate().transcript)) {
+        return undefined
+      }
       return {
         visiblePrompt: "executor: implement reasoning plan",
-        prompt: "You are now the executor role. Implement the reasoning model's latest plan from the transcript exactly. Use tools to inspect, edit, and verify. Do not redesign; report blockers or completion.",
+        prompt: "You are now the executor role. Implement the reasoning model's latest plan from the transcript exactly. Use tools to inspect, edit, and verify. Do not redesign. When the requested executor work is complete or blocked, report concrete tool results and what changed.",
         skills: queued.skills,
         modelRole: "executor",
         orchestrationRound: round,
@@ -825,7 +887,7 @@ export function App(props: AppProps) {
     if (queued.modelRole === "executor") {
       return {
         visiblePrompt: "reviewer: review executor work",
-        prompt: "You are now the reviewer role. Review the executor's work from this session for correctness, missed requirements, regressions, and safety. Do not edit files or call tools. Return findings only.",
+        prompt: "You are now the reviewer role. Review the executor's work from this session for correctness, missed requirements, regressions, and safety. Do not edit files or call tools. Return findings only, and clearly say whether the reasoning model should continue with another executor cycle or accept the work as complete.",
         skills: queued.skills,
         modelRole: "reviewer",
         orchestrationRound: round,
@@ -834,7 +896,7 @@ export function App(props: AppProps) {
     if (queued.modelRole === "reviewer") {
       return {
         visiblePrompt: "reasoning: evaluate reviewer feedback",
-        prompt: "You are now the reasoning role. Evaluate the reviewer feedback. You may accept or disagree with it. If valid, decide the next exact executor diff/actions; if no further work is needed, give the final user-facing summary.",
+        prompt: "You are now the reasoning role. Evaluate the reviewer feedback and control the model-family loop. If the original user task is not fully complete, produce the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`. If reviewer feedback is invalid, you may disagree, but still decide whether another executor cycle is needed. Only when you are satisfied that the task is fully complete should you give the final user-facing summary and end with `ORCHESTRATION_DECISION: complete`.",
         skills: queued.skills,
         modelRole: "reasoning",
         orchestrationRound: round + 1,
@@ -843,46 +905,47 @@ export function App(props: AppProps) {
     return undefined
   }
 
-  function resumePromptFromUserPrompt(prompt: string, state: AppState) {
+  function reasoningRequestsAnotherExecutorCycle(transcript: TranscriptItem[]) {
+    const latest = latestAssistantText(transcript).toLowerCase()
+    if (!latest) return false
+    if (/\borchestration_decision\s*:\s*complete\b/.test(latest)) return false
+    if (/\borchestration_decision\s*:\s*continue\b/.test(latest)) return true
+    if (/\btask_complete\s*:\s*true\b/.test(latest)) return false
+    if (/\btask_complete\s*:\s*false\b/.test(latest)) return true
+    // Backstop for older prompts or models that did not emit the explicit
+    // control line: if the reasoning pass says the review is valid and gives
+    // next executor actions, keep the loop moving instead of stopping.
+    return (
+      latest.includes("next executor action") ||
+      latest.includes("next executor step") ||
+      latest.includes("next exact executor") ||
+      (latest.includes("reviewer feedback is valid") && latest.includes("incomplete"))
+    )
+  }
+
+  function latestAssistantText(transcript: TranscriptItem[]) {
+    for (let index = transcript.length - 1; index >= 0; index -= 1) {
+      const item = transcript[index]
+      if (item.kind === "assistant") return item.text.trim()
+    }
+    return ""
+  }
+
+  function resumePromptFromUserPrompt(prompt: string, _state: AppState) {
     if (!isResumePrompt(prompt)) return undefined
-    const latest = latestUserPromptFromState(state)
-    if (!latest) return undefined
-    return resumeInstruction(latest)
+    return resumeBackendPrompt(prompt)
   }
 
   function isResumePrompt(prompt: string) {
-    return /^(?:inductor\s+)?resume(?:\s+(?:please|this|it|that|thing|thingy))?[\s.!?]*$/i.test(prompt.trim())
+    return /^(?:\/|(?:inductor\s+)?)resume(?:\s+(?:please|this|it|that|thing|thingy))?[\s.!?]*$/i.test(prompt.trim())
   }
 
-  function latestUserPromptFromState(state: AppState) {
-    for (let index = state.transcript.length - 1; index >= 0; index -= 1) {
-      const item = state.transcript[index]
-      if (item.kind !== "user") continue
-      if (isResumePrompt(item.text)) continue
-      return item.text.trim()
-    }
-    return undefined
-  }
-
-  function resumeInstruction(latestPrompt: string) {
-    return [
-      "Resume the user's most recent substantive request below.",
-      "Do not treat the word \"resume\" as the task. Continue the interrupted work using the existing transcript and current workspace state.",
-      "Avoid repeating completed work; inspect current files/status if needed, then keep making progress.",
-      "",
-      "Latest request to resume:",
-      latestPrompt,
-    ].join("\n")
+  function resumeBackendPrompt(visiblePrompt: string) {
+    return `${RESUME_PROMPT_MARKER}:${JSON.stringify({ visible_prompt: visiblePrompt })}`
   }
 
   function autoResumeInstruction(latestPrompt: string) {
-    return [
-      "Inductor restarted before the previous run could finish. Resume the interrupted request below now.",
-      "Continue from the existing transcript and current workspace state. Avoid repeating completed work; inspect current files/status if needed, then keep making progress.",
-      "",
-      "Latest interrupted request:",
-      latestPrompt,
-    ].join("\n")
+    return resumeBackendPrompt(latestPrompt)
   }
 
   function focusedAgentSessionMatches(key: string, sessionId: string) {
@@ -993,7 +1056,8 @@ export function App(props: AppProps) {
 
   function openPalette(kind: PaletteKind) {
     if (kind === "model_family") {
-      setModelFamilyWizard({ roleIndex: 0, step: "model", family: cloneModelFamily(focusedAgent().modelFamily) })
+      const current = focusedAgent()
+      setModelFamilyWizard({ roleIndex: 0, step: "model", family: cloneModelFamily(current.modelFamilyEnabled ? current.modelFamily : defaultModelFamilySelection) })
       setNotice({ text: `${roleLabel(modelFamilyWizardRoles[0])} model`, tone: "cyan" })
     } else {
       setModelFamilyWizard(undefined)
@@ -1033,7 +1097,17 @@ export function App(props: AppProps) {
       const nextRoleIndex = wizard.roleIndex + 1
       const nextRole = modelFamilyWizardRoles[nextRoleIndex]
       if (!nextRole) {
-        patchFocused({ modelFamily: nextFamily })
+        defaultModelFamilySelection = cloneModelFamily(nextFamily)
+        defaultModelFamilyEnabled = true
+        saveModelFamilyPreference(modelFamilyPreferencePath, { enabled: true, family: defaultModelFamilySelection })
+        patchFocused({
+          modelFamilyEnabled: true,
+          modelFamily: nextFamily,
+          activeModelRole: undefined,
+          provider: nextFamily.reasoning.provider,
+          model: nextFamily.reasoning.model,
+          effort: nextFamily.reasoning.effort,
+        })
         setNotice({ text: "model family configured", tone: "muted" })
         setModelFamilyWizard(undefined)
         closePalette()
@@ -1046,6 +1120,22 @@ export function App(props: AppProps) {
     }
   }
 
+  function acceptSingleModelChoice(choice: ModelChoice) {
+    const nextEffort = coerceEffortForModel(mode(), choice)
+    defaultModelFamilyEnabled = false
+    saveModelFamilyPreference(modelFamilyPreferencePath, { enabled: false, family: defaultModelFamilySelection })
+    patchFocused({
+      provider: choice.provider,
+      model: choice.model,
+      effort: nextEffort,
+      modelFamilyEnabled: false,
+      activeModelRole: undefined,
+      modelFamily: defaultModelFamily(choice.provider, choice.model, nextEffort),
+    })
+    setNotice({ text: `model family off · using ${choice.label}`, tone: "muted" })
+    closePalette()
+  }
+
   function acceptPalette(insertDirectory = false) {
     const item = paletteItems()[selected()]
     if (!item) return
@@ -1054,11 +1144,7 @@ export function App(props: AppProps) {
       return
     }
     if (palette() === "models") {
-      const choice = item as ModelChoice
-      setProvider(choice.provider)
-      setModel(choice.model)
-      setMode(coerceEffortForModel(mode(), choice))
-      closePalette()
+      acceptSingleModelChoice(item as ModelChoice)
       return
     }
     if (palette() === "model_family") {
@@ -1105,11 +1191,7 @@ export function App(props: AppProps) {
       return
     }
     if (palette() === "models") {
-      const choice = item as ModelChoice
-      setProvider(choice.provider)
-      setModel(choice.model)
-      setMode(coerceEffortForModel(mode(), choice))
-      closePalette()
+      acceptSingleModelChoice(item as ModelChoice)
       return
     }
     if (palette() === "model_family") {
@@ -1436,6 +1518,13 @@ export function App(props: AppProps) {
       startPullRequestFlow()
       return
     }
+    if (command.action === "resume") {
+      closePalette()
+      input.setText("/resume")
+      setDraft("/resume")
+      submit()
+      return
+    }
     if (command.action === "review") {
       input.setText("review current changes")
       setDraft("review current changes")
@@ -1582,7 +1671,7 @@ export function App(props: AppProps) {
       queueMicrotask(() => input?.focus())
       return
     }
-    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamilyEnabled: base.modelFamilyEnabled, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
     setStore("agents", (agents) => [...agents, slot])
     setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
@@ -1622,7 +1711,7 @@ export function App(props: AppProps) {
     const remaining = store.agents.filter((a) => a.key !== key)
     if (remaining.length === 0) {
       const base = store.agents.find((a) => a.key === key) ?? store.agents[0]
-      const fresh = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+      const fresh = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamilyEnabled: base.modelFamilyEnabled, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
       setStore({ agents: [fresh], focusedKey: fresh.key })
       setExpanded(new Set<string>())
       queueMicrotask(() => input?.focus())
@@ -2026,7 +2115,7 @@ export function App(props: AppProps) {
       <box width="100%" height="100%" backgroundColor={theme.bg} flexDirection="column" border borderStyle="rounded" borderColor={theme.border}>
         <TopRail
           mode={activeRoleConfig().effort}
-          agent={activeModelRole()}
+          agent={focusedAgent().modelFamilyEnabled ? activeModelRole() : agent()}
           provider={activeRoleConfig().provider}
           model={activeRoleConfig().model}
           title={fstate().title}
@@ -2440,8 +2529,10 @@ function DraftSessionRow(props: {
 }) {
   const s = () => props.slot.state
   const statusColor = () => s().pendingPermission ? theme.orange : s().running ? theme.green : theme.dim
-  const activeRole = () => props.slot.activeModelRole ?? "reasoning"
-  const activeConfig = () => props.slot.modelFamily[activeRole()]
+  const activeRole = () => props.slot.modelFamilyEnabled ? (props.slot.activeModelRole ?? "reasoning") : "agent"
+  const activeConfig = () => props.slot.modelFamilyEnabled
+    ? props.slot.modelFamily[props.slot.activeModelRole ?? "reasoning"]
+    : { provider: props.slot.provider, model: props.slot.model, effort: props.slot.effort }
   return (
     <box
       width="100%"
@@ -3952,7 +4043,7 @@ function diffFromTool(item: Extract<TranscriptItem, { kind: "tool" }>) {
 function diffFromPatchOperation(operation: unknown) {
   if (!operation || typeof operation !== "object") return undefined
   const op = operation as Record<string, unknown>
-  const type = stringField(op, ["type"])
+  const type = operationKind(op)
   if (type === "rename") {
     const from = stringField(op, ["from"])
     const to = stringField(op, ["to"])
@@ -3970,9 +4061,42 @@ function diffFromPatchOperation(operation: unknown) {
       .filter((diff): diff is string => Boolean(diff))
     return diffs.length > 0 ? diffs.join("\n") : undefined
   }
+  const operationDiff = diffFromStructuredPatchOperation(path, op)
+  if (operationDiff) return operationDiff
   const oldText = stringField(op, ["old", "old_text", "before"])
   const newText = stringField(op, ["new", "new_text", "content", "after"])
   return oldText || newText ? createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "") : undefined
+}
+
+function diffFromStructuredPatchOperation(path: string, op: Record<string, unknown>) {
+  const type = operationKind(op)
+  if (type === "insert_before" || type === "insert_after") {
+    const content = stringField(op, ["content", "new"]) ?? ""
+    const expectedLine = stringField(op, ["expected_line"])
+    if (!expectedLine) return createUnifiedPatchFromContent(path, "", content)
+    const context = ensureTrailingNewline(expectedLine)
+    const inserted = ensureTrailingNewline(content)
+    return createUnifiedPatchFromContent(
+      path,
+      context,
+      type === "insert_before" ? `${inserted}${context}` : `${context}${inserted}`,
+    )
+  }
+  if (type === "add_file") {
+    return createUnifiedPatchFromContent(path, "", stringField(op, ["content", "new"]) ?? "")
+  }
+  if (type === "delete_file") {
+    return createUnifiedPatchFromContent(path, stringField(op, ["old", "content"]) ?? "", "")
+  }
+  return undefined
+}
+
+function operationKind(record: Record<string, unknown>) {
+  return stringField(record, ["op", "type"])
+}
+
+function ensureTrailingNewline(value: string) {
+  return value.endsWith("\n") ? value : `${value}\n`
 }
 
 function editsArray(value: Record<string, unknown> | undefined) {

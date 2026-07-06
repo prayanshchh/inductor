@@ -184,8 +184,7 @@ cargo test
 GitHub Actions lives under `.github/workflows/`:
 
 - `ci.yml` runs Rust formatting, strict clippy, Rust tests, TUI type-checks/tests, and startup smoke checks on Ubuntu and macOS.
-- `coverage.yml` records Rust and TUI coverage with default 70% line-coverage thresholds.
-- `release.yml` builds tar.gz bundles containing the CLI as `inductor` plus the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases on `v*` tags. Current release artifacts target Apple Silicon macOS only.
-- `scripts/install.sh` downloads the latest GitHub Release, verifies the checksum, and installs `inductor` plus `inductor-open-tui` on Apple Silicon macOS.
+- `coverage.yml` records Rust coverage with a 66% line-coverage threshold and TUI coverage with a 70% line-coverage threshold.
+- `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases on `v*` tags.
 
 To enforce these before merge, configure branch protection in GitHub so the CI and coverage jobs are required status checks.

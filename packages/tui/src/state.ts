@@ -604,7 +604,7 @@ function structuredPatchFilesFromInput(record: Record<string, unknown>): Modifie
   for (const operation of operations) {
     if (!operation || typeof operation !== "object") continue
     const op = operation as Record<string, unknown>
-    const type = stringField(op, "type")
+    const type = operationKind(op)
     if (type === "rename") {
       const from = stringField(op, "from")
       const to = stringField(op, "to")
@@ -623,11 +623,47 @@ function structuredPatchFilesFromInput(record: Record<string, unknown>): Modifie
       files.push(modifiedFileFromDiff(path, diff || undefined))
       continue
     }
+    const operationDiff = diffFromStructuredPatchOperation(path, op)
+    if (operationDiff) {
+      files.push(modifiedFileFromDiff(path, operationDiff))
+      continue
+    }
     const oldText = stringField(op, "old") ?? stringField(op, "old_text") ?? stringField(op, "before")
     const newText = stringField(op, "new") ?? stringField(op, "new_text") ?? stringField(op, "content") ?? stringField(op, "after")
     files.push(modifiedFileFromDiff(path, createUnifiedPatchFromContent(path, oldText ?? "", newText ?? "")))
   }
   return files
+}
+
+function diffFromStructuredPatchOperation(path: string, op: Record<string, unknown>) {
+  const type = operationKind(op)
+  if (type === "insert_before" || type === "insert_after") {
+    const content = stringField(op, "content") ?? stringField(op, "new") ?? ""
+    const expectedLine = stringField(op, "expected_line")
+    if (!expectedLine) return createUnifiedPatchFromContent(path, "", content)
+    const context = ensureTrailingNewline(expectedLine)
+    const inserted = ensureTrailingNewline(content)
+    return createUnifiedPatchFromContent(
+      path,
+      context,
+      type === "insert_before" ? `${inserted}${context}` : `${context}${inserted}`,
+    )
+  }
+  if (type === "add_file") {
+    return createUnifiedPatchFromContent(path, "", stringField(op, "content") ?? stringField(op, "new") ?? "")
+  }
+  if (type === "delete_file") {
+    return createUnifiedPatchFromContent(path, stringField(op, "old") ?? stringField(op, "content") ?? "", "")
+  }
+  return undefined
+}
+
+function operationKind(record: Record<string, unknown>) {
+  return stringField(record, "op") ?? stringField(record, "type")
+}
+
+function ensureTrailingNewline(value: string) {
+  return value.endsWith("\n") ? value : `${value}\n`
 }
 
 function editsArray(record: Record<string, unknown>) {

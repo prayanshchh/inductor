@@ -280,7 +280,14 @@ fn prompt_composer_orders_configured_and_plugin_layers() {
 
     assert_eq!(
         layers.iter().map(|layer| layer.name).collect::<Vec<_>>(),
-        vec!["base", "model-role", "environment", "configured", "plugin", "effort"]
+        vec![
+            "base",
+            "model-role",
+            "environment",
+            "configured",
+            "plugin",
+            "effort"
+        ]
     );
 
     let composed = PromptComposer::compose(
@@ -953,8 +960,8 @@ async fn loop_uses_cached_read_hash_instead_of_model_expected_hash() {
 }
 
 #[tokio::test]
-async fn loop_requires_fresh_read_before_line_patch_after_same_file_write() {
-    let temp = TempDir::new("loop-line-patch-fresh-read-required");
+async fn loop_refreshes_line_snapshot_after_same_file_write() {
+    let temp = TempDir::new("loop-line-patch-refreshes-snapshot");
     fs::write(temp.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
     let runtime = ToolRuntime::new(temp.path()).unwrap();
 
@@ -986,13 +993,13 @@ async fn loop_requires_fresh_read_before_line_patch_after_same_file_write() {
 
     assert_eq!(
         fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
-        "one\nTWO\nthree\n"
+        "one\nTWO\nTHREE\n"
     );
-    assert!(events.iter().any(|event| matches!(
+    assert!(!events.iter().any(|event| matches!(
         event,
         SessionEvent::ToolCallError { message, .. }
             if message.contains("read_file required before applying line-aware patch")
-                && message.contains("hello.txt")
+                || message.contains("requires a fresh read_file")
     )));
 }
 
@@ -1125,6 +1132,49 @@ async fn loop_relocates_unique_stale_line_patch_against_latest_snapshot() {
 }
 
 #[tokio::test]
+async fn loop_relocates_unique_stale_line_patch_without_copied_trailing_newline() {
+    let temp = TempDir::new("loop-line-patch-relocates-stale-line-no-newline");
+    fs::write(temp.path().join("hello.txt"), "one\ntarget\nthree\nfour\n").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\"}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"update\",\"path\":\"hello.txt\",\"start_line\":4,\"end_line\":4,\"old\":\"target\",\"new\":\"TARGET\\n\"}]}}</inductor_tool_call>",
+        "Done.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "edit hello.txt".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
+    ))
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "one\nTARGET\nthree\nfour\n"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallError { message, .. }
+            if message.contains("does not match")
+                || message.contains("read_file required")
+    )));
+}
+
+#[tokio::test]
 async fn loop_relocates_unique_insert_expected_line_against_latest_snapshot() {
     let temp = TempDir::new("loop-line-patch-relocates-insert-line");
     fs::write(temp.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
@@ -1163,6 +1213,49 @@ async fn loop_relocates_unique_insert_expected_line_against_latest_snapshot() {
         event,
         SessionEvent::ToolCallResult { output, .. }
             if output.contains("applied 1 line-aware patch operation")
+    )));
+}
+
+#[tokio::test]
+async fn loop_relocates_insert_expected_line_without_copied_trailing_newline() {
+    let temp = TempDir::new("loop-line-patch-relocates-insert-line-no-newline");
+    fs::write(temp.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
+    let runtime = ToolRuntime::new(temp.path()).unwrap();
+
+    let provider = ScriptedProvider::new([
+        "<inductor_tool_call>{\"name\":\"read_file\",\"input\":{\"path\":\"hello.txt\"}}</inductor_tool_call>",
+        "<inductor_tool_call>{\"name\":\"apply_patch\",\"input\":{\"operations\":[{\"op\":\"insert_after\",\"path\":\"hello.txt\",\"line\":3,\"expected_line\":\"two\",\"content\":\"inserted\\n\"}]}}</inductor_tool_call>",
+        "Done.",
+    ]);
+    let auth = test_auth();
+    let mut state = SessionState::new(SessionId::new());
+    let mut allow = AllowStore::new();
+
+    let events = collect_events(run_turn(
+        &provider,
+        &auth,
+        &runtime,
+        &AutoApprove,
+        &mut allow,
+        &mut state,
+        "edit hello.txt".to_string(),
+        HarnessConfig::new("test-model"),
+        CancellationToken::new(),
+        provider_core::empty_permission_responses(),
+        provider_core::empty_question_responses(),
+        provider_core::empty_question_requests(),
+    ))
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("hello.txt")).unwrap(),
+        "one\ntwo\ninserted\nthree\n"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        SessionEvent::ToolCallError { message, .. }
+            if message.contains("expected_line did not match")
+                || message.contains("read_file required")
     )));
 }
 

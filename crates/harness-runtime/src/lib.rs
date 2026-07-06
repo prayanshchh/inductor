@@ -116,9 +116,9 @@ Available tools and their JSON schemas:\n{}\n\n\
 Rules:\n\
 - Paths may be workspace-relative or absolute unless the user has enabled workspace-only mode.\n\
 - If the user prompt is just \"resume\" or asks to resume, treat it as a request to continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.\n\
-- Use apply_patch for all file changes. Before editing an existing file, establish a fresh full-file view with read_file or an explicit bash inspection command that names the file, then base every line number/old text/expected_line on that latest file view. For pure insertions, use insert_before or insert_after with expected_line copied from the adjacent current line instead of inventing an update range. For replacing existing lines, provide exact path, 1-based inclusive start_line/end_line, old text, and new text from the latest file view. Do not use anchor-only patches.\n\
+- Use apply_patch for all file changes. Before editing an existing file, establish a fresh full-file view with read_file or an explicit bash inspection command that names the file, then base every line number/old text/expected_line on that latest file view. For pure insertions, use insert_before or insert_after with expected_line copied from the adjacent current line instead of inventing an update range. For replacing existing lines, provide exact path, 1-based inclusive start_line/end_line, old text, and new text from the latest file view. Do not use anchor-only patches. If a file needs more than one change, put every operation for that file in one apply_patch operations array; do not emit multiple apply_patch calls for the same file in the same turn.\n\
 - If apply_patch says read_file is required or a line/hash is stale, re-inspect the whole file once, recompute all remaining changes for that file, and retry with one consolidated patch for that file.\n\
-- Batch edits per file: think through all related changes for the current file, apply them in one larger patch when practical, then move to the next file. Avoid multiple tiny edits to the same file in short intervals.\n\
+- Batch edits per file: think through all related changes for the current file, combine those edits into a single apply_patch call for that file, then move to the next file. Do not split same-file edits across separate apply_patch calls.\n\
 - Do not use hidden legacy write_file, edit_file, or multi_edit unless explicitly asked by the user.\n\
 - read_file returns the whole file; prefer one full read per relevant file instead of repeated ranged reads or sed chunks. Use grep with focused regex patterns to locate files, then read the full file before editing.\n\
 - When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.\n\
@@ -829,7 +829,10 @@ impl ProviderRequestPreparer {
             prompt: prepared_context.prompt,
             system_prompt: Some(system_preamble),
             messages: request_messages(&prepared_context.messages, input.turn_images.clone()),
-            tool_names: advertised_tool_names_for_role(input.config.model_role, &input.config.hooks),
+            tool_names: advertised_tool_names_for_role(
+                input.config.model_role,
+                &input.config.hooks,
+            ),
             metadata: request_metadata(input.config, input.round),
             images: input.turn_images,
         };
@@ -952,10 +955,11 @@ impl ToolHashCache {
             return;
         }
 
-        if call.name == ToolName::Bash.as_str() && result.exit_code == Some(0) {
-            if let Some(command) = call.input.get("command").and_then(Value::as_str) {
-                self.record_bash_read_snapshots(tools, command);
-            }
+        if call.name == ToolName::Bash.as_str()
+            && result.exit_code == Some(0)
+            && let Some(command) = call.input.get("command").and_then(Value::as_str)
+        {
+            self.record_bash_read_snapshots(tools, command);
         }
 
         for path in tool_target_paths(call) {
@@ -1008,7 +1012,15 @@ impl ToolHashCache {
         self.read_snapshots.remove(&key);
         *self.path_revisions.entry(key.clone()).or_default() += 1;
         self.dirty_since_read
-            .insert(key, "previous tool write".to_string());
+            .insert(key.clone(), "previous tool write".to_string());
+
+        let Ok(result) = tools.read_file(&key) else {
+            return;
+        };
+        let Some(hash) = result.metadata.get("sha256").and_then(Value::as_str) else {
+            return;
+        };
+        self.record_read_snapshot(&key, hash, &result.output);
     }
 
     fn validate_and_rewrite_line_patch(
@@ -1194,6 +1206,23 @@ fn split_lines_lossless_local(text: &str) -> Vec<String> {
     lines
 }
 
+fn line_without_trailing_newline(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn snapshot_line_matches(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || line_without_trailing_newline(actual) == line_without_trailing_newline(expected)
+}
+
+fn snapshot_line_sequence_matches(actual_lines: &[String], expected_lines: &[String]) -> bool {
+    actual_lines.len() == expected_lines.len()
+        && actual_lines
+            .iter()
+            .zip(expected_lines)
+            .all(|(actual, expected)| snapshot_line_matches(actual, expected))
+}
+
 fn snapshot_lines_match(
     lines: &[String],
     start_line: usize,
@@ -1211,7 +1240,7 @@ fn snapshot_lines_match(
     start_index < lines.len()
         && end_index <= lines.len()
         && end_index - start_index == expected_lines.len()
-        && lines[start_index..end_index] == *expected_lines
+        && snapshot_line_sequence_matches(&lines[start_index..end_index], expected_lines)
 }
 
 fn snapshot_sequence_matches(
@@ -1224,7 +1253,8 @@ fn snapshot_sequence_matches(
     }
     let start_index = start_line - 1;
     let end_index = start_index + expected_lines.len();
-    end_index <= lines.len() && lines[start_index..end_index] == *expected_lines
+    end_index <= lines.len()
+        && snapshot_line_sequence_matches(&lines[start_index..end_index], expected_lines)
 }
 
 fn find_unique_sequence_nearby(
@@ -1343,7 +1373,7 @@ fn validate_or_relocate_insert(
         && snapshot
             .lines
             .get(line - 1)
-            .is_some_and(|actual| actual == expected)
+            .is_some_and(|actual| snapshot_line_matches(actual, expected))
     {
         return Ok(line);
     }
@@ -2955,7 +2985,7 @@ Working rules:
 - Continue after tool results until the task is complete, blocked, or clearly needs user input.
 - If the user prompt is just \"resume\" or asks to resume, continue the most recent substantive user request from the transcript; do not treat the word \"resume\" as the task.
 - Use precise edits for existing files and run focused verification when practical.
-- Batch edits per file: plan all related changes, apply them in one patch when practical, then move to the next file.
+- Batch edits per file: plan all related changes for the current file, combine them into one apply_patch call for that file, then move to the next file. Do not split same-file edits across separate apply_patch calls.
 - Final responses should state the outcome and any verification performed without extra preamble.
 
 Todo and question rules:
@@ -2965,7 +2995,7 @@ Todo and question rules:
 - Update or replace todos when the user's next prompt changes the plan; clear stale todos if there is no remaining work.
 - Ask the user instead of guessing on important or ambiguous feature, architecture, product, UX, data-loss, security, or other choice points.
 - Use the `ask_questions` tool for such choices. Include options with one-line descriptions, pros, cons, and a recommended option; the user can still choose a custom answer.
-- Use apply_patch for all file changes. Before editing an existing file, read the whole file with read_file and base every line number/old text/expected_line on that latest full-file snapshot. For pure insertions, use insert_before or insert_after with expected_line copied from that read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from that latest read. Use add_file operations for new files. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
+- Use apply_patch for all file changes. Before editing an existing file, read the whole file with read_file and base every line number/old text/expected_line on that latest full-file snapshot. For pure insertions, use insert_before or insert_after with expected_line copied from that read_file result. For replacing existing lines, provide exact path, inclusive 1-based start_line/end_line, old text, and new text from that latest read. Use add_file operations for new files. If a file needs more than one change, put every operation for that file in one apply_patch operations array; do not emit multiple apply_patch calls for the same file in the same turn. Avoid hidden legacy write_file, edit_file, and multi_edit unless explicitly asked by the user.
 - If apply_patch says read_file is required or a line/hash is stale, re-read the whole file once, recompute the patch from the fresh contents, and retry with one consolidated patch for that file.
 - When you need several independent read-only inspections, request those tool calls in the same turn instead of one at a time.
 - If repo memory is available, use read_memory to recall durable repo context and write_memory to update concise, stable learnings that should carry to future sessions/worktrees. Do not store secrets in memory.
@@ -3037,9 +3067,9 @@ struct PromptLayer {
 
 fn model_role_prompt(role: ModelRole) -> String {
     match role {
-        ModelRole::Reasoning => "Model role: reasoning. You are the frontier reasoning model. Decide the complete diff and the next exact executor actions. Do not call tools or edit files directly; instead produce a concise implementation plan/instructions for the executor. After reviewer feedback, decide whether it is valid; you may explicitly disagree and continue with your own plan.".to_string(),
+        ModelRole::Reasoning => "Model role: reasoning. You are the frontier reasoning model. Decide the complete diff and the next exact executor actions. Do not call tools or edit files directly; instead produce a concise implementation plan/instructions for the executor. After reviewer feedback, you control the model-family loop: if the original user task is not fully complete, provide the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`; only when you are satisfied that review plus reasoning show the task is complete should you give the final summary and end with `ORCHESTRATION_DECISION: complete`. You may explicitly disagree with invalid reviewer feedback, but still decide whether another executor cycle is needed.".to_string(),
         ModelRole::Executor => "Model role: executor. You are the lower-cost executor. Do not redesign the solution. Follow the reasoning model's instructions as faithfully as possible, use tools correctly to inspect/edit/run commands, report concrete tool results, and ask for updated reasoning instructions when blocked or when the requested diff is complete.".to_string(),
-        ModelRole::Reviewer => "Model role: reviewer. You are the frontier reviewer. Review the executor's work for correctness, regressions, safety, and missed requirements. Do not call tools and do not fix code. Return only review findings and whether the reasoning model should accept them or continue.".to_string(),
+        ModelRole::Reviewer => "Model role: reviewer. You are the frontier reviewer. Review the executor's work for correctness, regressions, safety, and missed requirements. Do not call tools and do not fix code. Return only review findings and whether the reasoning model should accept the work as complete or continue with another executor cycle.".to_string(),
     }
 }
 

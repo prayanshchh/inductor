@@ -168,9 +168,10 @@ impl ModelMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
+    #[default]
     Reasoning,
     Executor,
     Reviewer,
@@ -183,12 +184,6 @@ impl ModelRole {
             Self::Executor => "executor",
             Self::Reviewer => "reviewer",
         }
-    }
-}
-
-impl Default for ModelRole {
-    fn default() -> Self {
-        Self::Reasoning
     }
 }
 
