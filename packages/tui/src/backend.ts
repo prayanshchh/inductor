@@ -38,6 +38,9 @@ export type SessionEvent = {
   branch_name?: string | null
   questions?: QuestionItem[]
   answers?: QuestionAnswer[]
+  role?: ModelRole
+  model?: string
+  effort?: string
 }
 
 export type QuestionOption = {
@@ -60,6 +63,7 @@ export type QuestionAnswer = {
 }
 
 export type DevMode = "in-place" | "worktree"
+export type ModelRole = "reasoning" | "executor" | "reviewer"
 
 export type BackendOptions = {
   backendBin: string
@@ -68,6 +72,7 @@ export type BackendOptions = {
   model?: string
   sessionId?: string
   effort?: string
+  modelRole?: ModelRole
   approval: string
   repoRoot: string
   appDb?: string
@@ -192,6 +197,9 @@ export function startBackendTurn(prompt: string, options: BackendOptions, callba
   }
   if (options.effort) {
     cmd.push("--effort", options.effort)
+  }
+  if (options.modelRole) {
+    cmd.push("--model-role", options.modelRole)
   }
   if (options.mode) {
     cmd.push("--mode", options.mode)

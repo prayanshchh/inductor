@@ -20,7 +20,7 @@ import {
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type SkillInfo, type Worktree } from "./backend"
+import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type ModelRole, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type SkillInfo, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -49,6 +49,8 @@ export type AppProps = BackendOptions & {
 }
 
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
+type ModelRoleConfig = { provider: string; model: string; effort: EffortValue }
+type ModelFamily = Record<ModelRole, ModelRoleConfig>
 
 /** One concurrent agent: its session, worktree, provider/model and transcript. */
 type AgentSlot = {
@@ -59,6 +61,8 @@ type AgentSlot = {
   provider: string
   model: string
   effort: EffortValue
+  modelFamily: ModelFamily
+  activeModelRole?: ModelRole
   devMode: DevMode
   approval: string
   workspaceOnly: boolean
@@ -68,18 +72,20 @@ type AgentSlot = {
 }
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
-type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[] }
+type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[]; modelRole?: ModelRole; orchestrationRound?: number }
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout>; queued: QueuedPrompt[]; activeQueued?: QueuedPrompt; steering?: QueuedPrompt }
-type PaletteKind = "commands" | "models" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
-type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "new" | "permissions" | "pr" | "review" | "sessions" | "skills"
+type PaletteKind = "commands" | "models" | "model_family" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
+type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "model_family" | "new" | "permissions" | "pr" | "review" | "sessions" | "skills"
 type Command = { name: string; description: string; action: CommandAction }
 type ModelChoice = { provider: string; model: string; label: string; group: string; effortName: string; efforts: EffortValue[]; effortLabels?: Partial<Record<EffortValue, string>> }
+type ModelFamilyChoice = { role: ModelRole; setting: "model" | "effort"; provider?: string; model?: string; effort?: EffortValue; label: string; description: string }
+type ModelFamilyWizard = { roleIndex: number; step: "model" | "effort"; family: ModelFamily }
 type ConnectChoice = { provider: string; label: string; description: string }
 type EffortChoice = { name: string; label: string; description: string; value: EffortValue }
 type AgentChoice = { name: string; description: string }
 type PermissionChoice = { name: string; label: string; description: string; approval: string; workspaceOnly: boolean }
 type SkillChoice = SkillInfo & { label: string }
-type PaletteItem = Command | ModelChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | SkillChoice | FileChoice
+type PaletteItem = Command | ModelChoice | ModelFamilyChoice | ConnectChoice | EffortChoice | AgentChoice | PermissionChoice | SkillChoice | FileChoice
 type SkillMentionState = { triggerStart: number; token: string; query: string }
 type SkillCreateFlow = { step: "name" | "description" | "body"; name: string; description: string }
 type StopIntent = "interrupt" | "exit"
@@ -135,6 +141,7 @@ const commands: Command[] = [
   { name: "/fast", description: "Switch reasoning effort", action: "mode" },
   { name: "/help", description: "Show shortcuts", action: "help" },
   { name: "/model", description: "Switch model", action: "model" },
+  { name: "/model_family", description: "Configure reasoning/executor/reviewer models", action: "model_family" },
   { name: "/new", description: "New session", action: "new" },
   { name: "/permissions", description: "Switch agent permissions", action: "permissions" },
   { name: "/pr", description: "Create pull request", action: "pr" },
@@ -217,6 +224,36 @@ function savePromptHistoryFile(filePath: string, entries: string[]) {
   }
 }
 
+function defaultModelFamily(provider: string, model?: string, effort: EffortValue = "medium"): ModelFamily {
+  const primaryModel = model ?? defaultModel(provider)
+  return {
+    reasoning: { provider, model: primaryModel, effort: coerceFamilyEffort("high") },
+    executor: { provider, model: defaultExecutorModel(provider), effort: coerceFamilyEffort("low") },
+    reviewer: { provider, model: primaryModel, effort: coerceFamilyEffort(effort) },
+  }
+}
+
+function cloneModelFamily(family: ModelFamily): ModelFamily {
+  return {
+    reasoning: { ...family.reasoning },
+    executor: { ...family.executor },
+    reviewer: { ...family.reviewer },
+  }
+}
+
+function coerceFamilyEffort(effort: EffortValue): EffortValue {
+  return effort === "ultracode" ? "max" : effort
+}
+
+function defaultExecutorModel(provider: string) {
+  if (provider === "codex") return "gpt-5.4-mini"
+  if (provider === "claude") return "haiku"
+  if (provider === "copilot") return "o4-mini"
+  return defaultModel(provider)
+}
+
+const modelFamilyWizardRoles: readonly ModelRole[] = ["reasoning", "executor", "reviewer"]
+
 export function App(props: AppProps) {
   let input!: TextareaRenderable
   let replacingPrompt = false
@@ -239,6 +276,8 @@ export function App(props: AppProps) {
       provider: init.provider ?? props.provider,
       model: init.model ?? props.model ?? defaultModel(props.provider),
       effort: init.effort ?? "medium",
+      modelFamily: init.modelFamily ? cloneModelFamily(init.modelFamily) : defaultModelFamily(init.provider ?? props.provider, init.model ?? props.model, init.effort ?? "medium"),
+      activeModelRole: init.activeModelRole,
       devMode: init.devMode ?? "worktree",
       approval: init.approval ?? props.approval,
       workspaceOnly: init.workspaceOnly ?? Boolean(props.workspaceOnly),
@@ -290,11 +329,20 @@ export function App(props: AppProps) {
   // Composer settings are views of the focused slot, so existing call sites
   // (provider(), setModel(x), ...) keep working while each agent owns its own.
   const provider = () => focusedAgent().provider
-  const setProvider = (value: string) => patchFocused({ provider: value })
+  const setProvider = (value: string) => {
+    const current = focusedAgent()
+    patchFocused({ provider: value, modelFamily: defaultModelFamily(value, current.model, current.effort) })
+  }
   const model = () => focusedAgent().model
-  const setModel = (value: string) => patchFocused({ model: value })
+  const setModel = (value: string) => {
+    const current = focusedAgent()
+    patchFocused({ model: value, modelFamily: { ...current.modelFamily, reasoning: { ...current.modelFamily.reasoning, model: value }, reviewer: { ...current.modelFamily.reviewer, model: value } } })
+  }
   const mode = () => focusedAgent().effort
-  const setMode = (value: EffortValue) => patchFocused({ effort: value })
+  const setMode = (value: EffortValue) => {
+    const current = focusedAgent()
+    patchFocused({ effort: value, modelFamily: { ...current.modelFamily, reasoning: { ...current.modelFamily.reasoning, effort: value } } })
+  }
   const devMode = () => focusedAgent().devMode
   const approval = () => focusedAgent().approval
   const setApproval = (value: string) => patchFocused({ approval: value })
@@ -303,6 +351,8 @@ export function App(props: AppProps) {
   const agent = () => focusedAgent().role
   const setAgent = (value: string) => patchFocused({ role: value })
   const sessionId = () => focusedAgent().sessionId
+  const activeModelRole = () => focusedAgent().activeModelRole ?? "reasoning"
+  const activeRoleConfig = () => focusedAgent().modelFamily[activeModelRole()]
   // The worktree (and its branch) is created on the first prompt, so derive the
   // branch from the matched worktree once it exists; until then the session has
   // no worktree of its own yet.
@@ -330,6 +380,7 @@ export function App(props: AppProps) {
   const [promptHistory, setPromptHistory] = createSignal<PromptHistoryState>({ entries: loadPromptHistoryFile(promptHistoryPath), draft: "" })
   const [palette, setPalette] = createSignal<PaletteKind>()
   const [selected, setSelected] = createSignal(0)
+  const [modelFamilyWizard, setModelFamilyWizard] = createSignal<ModelFamilyWizard>()
   const [mention, setMention] = createSignal<MentionState>()
   const [skillMention, setSkillMention] = createSignal<SkillMentionState>()
   const [pasteCount, setPasteCount] = createSignal(0)
@@ -432,11 +483,40 @@ export function App(props: AppProps) {
       .filter((skill) => !selected.has(skill.name) || skill.name.toLowerCase().includes(query))
       .filter((skill) => skill.name.toLowerCase().includes(query) || skill.description.toLowerCase().includes(query) || skill.source.toLowerCase().includes(query))
   })
+  const modelFamilyItems = createMemo<ModelFamilyChoice[]>(() => {
+    modelCatalogVersion()
+    const wizard = modelFamilyWizard()
+    const role = wizard ? modelFamilyWizardRoles[wizard.roleIndex] : undefined
+    if (!wizard || !role) return []
+    const cfg = wizard.family[role]
+    if (wizard.step === "model") {
+      return modelChoices.map((choice) => ({
+        role,
+        setting: "model" as const,
+        provider: choice.provider,
+        model: choice.model,
+        label: choice.label,
+        description: `Set ${roleLabel(role)} model`,
+      }))
+    }
+    const choice = selectedModelChoice(cfg.provider, cfg.model)
+    return effortChoices(choice).map((effort) => ({
+      role,
+      setting: "effort" as const,
+      effort: effort.value,
+      label: effort.label,
+      description: `Set ${roleLabel(role)} effort for ${providerLabel(cfg.provider)} ${shortModel(cfg.model)}`,
+    }))
+  })
+
   const paletteItems = createMemo(() => {
     if (palette() === "files") return fileItems()
     if (palette() === "models") {
       modelCatalogVersion()
       return modelChoices
+    }
+    if (palette() === "model_family") {
+      return modelFamilyItems()
     }
     if (palette() === "connect") return connectChoices
     if (palette() === "agents") return agentChoices
@@ -558,7 +638,7 @@ export function App(props: AppProps) {
 
     const key = store.focusedKey
     const backendPrompt = resumePromptFromUserPrompt(visiblePrompt, fstate()) ?? prompt
-    const queued = { visiblePrompt, prompt: backendPrompt, skills: uniqueStrings([...activeSkills(), ...promptSkills]) }
+    const queued = { visiblePrompt, prompt: backendPrompt, skills: uniqueStrings([...activeSkills(), ...promptSkills]), modelRole: "reasoning" as ModelRole }
     const running = fstate().running || runs.has(key)
     if (running) {
       if (steer) replaceCurrentRun(key, queued)
@@ -636,14 +716,18 @@ export function App(props: AppProps) {
 
     setNotice(undefined)
     updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
+    const runRole = queued.modelRole ?? "reasoning"
+    const runConfig = agentSlot.modelFamily[runRole]
+    patchAgent(key, { activeModelRole: runRole })
     const run = startBackendTurn(queued.prompt, {
       ...props,
-      provider: agentSlot.provider,
-      model: agentSlot.model,
+      provider: runConfig.provider,
+      model: runConfig.model,
       approval: agentSlot.approval,
       workspaceOnly: agentSlot.workspaceOnly,
       sessionId: agentSlot.sessionId,
-      effort: backendEffort(agentSlot.effort),
+      effort: backendEffort(runConfig.effort),
+      modelRole: runRole,
       mode: agentSlot.devMode,
       appDb: props.appDb,
       // Reuse the worktree once the session owns one; the backend creates it on
@@ -707,8 +791,15 @@ export function App(props: AppProps) {
           }
           return
         }
+        patchAgent(key, { activeModelRole: undefined })
         updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))
         void refreshWorktrees()
+        const followup = orchestrationFollowup(queued)
+        if (followup) {
+          setNotice({ text: `Starting ${roleLabel(followup.modelRole ?? "reasoning").toLowerCase()} role...`, tone: "cyan" })
+          startTurn(key, followup)
+          return
+        }
         const nextPrompt = flags.queued.find((prompt) => !prompt.active)
         if (nextPrompt) {
           setNotice(undefined)
@@ -717,6 +808,39 @@ export function App(props: AppProps) {
       },
     })
     runs.set(key, run)
+  }
+
+  function orchestrationFollowup(queued: QueuedPrompt): QueuedPrompt | undefined {
+    const round = queued.orchestrationRound ?? 0
+    if (round > 0) return undefined
+    if (queued.modelRole === "reasoning") {
+      return {
+        visiblePrompt: "executor: implement reasoning plan",
+        prompt: "You are now the executor role. Implement the reasoning model's latest plan from the transcript exactly. Use tools to inspect, edit, and verify. Do not redesign; report blockers or completion.",
+        skills: queued.skills,
+        modelRole: "executor",
+        orchestrationRound: round,
+      }
+    }
+    if (queued.modelRole === "executor") {
+      return {
+        visiblePrompt: "reviewer: review executor work",
+        prompt: "You are now the reviewer role. Review the executor's work from this session for correctness, missed requirements, regressions, and safety. Do not edit files or call tools. Return findings only.",
+        skills: queued.skills,
+        modelRole: "reviewer",
+        orchestrationRound: round,
+      }
+    }
+    if (queued.modelRole === "reviewer") {
+      return {
+        visiblePrompt: "reasoning: evaluate reviewer feedback",
+        prompt: "You are now the reasoning role. Evaluate the reviewer feedback. You may accept or disagree with it. If valid, decide the next exact executor diff/actions; if no further work is needed, give the final user-facing summary.",
+        skills: queued.skills,
+        modelRole: "reasoning",
+        orchestrationRound: round + 1,
+      }
+    }
+    return undefined
   }
 
   function resumePromptFromUserPrompt(prompt: string, state: AppState) {
@@ -826,6 +950,7 @@ export function App(props: AppProps) {
   }
 
   function dismissPalette() {
+    if (palette() === "model_family") setModelFamilyWizard(undefined)
     setPalette(undefined)
     setMention(undefined)
     setSkillMention(undefined)
@@ -867,6 +992,12 @@ export function App(props: AppProps) {
   }
 
   function openPalette(kind: PaletteKind) {
+    if (kind === "model_family") {
+      setModelFamilyWizard({ roleIndex: 0, step: "model", family: cloneModelFamily(focusedAgent().modelFamily) })
+      setNotice({ text: `${roleLabel(modelFamilyWizardRoles[0])} model`, tone: "cyan" })
+    } else {
+      setModelFamilyWizard(undefined)
+    }
     setPalette(kind)
     setSelected(0)
   }
@@ -875,6 +1006,44 @@ export function App(props: AppProps) {
     const count = paletteItems().length
     if (count === 0) return
     setSelected((index) => (index + delta + count) % count)
+  }
+
+  function acceptModelFamilyChoice(choice: ModelFamilyChoice) {
+    const wizard = modelFamilyWizard()
+    const role = wizard ? modelFamilyWizardRoles[wizard.roleIndex] : undefined
+    if (!wizard || !role || choice.role !== role) return
+    const nextFamily = cloneModelFamily(wizard.family)
+
+    if (wizard.step === "model" && choice.setting === "model" && choice.provider && choice.model) {
+      const modelChoice = selectedModelChoice(choice.provider, choice.model)
+      nextFamily[role] = {
+        ...nextFamily[role],
+        provider: choice.provider,
+        model: choice.model,
+        effort: modelChoice ? coerceEffortForModel(nextFamily[role].effort, modelChoice) : nextFamily[role].effort,
+      }
+      setModelFamilyWizard({ roleIndex: wizard.roleIndex, step: "effort", family: nextFamily })
+      setNotice({ text: `${roleLabel(role)} effort`, tone: "cyan" })
+      setSelected(0)
+      return
+    }
+
+    if (wizard.step === "effort" && choice.setting === "effort" && choice.effort) {
+      nextFamily[role] = { ...nextFamily[role], effort: choice.effort }
+      const nextRoleIndex = wizard.roleIndex + 1
+      const nextRole = modelFamilyWizardRoles[nextRoleIndex]
+      if (!nextRole) {
+        patchFocused({ modelFamily: nextFamily })
+        setNotice({ text: "model family configured", tone: "muted" })
+        setModelFamilyWizard(undefined)
+        closePalette()
+        return
+      }
+      setModelFamilyWizard({ roleIndex: nextRoleIndex, step: "model", family: nextFamily })
+      setNotice({ text: `${roleLabel(nextRole)} model`, tone: "cyan" })
+      setSelected(0)
+      return
+    }
   }
 
   function acceptPalette(insertDirectory = false) {
@@ -890,6 +1059,10 @@ export function App(props: AppProps) {
       setModel(choice.model)
       setMode(coerceEffortForModel(mode(), choice))
       closePalette()
+      return
+    }
+    if (palette() === "model_family") {
+      acceptModelFamilyChoice(item as ModelFamilyChoice)
       return
     }
     if (palette() === "connect") {
@@ -937,6 +1110,10 @@ export function App(props: AppProps) {
       setModel(choice.model)
       setMode(coerceEffortForModel(mode(), choice))
       closePalette()
+      return
+    }
+    if (palette() === "model_family") {
+      acceptModelFamilyChoice(item as ModelFamilyChoice)
       return
     }
     if (palette() === "connect") {
@@ -1052,6 +1229,7 @@ export function App(props: AppProps) {
   }
 
   function closePalette(keepPrompt = false) {
+    if (palette() === "model_family") setModelFamilyWizard(undefined)
     setPalette(undefined)
     setMention(undefined)
     setSkillMention(undefined)
@@ -1217,6 +1395,10 @@ export function App(props: AppProps) {
     }
     if (command.action === "model") {
       openPalette("models")
+      return
+    }
+    if (command.action === "model_family") {
+      openPalette("model_family")
       return
     }
     if (command.action === "connect") {
@@ -1400,7 +1582,7 @@ export function App(props: AppProps) {
       queueMicrotask(() => input?.focus())
       return
     }
-    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+    const slot = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
     setStore("agents", (agents) => [...agents, slot])
     setStore("focusedKey", slot.key)
     setExpanded(new Set<string>())
@@ -1440,7 +1622,7 @@ export function App(props: AppProps) {
     const remaining = store.agents.filter((a) => a.key !== key)
     if (remaining.length === 0) {
       const base = store.agents.find((a) => a.key === key) ?? store.agents[0]
-      const fresh = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
+      const fresh = makeAgentSlot({ provider: base.provider, model: base.model, effort: base.effort, modelFamily: base.modelFamily, devMode: base.devMode, approval: base.approval, workspaceOnly: base.workspaceOnly, role: base.role })
       setStore({ agents: [fresh], focusedKey: fresh.key })
       setExpanded(new Set<string>())
       queueMicrotask(() => input?.focus())
@@ -1843,10 +2025,10 @@ export function App(props: AppProps) {
     <box width="100%" height="100%" backgroundColor={theme.bg} paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
       <box width="100%" height="100%" backgroundColor={theme.bg} flexDirection="column" border borderStyle="rounded" borderColor={theme.border}>
         <TopRail
-          mode={mode()}
-          agent={agent()}
-          provider={provider()}
-          model={model()}
+          mode={activeRoleConfig().effort}
+          agent={activeModelRole()}
+          provider={activeRoleConfig().provider}
+          model={activeRoleConfig().model}
           title={fstate().title}
           workspace={props.workspace}
           running={fstate().running}
@@ -1989,8 +2171,8 @@ function TopRail(props: {
       borderColor={theme.border}
     >
       <TopBrand />
-      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("modes")} />
-      <TopMetric width={34} label="agent" value={truncateRight(modelDisplay(props.provider, props.model), 20)} color={theme.blue} onClick={() => props.openPalette("models")} />
+      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("model_family")} />
+      <TopMetric width={34} label="agent" value={truncateRight(`${modelDisplay(props.provider, props.model)} (${props.agent})`, 20)} color={theme.blue} onClick={() => props.openPalette("model_family")} />
       <TopMetric width={32} label="session" value={truncateRight(props.title, 18)} color={theme.cyan} />
       <TopMetric width={28} label="branch" value={truncateRight(props.branch, 18)} color={theme.cyan} />
       <box flexGrow={1} height="100%" />
@@ -2258,6 +2440,8 @@ function DraftSessionRow(props: {
 }) {
   const s = () => props.slot.state
   const statusColor = () => s().pendingPermission ? theme.orange : s().running ? theme.green : theme.dim
+  const activeRole = () => props.slot.activeModelRole ?? "reasoning"
+  const activeConfig = () => props.slot.modelFamily[activeRole()]
   return (
     <box
       width="100%"
@@ -2275,9 +2459,9 @@ function DraftSessionRow(props: {
         </text>
       </box>
       <box flexDirection="row" gap={1} onMouseUp={props.focus}>
-        <text fg={theme.dim}>{providerLabel(props.slot.provider)} {truncateRight(shortModel(props.slot.model), 8)}</text>
+        <text fg={theme.dim}>{truncateRight(`${shortModel(activeConfig().model)} (${activeRole()})`, 24)}</text>
         <box flexGrow={1} />
-        <text fg={statusColor()}>{s().running ? "running" : s().pendingPermission ? "needs approval" : (s().status || "idle")}</text>
+        <text fg={statusColor()}>{s().running ? activeConfig().effort : s().pendingPermission ? "needs approval" : (s().status || "idle")}</text>
       </box>
     </box>
   )
@@ -3095,7 +3279,7 @@ function Palette(props: {
   skillsStatus: string
   choose: (index: number) => void
 }) {
-  const maxRows = () => props.kind === "models" ? 10 : 14
+  const maxRows = () => props.kind === "models" || props.kind === "model_family" ? 10 : 14
   const isSkillPalette = () => props.kind === "skills"
   const startIndex = () => {
     const rows = maxRows()
@@ -3538,6 +3722,12 @@ function effortDisplay(value: EffortValue, choice?: ModelChoice) {
 
 function backendEffort(value: EffortValue) {
   return value === "ultracode" ? "xhigh" : value
+}
+
+function roleLabel(role: ModelRole) {
+  if (role === "reasoning") return "Reasoning"
+  if (role === "executor") return "Executor"
+  return "Reviewer"
 }
 
 function titleCase(value: string) {
