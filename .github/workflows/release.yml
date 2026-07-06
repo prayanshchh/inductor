@@ -19,10 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target-label: linux-x64
           - os: macos-14
-            target-label: darwin-arm64
+            target-label: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
