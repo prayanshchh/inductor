@@ -147,6 +147,7 @@ impl ProviderPlugin for ClaudeProvider {
         let system_prompt = req.system_prompt;
         let messages = req.messages;
         let images = req.images;
+        let tool_names = req.tool_names;
         let approval_policy = req
             .metadata
             .get("approval_policy")
@@ -171,6 +172,7 @@ impl ProviderPlugin for ClaudeProvider {
                 images,
                 system_prompt,
                 approval_policy,
+                tool_names,
             };
             if let Err(error) = timeout(idle_timeout, bridge.send_request(&request)).await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!(
@@ -511,6 +513,7 @@ struct BridgeRequest {
     images: Vec<ImageAttachment>,
     system_prompt: Option<String>,
     approval_policy: String,
+    tool_names: Vec<String>,
 }
 
 struct SdkBridge {
@@ -592,6 +595,11 @@ impl SdkBridge {
     }
 
     async fn send_request(&mut self, request: &BridgeRequest) -> anyhow::Result<()> {
+        let allowed = request
+            .tool_names
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
         self.send_value(&json!({
             "prompt": request.prompt,
             "cwd": request.cwd,
@@ -602,6 +610,7 @@ impl SdkBridge {
             "approval_policy": request.approval_policy,
             "tool_definitions": tools::tool_definitions()
                 .into_iter()
+                .filter(|definition| allowed.contains(definition.name.as_str()))
                 .collect::<Vec<_>>(),
         }))
         .await

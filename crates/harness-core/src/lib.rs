@@ -168,6 +168,30 @@ impl ModelMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    Reasoning,
+    Executor,
+    Reviewer,
+}
+
+impl ModelRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::Executor => "executor",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+impl Default for ModelRole {
+    fn default() -> Self {
+        Self::Reasoning
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRequest {
     pub session_id: SessionId,
@@ -409,6 +433,12 @@ pub enum SessionEvent {
         compacted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+    },
+    ModelRoleChanged {
+        session_id: SessionId,
+        role: ModelRole,
+        model: String,
+        effort: String,
     },
     StepStart {
         session_id: SessionId,

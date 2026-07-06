@@ -93,7 +93,7 @@ impl CopilotProvider {
         json!({
             "model": normalize_copilot_model(&req.model),
             "messages": messages,
-            "tools": copilot_tools(),
+            "tools": copilot_tools(&req.tool_names),
             "tool_choice": "auto",
             "stream": true,
             "temperature": 0.0
@@ -488,10 +488,12 @@ fn copilot_part_is_empty_text(part: &Value) -> bool {
         .is_some_and(|text| text.trim().is_empty())
 }
 
-fn copilot_tools() -> Value {
+fn copilot_tools(tool_names: &[String]) -> Value {
+    let allowed = tool_names.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
     Value::Array(
         tools::tool_definitions()
             .into_iter()
+            .filter(|definition| allowed.contains(definition.name.as_str()))
             .map(|definition| {
                 json!({
                     "type": "function",
@@ -969,7 +971,7 @@ mod tests {
             prompt: prompt.to_string(),
             system_prompt: Some("system".to_string()),
             messages: Vec::new(),
-            tool_names: Vec::new(),
+            tool_names: tools::tool_names(),
             metadata: Value::Null,
             images: Vec::new(),
         }

@@ -83,7 +83,7 @@ impl CodexProvider {
                 in one consolidated patch when practical before moving to the next file. If apply_patch reports stale \
                 lines or read_file required, re-inspect the whole file once and retry with one consolidated patch for that file."),
             "input": input,
-            "tools": codex_tools(),
+            "tools": codex_tools(&req.tool_names),
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "stream": true,
@@ -240,9 +240,11 @@ fn codex_part(part: &MessagePart, is_assistant: bool) -> Value {
 /// Inductor's shared tool registry exposed as OpenAI Responses function tools.
 /// OpenAI-hosted web search remains provider-specific because it is executed
 /// server-side by OpenAI rather than by Inductor's local tool runtime.
-fn codex_tools() -> Value {
+fn codex_tools(tool_names: &[String]) -> Value {
+    let allowed = tool_names.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
     let mut definitions = tools::tool_definitions()
         .into_iter()
+        .filter(|definition| allowed.contains(definition.name.as_str()))
         .map(|definition| {
             json!({
                 "type": "function",
@@ -252,7 +254,9 @@ fn codex_tools() -> Value {
             })
         })
         .collect::<Vec<_>>();
-    definitions.push(json!({ "type": "web_search" }));
+    if allowed.contains("web_search") {
+        definitions.push(json!({ "type": "web_search" }));
+    }
     Value::Array(definitions)
 }
 
@@ -906,7 +910,7 @@ mod tests {
             prompt: prompt.to_string(),
             system_prompt: None,
             messages: Vec::new(),
-            tool_names: Vec::new(),
+            tool_names: tools::tool_names().into_iter().chain(std::iter::once("web_search".to_string())).collect(),
             metadata: Value::Null,
             images: Vec::new(),
         }

@@ -15,9 +15,9 @@ use diff::{DiffRequest, diff_worktree};
 use futures_util::StreamExt;
 use git::{CreateWorktreeRequest, WorktreeManager};
 use harness_core::{
-    ApprovalPolicy, ImageAttachment, PermissionDecision, PermissionRequestId, PermissionResponse,
-    ProviderId, QuestionAnswer, QuestionResponse, SessionEvent, SessionId, SessionStatus,
-    StopReason, ToolCallId, TurnRequest, WorkspaceId,
+    ApprovalPolicy, ImageAttachment, ModelRole, PermissionDecision, PermissionRequestId,
+    PermissionResponse, ProviderId, QuestionAnswer, QuestionResponse, SessionEvent, SessionId,
+    SessionStatus, StopReason, ToolCallId, TurnRequest, WorkspaceId,
 };
 use harness_runtime::{
     AllowStore, ApprovalRequest, Approver, AutoApprove, HarnessConfig, Role, SessionState,
@@ -162,6 +162,9 @@ enum Command {
 
         #[arg(long, value_enum, default_value_t = EffortArg::Medium)]
         effort: EffortArg,
+
+        #[arg(long, value_enum, default_value_t = ModelRoleArg::Reasoning)]
+        model_role: ModelRoleArg,
 
         /// Skill names or paths to load into the system prompt for this turn.
         #[arg(long = "skill")]
@@ -420,6 +423,23 @@ impl From<EffortArg> for ModelEffort {
             EffortArg::High => Self::High,
             EffortArg::Xhigh => Self::XHigh,
             EffortArg::Max => Self::Max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModelRoleArg {
+    Reasoning,
+    Executor,
+    Reviewer,
+}
+
+impl From<ModelRoleArg> for ModelRole {
+    fn from(value: ModelRoleArg) -> Self {
+        match value {
+            ModelRoleArg::Reasoning => Self::Reasoning,
+            ModelRoleArg::Executor => Self::Executor,
+            ModelRoleArg::Reviewer => Self::Reviewer,
         }
     }
 }
@@ -750,6 +770,7 @@ async fn main() {
             tool_result_inline_bytes,
             blob_root,
             effort,
+            model_role,
             skills,
             app_db,
             state_db,
@@ -772,6 +793,7 @@ async fn main() {
                 tool_result_inline_bytes,
                 blob_root,
                 effort,
+                model_role,
                 skills,
                 app_db,
                 state_db,
@@ -1802,6 +1824,7 @@ async fn run_harness_command(
     tool_result_inline_bytes: usize,
     blob_root: Option<PathBuf>,
     effort: EffortArg,
+    model_role: ModelRoleArg,
     skills: Vec<String>,
     app_db: Option<PathBuf>,
     state_db: Option<PathBuf>,
@@ -2007,6 +2030,7 @@ async fn run_harness_command(
     config.context.limits = ContextLimits::new(soft_tokens, hard_tokens, tool_result_inline_bytes);
     config.context.blob_root = blob_root;
     config.model_effort = ModelEffort::from(effort);
+    config.model_role = ModelRole::from(model_role);
     config.provider_family = match provider {
         ProviderKind::Claude => ProviderFamily::Claude,
         ProviderKind::Codex => ProviderFamily::Codex,
@@ -2492,6 +2516,7 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
         | SessionEvent::ReasoningDelta { session_id, .. }
         | SessionEvent::ReasoningEnd { session_id, .. }
         | SessionEvent::ContextPrepared { session_id, .. }
+        | SessionEvent::ModelRoleChanged { session_id, .. }
         | SessionEvent::StepStart { session_id, .. }
         | SessionEvent::StepFinish { session_id, .. }
         | SessionEvent::ToolCallStart { session_id, .. }

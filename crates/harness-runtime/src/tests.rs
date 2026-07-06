@@ -201,6 +201,7 @@ fn provider_request_preparer_builds_complete_turn_request() {
     config.provider_family = ProviderFamily::Codex;
     config.model_effort = ModelEffort::High;
     config.approval_policy = ApprovalPolicy::OnRequest;
+    config.model_role = ModelRole::Executor;
 
     let prepared = ProviderRequestPreparer::prepare(ProviderRequestInput {
         session_id: state.session_id,
@@ -271,6 +272,7 @@ fn prompt_composer_orders_configured_and_plugin_layers() {
     let layers = PromptComposer::layers(
         ProviderFamily::Claude,
         ModelEffort::High,
+        ModelRole::Reasoning,
         &test_environment(),
         &prompt,
         &hooks,
@@ -278,12 +280,13 @@ fn prompt_composer_orders_configured_and_plugin_layers() {
 
     assert_eq!(
         layers.iter().map(|layer| layer.name).collect::<Vec<_>>(),
-        vec!["base", "environment", "configured", "plugin", "effort"]
+        vec!["base", "model-role", "environment", "configured", "plugin", "effort"]
     );
 
     let composed = PromptComposer::compose(
         ProviderFamily::Claude,
         ModelEffort::High,
+        ModelRole::Reasoning,
         &test_environment(),
         &prompt,
         &hooks,
