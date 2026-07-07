@@ -90,14 +90,18 @@ impl CopilotProvider {
     }
 
     fn chat_body_with_messages(&self, req: &TurnRequest, messages: Vec<Value>) -> Value {
-        json!({
+        let tools = copilot_tools(&req.tool_names);
+        let mut body = json!({
             "model": normalize_copilot_model(&req.model),
             "messages": messages,
-            "tools": copilot_tools(&req.tool_names),
-            "tool_choice": "auto",
             "stream": true,
             "temperature": 0.0
-        })
+        });
+        if tools.as_array().is_some_and(|tools| !tools.is_empty()) {
+            body["tools"] = tools;
+            body["tool_choice"] = json!("auto");
+        }
+        body
     }
 
     async fn bearer_token(&self, auth: &ProviderAuth) -> anyhow::Result<CopilotBearerToken> {
@@ -993,8 +997,22 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["type"], "function");
         assert!(body["tools"][0]["function"]["name"].is_string());
+    }
+
+    #[test]
+    fn chat_body_omits_tool_choice_when_no_tools_are_advertised() {
+        let provider =
+            CopilotProvider::with_urls("https://api.github.test", "https://copilot.test").unwrap();
+        let mut req = text_request("hello");
+        req.tool_names = vec!["unknown_tool".to_string()];
+
+        let body = provider.chat_body(&req, copilot_messages(&req));
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]

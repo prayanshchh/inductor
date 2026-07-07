@@ -73,7 +73,9 @@ type AgentSlot = {
 }
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
-type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[]; modelRole?: ModelRole; orchestrationRound?: number }
+type OrchestrationPhase = "initial" | "executor_report" | "review_feedback"
+type OrchestrationDecision = "continue" | "review" | "complete" | undefined
+type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[]; modelRole?: ModelRole; orchestrationRound?: number; orchestrationPhase?: OrchestrationPhase }
 type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout>; queued: QueuedPrompt[]; activeQueued?: QueuedPrompt; steering?: QueuedPrompt }
 type PaletteKind = "commands" | "models" | "model_family" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
 type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "model_family" | "new" | "permissions" | "pr" | "resume" | "review" | "sessions" | "skills"
@@ -694,7 +696,13 @@ export function App(props: AppProps) {
 
     const key = store.focusedKey
     const backendPrompt = resumePromptFromUserPrompt(visiblePrompt, fstate()) ?? prompt
-    const queued = { visiblePrompt, prompt: backendPrompt, skills: uniqueStrings([...activeSkills(), ...promptSkills]), modelRole: "reasoning" as ModelRole }
+    const queued: QueuedPrompt = {
+      visiblePrompt,
+      prompt: backendPrompt,
+      skills: uniqueStrings([...activeSkills(), ...promptSkills]),
+      modelRole: focusedAgent().modelFamilyEnabled ? "reasoning" : undefined,
+      orchestrationPhase: focusedAgent().modelFamilyEnabled ? "initial" : undefined,
+    }
     const running = fstate().running || runs.has(key)
     if (running) {
       if (steer) replaceCurrentRun(key, queued)
@@ -873,54 +881,75 @@ export function App(props: AppProps) {
     if (!slot?.modelFamilyEnabled) return undefined
     const round = queued.orchestrationRound ?? 0
     if (queued.modelRole === "reasoning") {
-      if (round > 0 && !reasoningRequestsAnotherExecutorCycle(fstate().transcript)) {
+      const decision = latestOrchestrationDecision(fstate().transcript)
+      if (decision === "complete") {
         return undefined
       }
+      if (decision === "review") {
+        return {
+          visiblePrompt: "reviewer: independently review executor work",
+          prompt: "You are now the reviewer role. Independently review the model-family work from this session for correctness, regressions, safety, and missed requirements. Do not rely on the executor's final summary. Read the full transcript context: the original user request, all reasoning instructions, executor tool-call requests and tool results, especially apply_patch/edit/write operations, patch diagnostics, and verification commands/results. Do not edit files or call tools. Return concrete findings only, then clearly recommend whether reasoning should accept the work as complete or continue with another executor cycle.",
+          skills: queued.skills,
+          modelRole: "reviewer",
+          orchestrationRound: round,
+          orchestrationPhase: "review_feedback",
+        }
+      }
+      if (decision && decision !== "continue") return undefined
+      if (!decision && queued.orchestrationPhase === "review_feedback") return undefined
       return {
-        visiblePrompt: "executor: implement reasoning plan",
-        prompt: "You are now the executor role. Implement the reasoning model's latest plan from the transcript exactly. Use tools to inspect, edit, and verify. Do not redesign. When the requested executor work is complete or blocked, report concrete tool results and what changed.",
+        visiblePrompt: round === 0 ? "executor: execute reasoning instructions" : "executor: continue reasoning instructions",
+        prompt: "You are now the executor role. Execute only the latest reasoning model instructions from the transcript. Use tools to inspect, edit, and verify as requested. Do not decide the final design, broaden scope, or treat your own result as complete. When the requested executor slice is done or blocked, report a concise EXECUTOR_REPORT with: tools run, facts discovered, files changed, verification results, blockers, and any uncertainty. Then stop so the reasoning model can decide the next executor slice, review, or completion.",
         skills: queued.skills,
         modelRole: "executor",
         orchestrationRound: round,
+        orchestrationPhase: "executor_report",
       }
     }
     if (queued.modelRole === "executor") {
       return {
-        visiblePrompt: "reviewer: review executor work",
-        prompt: "You are now the reviewer role. Review the executor's work from this session for correctness, missed requirements, regressions, and safety. Do not edit files or call tools. Return findings only, and clearly say whether the reasoning model should continue with another executor cycle or accept the work as complete.",
+        visiblePrompt: "reasoning: evaluate executor report",
+        prompt: "You are now the reasoning role. Evaluate the executor's latest report, tool-call transcript, tool results, and any file changes from this executor slice. You own the final diff and must decide the next model-family step. If more inspection, editing, or verification is needed, give the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`. If the implementation diff is ready for independent review, summarize what should be reviewed and end with `ORCHESTRATION_DECISION: review`. Do not end with `ORCHESTRATION_DECISION: complete` until after reviewer feedback has been evaluated.",
         skills: queued.skills,
-        modelRole: "reviewer",
+        modelRole: "reasoning",
         orchestrationRound: round,
+        orchestrationPhase: "executor_report",
       }
     }
     if (queued.modelRole === "reviewer") {
       return {
         visiblePrompt: "reasoning: evaluate reviewer feedback",
-        prompt: "You are now the reasoning role. Evaluate the reviewer feedback and control the model-family loop. If the original user task is not fully complete, produce the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`. If reviewer feedback is invalid, you may disagree, but still decide whether another executor cycle is needed. Only when you are satisfied that the task is fully complete should you give the final user-facing summary and end with `ORCHESTRATION_DECISION: complete`.",
+        prompt: "You are now the reasoning role. Evaluate the reviewer feedback against the original user request, your prior reasoning instructions, and the executor's tool-call transcript/diffs. You own the final diff decision. If more work is needed, produce the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`. If another independent review is needed without executor work, end with `ORCHESTRATION_DECISION: review`. Only when you are satisfied that the implementation and review show the task is fully complete should you give the final user-facing summary and end with `ORCHESTRATION_DECISION: complete`.",
         skills: queued.skills,
         modelRole: "reasoning",
         orchestrationRound: round + 1,
+        orchestrationPhase: "review_feedback",
       }
     }
     return undefined
   }
 
-  function reasoningRequestsAnotherExecutorCycle(transcript: TranscriptItem[]) {
+  function latestOrchestrationDecision(transcript: TranscriptItem[]): OrchestrationDecision {
     const latest = latestAssistantText(transcript).toLowerCase()
-    if (!latest) return false
-    if (/\borchestration_decision\s*:\s*complete\b/.test(latest)) return false
-    if (/\borchestration_decision\s*:\s*continue\b/.test(latest)) return true
-    if (/\btask_complete\s*:\s*true\b/.test(latest)) return false
-    if (/\btask_complete\s*:\s*false\b/.test(latest)) return true
+    if (!latest) return undefined
+    if (/\borchestration_decision\s*:\s*complete\b/.test(latest)) return "complete"
+    if (/\borchestration_decision\s*:\s*review\b/.test(latest)) return "review"
+    if (/\borchestration_decision\s*:\s*continue\b/.test(latest)) return "continue"
+    if (/\btask_complete\s*:\s*true\b/.test(latest)) return "complete"
+    if (/\btask_complete\s*:\s*false\b/.test(latest)) return "continue"
     // Backstop for older prompts or models that did not emit the explicit
     // control line: if the reasoning pass says the review is valid and gives
     // next executor actions, keep the loop moving instead of stopping.
-    return (
+    if (
       latest.includes("next executor action") ||
       latest.includes("next executor step") ||
       latest.includes("next exact executor") ||
       (latest.includes("reviewer feedback is valid") && latest.includes("incomplete"))
-    )
+    ) {
+      return "continue"
+    }
+    if (latest.includes("ready for review") || latest.includes("independent review")) return "review"
+    return undefined
   }
 
   function latestAssistantText(transcript: TranscriptItem[]) {
@@ -2114,6 +2143,7 @@ export function App(props: AppProps) {
     <box width="100%" height="100%" backgroundColor={theme.bg} paddingTop={1} paddingLeft={1} paddingRight={1} paddingBottom={1}>
       <box width="100%" height="100%" backgroundColor={theme.bg} flexDirection="column" border borderStyle="rounded" borderColor={theme.border}>
         <TopRail
+          modelMode={focusedAgent().modelFamilyEnabled ? "model-family" : "model"}
           mode={activeRoleConfig().effort}
           agent={focusedAgent().modelFamilyEnabled ? activeModelRole() : agent()}
           provider={activeRoleConfig().provider}
@@ -2122,7 +2152,6 @@ export function App(props: AppProps) {
           workspace={props.workspace}
           running={fstate().running}
           elapsed={formatElapsed(now() - startedAt)}
-          branch={activeBranch()}
           openPalette={openPalette}
         />
         <box flexGrow={1} minHeight={0} overflow="hidden" flexDirection="row" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
@@ -2238,6 +2267,7 @@ export function App(props: AppProps) {
 }
 
 function TopRail(props: {
+  modelMode: "model" | "model-family"
   mode: EffortValue
   agent: string
   provider: string
@@ -2246,7 +2276,6 @@ function TopRail(props: {
   workspace: string
   running: boolean
   elapsed: string
-  branch: string
   openPalette: (kind: PaletteKind) => void
 }) {
   return (
@@ -2260,10 +2289,10 @@ function TopRail(props: {
       borderColor={theme.border}
     >
       <TopBrand />
-      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette("model_family")} />
-      <TopMetric width={34} label="agent" value={truncateRight(`${modelDisplay(props.provider, props.model)} (${props.agent})`, 20)} color={theme.blue} onClick={() => props.openPalette("model_family")} />
-      <TopMetric width={32} label="session" value={truncateRight(props.title, 18)} color={theme.cyan} />
-      <TopMetric width={28} label="branch" value={truncateRight(props.branch, 18)} color={theme.cyan} />
+      <TopMetric width={30} label="mode" value={props.modelMode} color={theme.cyan} onClick={() => props.openPalette(props.modelMode === "model-family" ? "model_family" : "models")} />
+      <TopMetric width={22} label="effort" value={props.mode} color={theme.cyan} onClick={() => props.openPalette(props.modelMode === "model-family" ? "model_family" : "modes")} />
+      <TopMetric width={32} label="agent" value={truncateRight(`${modelDisplay(props.provider, props.model)} (${props.agent})`, 20)} color={theme.blue} onClick={() => props.openPalette(props.modelMode === "model-family" ? "model_family" : "models")} />
+      <TopMetric width={36} label="session" value={truncateRight(props.title, 22)} color={theme.cyan} />
       <box flexGrow={1} height="100%" />
       <box width={18} height="100%" flexDirection="row" alignItems="center" justifyContent="center">
         <text fg={props.running ? theme.green : theme.text} attributes={TextAttributes.BOLD}>◴ {clockElapsed(props.elapsed)}</text>
