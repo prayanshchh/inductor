@@ -201,7 +201,7 @@ fn provider_request_preparer_builds_complete_turn_request() {
     config.provider_family = ProviderFamily::Codex;
     config.model_effort = ModelEffort::High;
     config.approval_policy = ApprovalPolicy::OnRequest;
-    config.model_role = ModelRole::Executor;
+    config.model_role = Some(ModelRole::Executor);
 
     let prepared = ProviderRequestPreparer::prepare(ProviderRequestInput {
         session_id: state.session_id,
@@ -236,6 +236,11 @@ fn provider_request_preparer_builds_complete_turn_request() {
     );
     assert_eq!(prepared.request.metadata["round"], json!(2));
     assert_eq!(prepared.request.metadata["model_effort"], json!("high"));
+    assert_eq!(
+        prepared.request.metadata["model_mode"],
+        json!("model_family")
+    );
+    assert_eq!(prepared.request.metadata["model_role"], json!("executor"));
     assert_eq!(prepared.request.images, vec![image.clone()]);
     assert!(prepared.request.messages.iter().any(|message| {
         message.role == "user"
@@ -263,6 +268,22 @@ fn provider_request_preparer_uses_canonical_xhigh_effort() {
     .unwrap();
 
     assert_eq!(prepared.request.metadata["model_effort"], json!("xhigh"));
+    assert_eq!(prepared.request.metadata["model_mode"], json!("model"));
+    assert_eq!(prepared.request.metadata["model_role"], Value::Null);
+    assert!(
+        prepared
+            .request
+            .tool_names
+            .contains(&"read_file".to_string())
+    );
+    assert!(
+        !prepared
+            .request
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("ORCHESTRATION_DECISION")
+    );
 }
 
 #[test]
@@ -272,7 +293,7 @@ fn prompt_composer_orders_configured_and_plugin_layers() {
     let layers = PromptComposer::layers(
         ProviderFamily::Claude,
         ModelEffort::High,
-        ModelRole::Reasoning,
+        Some(ModelRole::Reasoning),
         &test_environment(),
         &prompt,
         &hooks,
@@ -293,13 +314,39 @@ fn prompt_composer_orders_configured_and_plugin_layers() {
     let composed = PromptComposer::compose(
         ProviderFamily::Claude,
         ModelEffort::High,
-        ModelRole::Reasoning,
+        Some(ModelRole::Reasoning),
         &test_environment(),
         &prompt,
         &hooks,
     );
     assert!(composed.contains("Configured prompt layer."));
     assert!(composed.contains("Plugin prompt layer."));
+}
+
+#[test]
+fn prompt_composer_omits_model_family_layer_in_direct_model_mode() {
+    let layers = PromptComposer::layers(
+        ProviderFamily::Codex,
+        ModelEffort::Medium,
+        None,
+        &test_environment(),
+        &PromptRuntimeConfig::default(),
+        &PluginHooks::default(),
+    );
+
+    assert_eq!(
+        layers.iter().map(|layer| layer.name).collect::<Vec<_>>(),
+        vec!["base", "environment"]
+    );
+    let composed = PromptComposer::compose(
+        ProviderFamily::Codex,
+        ModelEffort::Medium,
+        None,
+        &test_environment(),
+        &PromptRuntimeConfig::default(),
+        &PluginHooks::default(),
+    );
+    assert!(!composed.contains("ORCHESTRATION_DECISION"));
 }
 
 #[test]

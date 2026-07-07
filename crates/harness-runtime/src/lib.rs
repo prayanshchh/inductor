@@ -626,7 +626,7 @@ pub struct HarnessConfig {
     pub hooks: PluginHooks,
     pub model_effort: ModelEffort,
     pub provider_family: ProviderFamily,
-    pub model_role: ModelRole,
+    pub model_role: Option<ModelRole>,
 }
 
 impl HarnessConfig {
@@ -641,7 +641,7 @@ impl HarnessConfig {
             hooks: PluginHooks::default(),
             model_effort: ModelEffort::default(),
             provider_family: ProviderFamily::Generic,
-            model_role: ModelRole::Reasoning,
+            model_role: None,
         }
     }
 }
@@ -748,10 +748,10 @@ fn advertised_tool_names() -> Vec<String> {
     tools::tool_names()
 }
 
-fn advertised_tool_names_for_role(role: ModelRole, hooks: &PluginHooks) -> Vec<String> {
+fn advertised_tool_names_for_role(role: Option<ModelRole>, hooks: &PluginHooks) -> Vec<String> {
     let mut names = match role {
-        ModelRole::Reasoning | ModelRole::Reviewer => Vec::new(),
-        ModelRole::Executor => advertised_tool_names(),
+        None | Some(ModelRole::Executor) => advertised_tool_names(),
+        Some(ModelRole::Reasoning | ModelRole::Reviewer) => Vec::new(),
     };
     for name in &hooks.advertised_tool_names {
         if !names.contains(name) {
@@ -767,7 +767,20 @@ fn request_metadata(config: &HarnessConfig, round: usize) -> Value {
     metadata.insert("model_effort".to_string(), json!(config.model_effort));
     metadata.insert("approval_policy".to_string(), json!(config.approval_policy));
     metadata.insert("round".to_string(), json!(round));
-    metadata.insert("model_role".to_string(), json!(config.model_role));
+    metadata.insert(
+        "model_mode".to_string(),
+        json!(if config.model_role.is_some() {
+            "model_family"
+        } else {
+            "model"
+        }),
+    );
+    metadata.insert(
+        "model_role".to_string(),
+        config
+            .model_role
+            .map_or(Value::Null, |model_role| json!(model_role)),
+    );
     for (key, value) in &config.hooks.request_metadata {
         metadata.insert(key.clone(), value.clone());
     }
@@ -2514,12 +2527,14 @@ pub fn run_turn<'a>(
         let mut hash_cache = ToolHashCache::default();
 
         yield SessionEvent::Status { session_id, status: SessionStatus::Starting };
-        yield SessionEvent::ModelRoleChanged {
-            session_id,
-            role: config.model_role,
-            model: config.model.clone(),
-            effort: config.model_effort.as_str().to_string(),
-        };
+        if let Some(model_role) = config.model_role {
+            yield SessionEvent::ModelRoleChanged {
+                session_id,
+                role: model_role,
+                model: config.model.clone(),
+                effort: config.model_effort.as_str().to_string(),
+            };
+        }
 
         let mut round = 0usize;
         'turns: loop {
@@ -3067,9 +3082,9 @@ struct PromptLayer {
 
 fn model_role_prompt(role: ModelRole) -> String {
     match role {
-        ModelRole::Reasoning => "Model role: reasoning. You are the frontier reasoning model. Decide the complete diff and the next exact executor actions. Do not call tools or edit files directly; instead produce a concise implementation plan/instructions for the executor. After reviewer feedback, you control the model-family loop: if the original user task is not fully complete, provide the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`; only when you are satisfied that review plus reasoning show the task is complete should you give the final summary and end with `ORCHESTRATION_DECISION: complete`. You may explicitly disagree with invalid reviewer feedback, but still decide whether another executor cycle is needed.".to_string(),
-        ModelRole::Executor => "Model role: executor. You are the lower-cost executor. Do not redesign the solution. Follow the reasoning model's instructions as faithfully as possible, use tools correctly to inspect/edit/run commands, report concrete tool results, and ask for updated reasoning instructions when blocked or when the requested diff is complete.".to_string(),
-        ModelRole::Reviewer => "Model role: reviewer. You are the frontier reviewer. Review the executor's work for correctness, regressions, safety, and missed requirements. Do not call tools and do not fix code. Return only review findings and whether the reasoning model should accept the work as complete or continue with another executor cycle.".to_string(),
+        ModelRole::Reasoning => "Model role: reasoning. You are the frontier reasoning model and you own the final diff decision in the model-family loop. Do not call tools or edit files directly. Instead, read the transcript, executor reports, tool-call requests/results, patch/edit operations, diagnostics, and reviewer feedback, then decide the next role. If more tool work is needed, provide the next exact executor instructions and end with `ORCHESTRATION_DECISION: continue`. If the implementation is ready for independent review, summarize the review target and end with `ORCHESTRATION_DECISION: review`. Only after reviewer feedback has been evaluated and you are satisfied the original user task is fully complete should you give the final user-facing summary and end with `ORCHESTRATION_DECISION: complete`.".to_string(),
+        ModelRole::Executor => "Model role: executor. You are the lower-cost executor. Execute only the latest reasoning model instructions. Use tools correctly to inspect, edit, and verify, but do not redesign the solution, broaden scope, or decide completion yourself. When the requested executor slice is complete or blocked, report concrete tool results, files changed, verification, blockers, and uncertainty, then stop so reasoning can decide the next executor slice, review, or completion.".to_string(),
+        ModelRole::Reviewer => "Model role: reviewer. You are the frontier reviewer. Independently review the model-family work for correctness, regressions, safety, and missed requirements. Do not call tools and do not fix code. Do not trust the executor summary alone: inspect the transcript context, reasoning instructions, executor tool-call requests/results, apply_patch/edit/write operations, patch diagnostics, and verification commands/results. Return only concrete findings and whether reasoning should accept the work as complete, continue with another executor cycle, or request another review.".to_string(),
     }
 }
 
@@ -3079,7 +3094,7 @@ impl PromptComposer {
     fn compose(
         provider: ProviderFamily,
         effort: ModelEffort,
-        role: ModelRole,
+        role: Option<ModelRole>,
         environment: &SystemEnvironment,
         prompt: &PromptRuntimeConfig,
         hooks: &PluginHooks,
@@ -3095,7 +3110,7 @@ impl PromptComposer {
     fn layers(
         provider: ProviderFamily,
         effort: ModelEffort,
-        role: ModelRole,
+        role: Option<ModelRole>,
         environment: &SystemEnvironment,
         prompt: &PromptRuntimeConfig,
         hooks: &PluginHooks,
@@ -3111,14 +3126,20 @@ impl PromptComposer {
                 },
             },
             PromptLayer {
-                name: "model-role",
-                content: model_role_prompt(role),
-            },
-            PromptLayer {
                 name: "environment",
                 content: environment.render(),
             },
         ];
+
+        if let Some(role) = role {
+            layers.insert(
+                1,
+                PromptLayer {
+                    name: "model-role",
+                    content: model_role_prompt(role),
+                },
+            );
+        }
 
         layers.extend(
             prompt
@@ -3161,7 +3182,7 @@ fn system_preamble_for_effort(
     PromptComposer::compose(
         provider,
         effort,
-        ModelRole::Reasoning,
+        None,
         environment,
         &PromptRuntimeConfig::default(),
         &PluginHooks::default(),

@@ -169,8 +169,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = EffortArg::Medium)]
         effort: EffortArg,
 
-        #[arg(long, value_enum, default_value_t = ModelRoleArg::Reasoning)]
-        model_role: ModelRoleArg,
+        #[arg(long, value_enum)]
+        model_role: Option<ModelRoleArg>,
 
         /// Skill names or paths to load into the system prompt for this turn.
         #[arg(long = "skill")]
@@ -1830,7 +1830,7 @@ async fn run_harness_command(
     tool_result_inline_bytes: usize,
     blob_root: Option<PathBuf>,
     effort: EffortArg,
-    model_role: ModelRoleArg,
+    model_role: Option<ModelRoleArg>,
     skills: Vec<String>,
     app_db: Option<PathBuf>,
     state_db: Option<PathBuf>,
@@ -2036,7 +2036,7 @@ async fn run_harness_command(
     config.context.limits = ContextLimits::new(soft_tokens, hard_tokens, tool_result_inline_bytes);
     config.context.blob_root = blob_root;
     config.model_effort = ModelEffort::from(effort);
-    config.model_role = ModelRole::from(model_role);
+    config.model_role = model_role.map(ModelRole::from);
     config.provider_family = match provider {
         ProviderKind::Claude => ProviderFamily::Claude,
         ProviderKind::Codex => ProviderFamily::Codex,
