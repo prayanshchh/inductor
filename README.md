@@ -38,11 +38,11 @@ inductor auth detect
 
 Release bundles ship both executables side by side:
 
-- `inductor` — the Rust backend/CLI
-- `inductor-open-tui` — the self-contained OpenTUI frontend
+- `inductor` — the main CLI users run; it launches the full UI/harness
+- `inductor-open-tui` — the packaged self-contained UI frontend that `inductor` starts internally
 
 Unpack a release archive, keep both binaries in the same directory, and add
-that directory to your `PATH`. `inductor open-tui` will automatically launch
+that directory to your `PATH`. Running `inductor` will automatically launch
 the packaged frontend without requiring Bun.
 
 ### Build from source
@@ -56,14 +56,14 @@ cd inductor
 # JS/TUI dependencies (also wires up the Claude bridge via postinstall)
 bun install
 
-# Build the Rust binary and self-contained OpenTUI frontend
+# Build the Rust binary and self-contained UI frontend
 cargo build --release
 INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui
 ```
 
 The compiled binaries land at `target/release/inductor` and
 `target/release/inductor-open-tui`. Keep them side by side if you want
-`inductor open-tui` to run without Bun. For a packaged archive, run:
+plain `inductor` to run without Bun. For a packaged archive, run:
 
 ```sh
 bun run bundle:release
@@ -82,23 +82,23 @@ cargo install --path crates/agent
 Start an interactive session in the current directory:
 
 ```sh
-inductor open-tui
+inductor
 ```
 
 Common options:
 
 ```sh
 # Pick a provider (defaults to claude)
-inductor open-tui --provider codex
+inductor --provider codex
 
 # Choose a workspace folder
-inductor open-tui --workspace ./my-project
+inductor --workspace ./my-project
 
 # Use a specific model
-inductor open-tui --provider claude --model claude-sonnet-4-5
+inductor --provider claude --model claude-sonnet-4-5
 
 # Restrict file tools and bash to the workspace instead of yolo mode
-inductor open-tui --workspace-only
+inductor --workspace-only
 ```
 
 ### Approval modes
@@ -108,7 +108,7 @@ running commands, edits, reads, or writes. To require approval before mutating
 actions, pass an approval policy:
 
 ```sh
-inductor open-tui --approval on_request
+inductor --approval on_request
 ```
 
 | Value        | Behavior                                            |
@@ -126,7 +126,7 @@ Add `--workspace-only` to confine file tools and bash to the chosen workspace.
   permissions, computes diffs, and persists sessions to a local SQLite DB
   (default: `<workspace>/.inductor/state.db`).
 - **OpenTUI frontend** (`packages/tui`) renders the chat, tool activity, diffs,
-  and terminal panes. It's launched automatically by `inductor open-tui`.
+  and terminal panes. It's launched automatically by `inductor`.
 - **Providers** plug into a common interface:
   - `provider-claude` bridges to the Claude Agent SDK
     (`crates/provider-claude/js/claude_agent_sdk_bridge.mjs`).
@@ -145,7 +145,7 @@ actions are gated and rendered consistently, regardless of provider.
 - **`inductor auth detect` shows `status: none`:** no provider login was found.
   Sign in to Claude Code or Codex, then retry.
 - **`OpenTUI dependencies are missing`:** if you're running from a source checkout, run `bun install` from the repo root.
-- **`OpenTUI frontend is unavailable`:** either run `INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui` from the repo root or use a release archive that includes `inductor-open-tui` next to `inductor`.
+- **`Inductor UI frontend is unavailable`:** either run `INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui` from the repo root or use a release archive that includes `inductor-open-tui` next to `inductor`.
 
 ---
 

@@ -55,8 +55,8 @@ const RESUME_ASSISTANT_OUTPUT_MAX_BYTES: usize = 2 * 1024;
 const RESUME_ERROR_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "agent")]
-#[command(about = "Rust harness sidecar for agent sessions")]
+#[command(name = "inductor")]
+#[command(about = "Terminal-native AI coding agent with an integrated UI and harness")]
 struct Cli {
     #[arg(long)]
     version_info: bool,
@@ -90,26 +90,6 @@ enum Command {
     Db {
         #[command(subcommand)]
         command: DbCommand,
-    },
-    /// Run the experimental OpenTUI/Solid presentation layer.
-    OpenTui {
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
-
-        #[arg(long, value_enum, default_value_t = ProviderArg::Claude)]
-        provider: ProviderArg,
-
-        #[arg(long)]
-        model: Option<String>,
-
-        /// When to pause tool calls for approval. Defaults to yolo mode:
-        /// never ask before running commands, edits, reads, or writes.
-        #[arg(long, value_enum, default_value_t = ApprovalArg::Never)]
-        approval: ApprovalArg,
-
-        /// Restrict file tools and bash to the workspace instead of yolo mode.
-        #[arg(long)]
-        workspace_only: bool,
     },
     /// Run a full harness turn loop: prompt -> provider -> tools -> answer.
     Run {
@@ -752,13 +732,6 @@ async fn main() {
         Some(Command::Context { command }) => run_context_command(command).await,
         Some(Command::Skill { command }) => run_skill_command(command).await,
         Some(Command::Db { command }) => run_db_command(command).await,
-        Some(Command::OpenTui {
-            workspace,
-            provider,
-            model,
-            approval,
-            workspace_only,
-        }) => run_opentui_command(workspace, provider, model, approval, workspace_only).await,
         Some(Command::Run {
             provider,
             workspace,
@@ -1165,7 +1138,7 @@ fn select_opentui_frontend(
     }
 
     Err(format!(
-        "OpenTUI frontend is unavailable. Expected either a source checkout at packages/tui/src/index.tsx or a packaged frontend at {}. Build it with `bun run build:tui` or download a release bundle.",
+        "Inductor UI frontend is unavailable. Expected either a source checkout at packages/tui/src/index.tsx or a packaged frontend at {}. Build it with `bun run build:tui` or download a release bundle.",
         frontend_bin.display()
     ))
 }
@@ -1254,7 +1227,7 @@ fn opentui_binary_name() -> &'static str {
     }
 }
 
-/// Locate the inductor repository root that ships the OpenTUI frontend.
+/// Locate the inductor repository root that ships the UI frontend.
 ///
 /// The binary is typically `cargo install`ed globally, so the compile-time
 /// `CARGO_MANIFEST_DIR` points at whatever workspace happened to build it and
