@@ -34,16 +34,22 @@ inductor auth detect
 
 ## Install
 
-### Download a release bundle
+### Install a release bundle
 
-Release bundles ship both executables side by side:
+Release bundles ship the CLI binary as `inductor` plus the self-contained
+`inductor-open-tui` frontend.
 
-- `inductor` — the Rust backend/CLI
-- `inductor-open-tui` — the self-contained OpenTUI frontend
+Unpack a release archive, keep the binaries in the same directory, and add
+that directory to your `PATH`. The CLI is available as `inductor`. `inductor open-tui`
+will automatically launch the packaged frontend without requiring Bun.
 
-Unpack a release archive, keep both binaries in the same directory, and add
-that directory to your `PATH`. `inductor open-tui` will automatically launch
-the packaged frontend without requiring Bun.
+Current release binaries support **Apple Silicon macOS only**.
+
+Or install the latest GitHub Release directly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/prayanshchhablani/inductor/main/scripts/install.sh | sh
+```
 
 ### Build from source
 
@@ -62,8 +68,8 @@ INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui
 ```
 
 The compiled binaries land at `target/release/inductor` and
-`target/release/inductor-open-tui`. Keep them side by side if you want
-`inductor open-tui` to run without Bun. For a packaged archive, run:
+`target/release/inductor-open-tui`. Keep them side by side if you want `inductor open-tui`
+to run without Bun. For a packaged archive, run:
 
 ```sh
 bun run bundle:release
@@ -179,6 +185,7 @@ GitHub Actions lives under `.github/workflows/`:
 
 - `ci.yml` runs Rust formatting, strict clippy, Rust tests, TUI type-checks/tests, and startup smoke checks on Ubuntu and macOS.
 - `coverage.yml` records Rust coverage with a 66% line-coverage threshold and TUI coverage with a 70% line-coverage threshold.
+- `pr-section-tests.yml` uses path filtering to run only the affected PR checks for tools, providers, and the OpenTUI frontend.
 - `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases on `v*` tags.
 
-To enforce these before merge, configure branch protection in GitHub so the CI and coverage jobs are required status checks.
+To enforce these before merge, configure branch protection in GitHub so the CI, coverage, and relevant section test checks are required status checks.
