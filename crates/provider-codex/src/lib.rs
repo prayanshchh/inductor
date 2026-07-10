@@ -10,13 +10,17 @@ use harness_core::{
 use provider_core::{
     PermissionResponses, ProviderAuth, ProviderAuthKind, ProviderPlugin, ProviderToolResponse,
 };
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+// ChatGPT's Codex endpoint gates subscription-only model IDs on the same
+// client identity headers used by the official Codex CLI.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.142.0";
 const DEFAULT_CODEX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CODEX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -296,6 +300,8 @@ impl ProviderPlugin for CodexProvider {
         headers.insert(AUTHORIZATION, bearer_header(auth)?);
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+        headers.insert(USER_AGENT, HeaderValue::from_static(CODEX_USER_AGENT));
 
         let session_id = req.session_id;
         let provider = self.clone();
@@ -872,21 +878,6 @@ fn codex_model_catalog() -> Vec<ModelInfo> {
             context_window: None,
         },
         ModelInfo {
-            id: "gpt-5.3-codex".to_string(),
-            display_name: "GPT-5.3-Codex".to_string(),
-            context_window: None,
-        },
-        ModelInfo {
-            id: "gpt-5.3-codex-spark".to_string(),
-            display_name: "GPT-5.3-Codex-Spark".to_string(),
-            context_window: None,
-        },
-        ModelInfo {
-            id: "gpt-5.2".to_string(),
-            display_name: "GPT-5.2".to_string(),
-            context_window: None,
-        },
-        ModelInfo {
             id: "gpt-5.6-sol".to_string(),
             display_name: "GPT-5.6 Sol".to_string(),
             context_window: None,
@@ -1450,9 +1441,9 @@ data: [DONE]
         assert!(models.iter().any(|model| model.id == "gpt-5.5"));
         assert!(models.iter().any(|model| model.id == "gpt-5.4"));
         assert!(models.iter().any(|model| model.id == "gpt-5.4-mini"));
-        assert!(models.iter().any(|model| model.id == "gpt-5.3-codex"));
-        assert!(models.iter().any(|model| model.id == "gpt-5.3-codex-spark"));
-        assert!(models.iter().any(|model| model.id == "gpt-5.2"));
+        assert!(!models.iter().any(|model| model.id == "gpt-5.3-codex"));
+        assert!(!models.iter().any(|model| model.id == "gpt-5.3-codex-spark"));
+        assert!(!models.iter().any(|model| model.id == "gpt-5.2"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-sol"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
