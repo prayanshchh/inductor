@@ -166,6 +166,12 @@ let modelChoices: ModelChoice[] = [
   { group: "OpenAI", provider: "codex", model: "gpt-5.5", label: "GPT-5.5", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
   { group: "OpenAI", provider: "codex", model: "gpt-5.4", label: "GPT-5.4", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
   { group: "OpenAI", provider: "codex", model: "gpt-5.4-mini", label: "GPT-5.4-Mini", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.3-codex", label: "GPT-5.3-Codex", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.2", label: "GPT-5.2", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.6-sol", label: "GPT-5.6 Sol", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.6-terra", label: "GPT-5.6 Terra", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
+  { group: "OpenAI", provider: "codex", model: "gpt-5.6-luna", label: "GPT-5.6 Luna", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"], effortLabels: { xhigh: "Extra High" } },
   { group: "GitHub Copilot", provider: "copilot", model: "gpt-4.1", label: "Copilot GPT-4.1", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
   { group: "GitHub Copilot", provider: "copilot", model: "claude-sonnet-4", label: "Copilot Claude Sonnet 4", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
   { group: "GitHub Copilot", provider: "copilot", model: "o4-mini", label: "Copilot o4-mini", effortName: "Reasoning", efforts: ["low", "medium", "high", "xhigh"] },
@@ -595,6 +601,7 @@ export function App(props: AppProps) {
     void refreshWorktrees().then((next) => autoResumeRecoveredWorktrees(next))
     void refreshSkills()
     const worktreeRefreshTimer = setInterval(() => void refreshWorktrees(), 30_000)
+    void refreshCodexModels()
     void refreshCopilotModels()
     onCleanup(() => clearInterval(worktreeRefreshTimer))
   })
@@ -1364,6 +1371,29 @@ export function App(props: AppProps) {
       setModelCatalogVersion((version) => version + 1)
     } catch {
       // Keep the baked-in Copilot fallback choices when auth is absent or stale.
+    }
+  }
+
+  async function refreshCodexModels() {
+    try {
+      const models = await listProviderModels(props, "codex")
+      if (models.length === 0) return
+      const next = [
+        ...modelChoices.filter((choice) => choice.provider !== "codex"),
+        ...models.map((model) => ({
+          group: "OpenAI",
+          provider: "codex",
+          model: model.id,
+          label: model.display_name || model.id,
+          effortName: "Reasoning",
+          efforts: ["low", "medium", "high", "xhigh"] as EffortValue[],
+          effortLabels: { xhigh: "Extra High" },
+        })),
+      ]
+      modelChoices = next
+      setModelCatalogVersion((version) => version + 1)
+    } catch {
+      // Keep the baked-in Codex choices when auth is absent or stale.
     }
   }
 

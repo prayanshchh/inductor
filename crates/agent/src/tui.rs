@@ -314,7 +314,14 @@ fn model_catalog() -> Vec<(&'static str, &'static str)> {
         ("claude", "sonnet"),
         ("claude", "haiku"),
         ("codex", "gpt-5.5"),
-        ("codex", "gpt-5.5-codex"),
+        ("codex", "gpt-5.4"),
+        ("codex", "gpt-5.4-mini"),
+        ("codex", "gpt-5.3-codex"),
+        ("codex", "gpt-5.3-codex-spark"),
+        ("codex", "gpt-5.2"),
+        ("codex", "gpt-5.6-sol"),
+        ("codex", "gpt-5.6-terra"),
+        ("codex", "gpt-5.6-luna"),
     ]
 }
 

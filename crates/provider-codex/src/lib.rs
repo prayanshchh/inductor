@@ -871,6 +871,36 @@ fn codex_model_catalog() -> Vec<ModelInfo> {
             display_name: "GPT-5.4-Mini".to_string(),
             context_window: None,
         },
+        ModelInfo {
+            id: "gpt-5.3-codex".to_string(),
+            display_name: "GPT-5.3-Codex".to_string(),
+            context_window: None,
+        },
+        ModelInfo {
+            id: "gpt-5.3-codex-spark".to_string(),
+            display_name: "GPT-5.3-Codex-Spark".to_string(),
+            context_window: None,
+        },
+        ModelInfo {
+            id: "gpt-5.2".to_string(),
+            display_name: "GPT-5.2".to_string(),
+            context_window: None,
+        },
+        ModelInfo {
+            id: "gpt-5.6-sol".to_string(),
+            display_name: "GPT-5.6 Sol".to_string(),
+            context_window: None,
+        },
+        ModelInfo {
+            id: "gpt-5.6-terra".to_string(),
+            display_name: "GPT-5.6 Terra".to_string(),
+            context_window: None,
+        },
+        ModelInfo {
+            id: "gpt-5.6-luna".to_string(),
+            display_name: "GPT-5.6 Luna".to_string(),
+            context_window: None,
+        },
     ];
     extend_models_from_env(&mut models, "INDUCTOR_CODEX_MODELS");
     models
@@ -1420,7 +1450,12 @@ data: [DONE]
         assert!(models.iter().any(|model| model.id == "gpt-5.5"));
         assert!(models.iter().any(|model| model.id == "gpt-5.4"));
         assert!(models.iter().any(|model| model.id == "gpt-5.4-mini"));
-        assert!(!models.iter().any(|model| model.id == "gpt-5.3-codex"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.3-codex"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.3-codex-spark"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.2"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-sol"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
     }
 
     #[test]
