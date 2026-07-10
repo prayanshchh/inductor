@@ -1,20 +1,78 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - "crates/agent/Cargo.toml"
 
 permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-main
   cancel-in-progress: false
 
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.release.outputs.changed }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            python3 -c 'import sys, tomllib; data = tomllib.loads(sys.stdin.read()); print(data["package"]["version"])'
+          }
+
+          current_version="$(read_version < crates/agent/Cargo.toml)"
+          [ -n "$current_version" ] || {
+            echo "could not read current version from crates/agent/Cargo.toml" >&2
+            exit 1
+          }
+
+          before="${{ github.event.before }}"
+          previous_version=""
+          baseline_valid="true"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            baseline_valid="false"
+          else
+            if ! previous_version="$(git show "${before}:crates/agent/Cargo.toml" | read_version)"; then
+              baseline_valid="false"
+              previous_version=""
+            fi
+          fi
+
+          tag="v${current_version}"
+          changed="false"
+          if [ "$baseline_valid" = "false" ] || [ "$current_version" != "$previous_version" ]; then
+            changed="true"
+          fi
+
+          if [ "$changed" = "true" ]; then
+            git fetch --tags --force origin
+            if git show-ref --verify --quiet "refs/tags/${tag}"; then
+              echo "release tag ${tag} already exists; bump crates/agent/Cargo.toml to a new version" >&2
+              exit 1
+            fi
+          fi
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "version=${current_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
   bundle:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +96,10 @@ jobs:
         run: |
           INDUCTOR_RELEASE_TARGET_LABEL=${{ matrix.target-label }} \
           bash scripts/release/build-bundle.sh
+      - name: Verify release artifacts
+        run: |
+          test -f dist/release/inductor-${{ matrix.target-label }}.tar.gz
+          test -f dist/release/inductor-${{ matrix.target-label }}.tar.gz.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -47,8 +109,10 @@ jobs:
             dist/release/*.sha256
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: bundle
+    needs:
+      - detect
+      - bundle
+    if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download bundled artifacts
@@ -60,6 +124,10 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Inductor ${{ needs.detect.outputs.tag }}
+          generate_release_notes: true
           files: |
             dist/release/*.tar.gz
             dist/release/*.sha256
