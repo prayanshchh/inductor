@@ -40,10 +40,6 @@ esac
 
 if [ -n "$version_override" ]; then
   latest_tag="$version_override"
-  case "$latest_tag" in
-    v*) : ;;
-    *) latest_tag="v$latest_tag" ;;
-  esac
 else
   latest_tag="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$latest_tag" ] || fail "could not determine latest release tag for ${repo}"

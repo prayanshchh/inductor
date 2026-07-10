@@ -1,10 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "*.*.*"
 
 permissions:
   contents: write
@@ -14,7 +13,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            python3 -c 'import sys, tomllib; data = tomllib.loads(sys.stdin.read()); print(data["package"]["version"])'
+          }
+
+          current_version="$(read_version < crates/agent/Cargo.toml)"
+          [ -n "$current_version" ] || {
+            echo "could not read current version from crates/agent/Cargo.toml" >&2
+            exit 1
+          }
+
+          tag="${{ github.ref_name }}"
+          if [ "$tag" != "$current_version" ]; then
+            echo "release tag ${tag} does not match crates/agent/Cargo.toml version ${current_version}" >&2
+            exit 1
+          fi
+
+          echo "version=${current_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
   bundle:
+    needs: detect
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +69,10 @@ jobs:
         run: |
           INDUCTOR_RELEASE_TARGET_LABEL=${{ matrix.target-label }} \
           bash scripts/release/build-bundle.sh
+      - name: Verify release artifacts
+        run: |
+          test -f dist/release/inductor-${{ matrix.target-label }}.tar.gz
+          test -f dist/release/inductor-${{ matrix.target-label }}.tar.gz.sha256
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -47,8 +82,9 @@ jobs:
             dist/release/*.sha256
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: bundle
+    needs:
+      - detect
+      - bundle
     runs-on: ubuntu-latest
     steps:
       - name: Download bundled artifacts
@@ -60,6 +96,10 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Inductor ${{ needs.detect.outputs.tag }}
+          generate_release_notes: true
           files: |
             dist/release/*.tar.gz
             dist/release/*.sha256

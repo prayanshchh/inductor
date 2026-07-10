@@ -189,6 +189,6 @@ GitHub Actions lives under `.github/workflows/`:
 - `ci.yml` runs Rust formatting, strict clippy, Rust tests, TUI type-checks/tests, and startup smoke checks on Ubuntu and macOS.
 - `coverage.yml` records Rust coverage with a 66% line-coverage threshold and TUI coverage with a 70% line-coverage threshold.
 - `pr-section-tests.yml` uses path filtering to run only the affected PR checks for tools, providers, and the OpenTUI frontend.
-- `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases on `v*` tags.
+- `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases when a matching semver tag such as `0.1.0` is pushed.
 
 To enforce these before merge, configure branch protection in GitHub so the CI, coverage, and relevant section test checks are required status checks.
