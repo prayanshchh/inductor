@@ -2,29 +2,24 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "crates/agent/Cargo.toml"
+    tags:
+      - "*.*.*"
 
 permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-main
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.release.outputs.changed }}
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - id: release
         shell: bash
         run: |
@@ -40,39 +35,17 @@ jobs:
             exit 1
           }
 
-          before="${{ github.event.before }}"
-          previous_version=""
-          baseline_valid="true"
-          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            baseline_valid="false"
-          else
-            if ! previous_version="$(git show "${before}:crates/agent/Cargo.toml" | read_version)"; then
-              baseline_valid="false"
-              previous_version=""
-            fi
+          tag="${{ github.ref_name }}"
+          if [ "$tag" != "$current_version" ]; then
+            echo "release tag ${tag} does not match crates/agent/Cargo.toml version ${current_version}" >&2
+            exit 1
           fi
 
-          tag="v${current_version}"
-          changed="false"
-          if [ "$baseline_valid" = "false" ] || [ "$current_version" != "$previous_version" ]; then
-            changed="true"
-          fi
-
-          if [ "$changed" = "true" ]; then
-            git fetch --tags --force origin
-            if git show-ref --verify --quiet "refs/tags/${tag}"; then
-              echo "release tag ${tag} already exists; bump crates/agent/Cargo.toml to a new version" >&2
-              exit 1
-            fi
-          fi
-
-          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           echo "version=${current_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
   bundle:
     needs: detect
-    if: needs.detect.outputs.changed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -112,7 +85,6 @@ jobs:
     needs:
       - detect
       - bundle
-    if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download bundled artifacts
