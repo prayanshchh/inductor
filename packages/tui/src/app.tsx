@@ -6,7 +6,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import path from "node:path"
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import {
   applyPermissionDecision,
@@ -2812,15 +2812,16 @@ function Timeline(props: {
 }) {
   return (
     <box flexDirection="column" paddingTop={1} paddingBottom={1} gap={1}>
-      <For each={props.items}>
+      {/* `Index` keeps transcript rows mounted as the same assistant item text grows, which avoids remount flicker while the live markdown re-renders. */}
+      <Index each={props.items}>
         {(item) => (
           <TimelineItem
-            item={item}
-            expanded={props.expanded.has(item.id)}
-            toggle={() => props.toggleExpanded(item.id)}
+            item={item()}
+            expanded={props.expanded.has(item().id)}
+            toggle={() => props.toggleExpanded(item().id)}
           />
         )}
-      </For>
+      </Index>
       <Show when={props.pendingQuestions}>
         {(pending) => (
           <QuestionTimelineItem
