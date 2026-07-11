@@ -1,194 +1,104 @@
 # Inductor
 
-Inductor is a terminal-native AI coding agent. You point it at a workspace, it
-opens a rich TUI, and you drive a coding session through your favorite model
-provider while Inductor owns the workspace tools (read, edit, grep, bash, …),
-permission gating, diffs, and session history.
+**Run multiple AI coding agents in parallel—without branch conflicts.**
 
-Under the hood Inductor pairs a Rust harness (execution, tools, persistence,
-git worktrees) with an [OpenTUI](https://github.com/sst/opentui) frontend, and
-talks to providers like **Claude** (via the Claude Agent SDK) and **Codex**.
+Inductor is a terminal-native AI coding workspace for **Claude**, **OpenAI Codex**, and **GitHub Copilot**. Each agent runs in its own Git worktree and branch, so you can assign several tasks at once while keeping every change isolated.
 
----
+![Inductor home screen](assets/inductor-home.png)
 
-## Requirements
+## Why Inductor?
 
-Before running Inductor, make sure you have:
+### Parallel agents, isolated by default
 
-- **Rust** (stable toolchain, edition 2024) — <https://rustup.rs>
-- **Bun** `>= 1.3` — <https://bun.sh> (only needed when building from source or developing the TUI)
-- **Node.js + npm** — needed for the Claude provider's JS bridge
-- A logged-in provider:
-  - **Claude**: a working [Claude Code](https://docs.anthropic.com/en/docs/claude-code) login
-    (run `claude` in your terminal once and sign in). Inductor reuses that
-    user-level credential.
-  - **Codex**: a Codex/OpenAI login (`~/.codex/auth.json`, or set `CODEX_HOME`).
+Start one agent to fix a bug, another to build a feature, and another to review the code. Every session gets its own:
 
-You can confirm Inductor sees a credential with:
+- Git worktree and branch
+- Conversation and task history
+- Provider, model, and reasoning effort
+- Terminal, modified-file list, and diff
+- Permission policy
 
-```sh
-inductor auth detect
+Press **Ctrl+N** or use `/new` to start another agent. Existing agents continue running while you move between sessions.
+
+### Use the model you want
+
+Inductor supports:
+
+- **Claude** through Claude Code
+- **OpenAI Codex** through Codex authentication
+- **GitHub Copilot** through GitHub device login
+
+Switch providers with `/connect` and models with `/model`.
+
+### See and control the work
+
+Inductor keeps the full coding workflow visible inside the terminal: tool calls, shell commands, file changes, to-dos, diffs, session history, and pull-request creation.
+
+## Model vs. model family
+
+| Mode | How it works | Best for |
+| --- | --- | --- |
+| **Model** | One provider and model handles the whole session | Fast, straightforward tasks |
+| **Model family** | Separate reasoning, executor, and reviewer models cooperate in one worktree | Larger tasks that benefit from planning, execution, and independent review |
+
+A model family follows this workflow:
+
+```text
+Reasoning → Executor → Reasoning check → Reviewer → Final decision
 ```
 
----
+The roles may use different providers and effort levels. Model-family roles work sequentially inside one session; use `/new` when you want truly parallel agents.
 
-## Install
+## Quick start
 
-### Install a release bundle
-
-Release bundles ship the CLI binary as `inductor` plus the self-contained
-`inductor-open-tui` frontend.
-
-- `inductor` — the main CLI users run; it launches the full UI/harness
-- `inductor-open-tui` — the packaged self-contained UI frontend that `inductor` starts internally
-
-Unpack a release archive, keep both binaries in the same directory, and add
-that directory to your `PATH`. Running `inductor` will automatically launch
-the packaged frontend without requiring Bun.
-
-Current release binaries support **Apple Silicon macOS only**.
-
-Or install the latest GitHub Release directly:
+Prebuilt releases currently support **Apple Silicon macOS**.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/prayanshchhablani/inductor/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/prayanshchh/inductor/main/scripts/install.sh \
+  | INDUCTOR_REPO=prayanshchh/inductor sh
 ```
 
-### Build from source
-
-Clone the repo and install dependencies:
+Authenticate with Claude Code or Codex before starting, or connect GitHub Copilot from inside Inductor.
 
 ```sh
-git clone <repo-url> inductor
-cd inductor
-
-# JS/TUI dependencies (also wires up the Claude bridge via postinstall)
-bun install
-
-# Build the Rust binary and self-contained UI frontend
-cargo build --release
-INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui
-```
-
-The compiled binaries land at `target/release/inductor` and
-`target/release/inductor-open-tui`. Keep them side by side if you want
-plain `inductor` to run without Bun. For a packaged archive, run:
-
-```sh
-bun run bundle:release
-```
-
-If you only want the Rust CLI on your `PATH`, you can still install it with:
-
-```sh
-cargo install --path crates/agent
-```
-
----
-
-## Usage
-
-Start an interactive session in the current directory:
-
-```sh
+cd path/to/your-project
 inductor
 ```
 
-Common options:
+Then enter a task:
 
-```sh
-# Pick a provider (defaults to claude)
-inductor --provider codex
-
-# Choose a workspace folder
-inductor --workspace ./my-project
-
-# Use a specific model
-inductor --provider claude --model claude-sonnet-4-5
-
-# Restrict file tools and bash to the workspace instead of yolo mode
-inductor --workspace-only
+```text
+Find the cause of the failing authentication tests, fix it, and run the focused test suite.
 ```
 
-### Approval modes
+Press **Ctrl+N** and give the next agent a separate task. Both agents can work at the same time in isolated branches.
 
-By default Inductor runs in **yolo mode** — it never pauses to ask before
-running commands, edits, reads, or writes. To require approval before mutating
-actions, pass an approval policy:
+## Commands
 
-```sh
-inductor --approval on_request
-```
+Type `/` to open the command palette.
 
-| Value        | Behavior                                            |
-| ------------ | --------------------------------------------------- |
-| `never`      | Default. Auto-run every tool (yolo).                |
-| `on_request` | Ask before running mutating tools (edit/write/bash).|
+![Inductor command palette](assets/inductor-command-palette.png)
 
-Add `--workspace-only` to confine file tools and bash to the chosen workspace.
+| Command | Purpose |
+| --- | --- |
+| `/agents` | Switch between Build, Review, and Plan behaviour |
+| `/connect` | Connect or switch Claude, Codex, or GitHub Copilot |
+| `/effort` | Change reasoning effort |
+| `/fast` | Open the reasoning-effort selector |
+| `/help` | Show keyboard shortcuts |
+| `/model` | Choose one model for the session |
+| `/model_family` | Configure reasoning, executor, and reviewer models |
+| `/new` | Start another parallel agent session |
+| `/permissions` | Control approvals and workspace access |
+| `/pr` | Commit, push, and create a pull request |
+| `/resume` | Resume the latest interrupted prompt |
+| `/review` | Review the current worktree changes |
+| `/sessions` | Browse and reopen saved sessions |
+| `/skill` | Create a reusable skill |
+| `/skills` | Select reusable skills for prompts |
+| `/clear` | Start a clean session |
+| `/exit` | Exit Inductor |
 
----
+## Built for parallel software work
 
-## How it works
-
-- **Rust harness** (`crates/`) runs the turn loop, executes tools, enforces
-  permissions, computes diffs, and persists sessions to a local SQLite DB
-  (default: `<workspace>/.inductor/state.db`).
-- **OpenTUI frontend** (`packages/tui`) renders the chat, tool activity, diffs,
-  and terminal panes. It's launched automatically by `inductor`.
-- **Providers** plug into a common interface:
-  - `provider-claude` bridges to the Claude Agent SDK
-    (`crates/provider-claude/js/claude_agent_sdk_bridge.mjs`).
-  - `provider-codex` integrates Codex.
-
-Inductor owns the workspace tools (read/edit/grep/bash/etc.) so the model's
-actions are gated and rendered consistently, regardless of provider.
-
----
-
-## Troubleshooting
-
-- **`401 Invalid authentication credentials` (Claude):** make sure you've signed
-  in with Claude Code (`claude` in the terminal). Inductor loads the *user*
-  setting source for credentials.
-- **`inductor auth detect` shows `status: none`:** no provider login was found.
-  Sign in to Claude Code or Codex, then retry.
-- **`OpenTUI dependencies are missing`:** if you're running from a source checkout, run `bun install` from the repo root.
-- **`Inductor UI frontend is unavailable`:** either run `INDUCTOR_TUI_OUTFILE=target/release/inductor-open-tui bun run build:tui` from the repo root or use a release archive that includes `inductor-open-tui` next to `inductor`.
-
----
-
-## Development
-
-```sh
-# One-time local hook setup
-bash scripts/setup-git-hooks.sh
-
-# Fast pre-commit gate
-bash scripts/checks/pre-commit.sh
-
-# Full pre-push / CI-equivalent gate
-bash scripts/checks/pre-push.sh
-
-# Build a distributable release bundle for the current platform
-bun run bundle:release
-
-# Run the TUI frontend directly during development
-bun run tui
-
-# Type-check and test the TUI
-bun run typecheck
-bun run test:tui
-
-# Rust tests
-cargo test
-```
-
-GitHub Actions lives under `.github/workflows/`:
-
-- `ci.yml` runs Rust formatting, strict clippy, Rust tests, TUI type-checks/tests, and startup smoke checks on Ubuntu and macOS.
-- `coverage.yml` records Rust coverage with a 66% line-coverage threshold and TUI coverage with a 70% line-coverage threshold.
-- `pr-section-tests.yml` uses path filtering to run only the affected PR checks for tools, providers, and the OpenTUI frontend.
-- `release.yml` builds tar.gz bundles containing `inductor` and the self-contained `inductor-open-tui`, uploads them as workflow artifacts, and publishes them to GitHub Releases when a matching semver tag such as `0.1.0` is pushed.
-
-To enforce these before merge, configure branch protection in GitHub so the CI, coverage, and relevant section test checks are required status checks.
+Inductor is for developers who want more than a single AI chat window. It gives you a local control center where multiple coding agents can investigate, implement, test, and review work across isolated branches—at the same time.
