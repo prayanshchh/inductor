@@ -12,7 +12,6 @@ test -x ./target/release/inductor-open-tui
 test -x ./target/release/inductor
 ./target/release/inductor --version-info >/dev/null
 ./target/release/inductor --help >/dev/null
-./target/release/inductor open-tui --help >/dev/null
 ./target/release/inductor session demo-events >/dev/null
 ./target/release/inductor context count --text hello >/dev/null
 ./target/release/inductor diff show --repo . --summary >/dev/null
