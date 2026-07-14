@@ -164,6 +164,20 @@ export type StoredSessionDetail = {
   }
   messages: StoredMessage[]
   events?: SessionEvent[]
+  message_count?: number
+  event_count?: number
+  event_start_ordinal?: number | null
+  event_end_ordinal?: number | null
+  messages_truncated?: boolean
+  events_truncated?: boolean
+  provider_error_requires_human?: boolean
+}
+
+export type StoredSessionEventPage = {
+  events: SessionEvent[]
+  event_start_ordinal?: number | null
+  event_end_ordinal?: number | null
+  has_older: boolean
 }
 
 export type ProviderModel = {
@@ -174,6 +188,10 @@ export type ProviderModel = {
 
 const decoder = new TextDecoder()
 const encoder = new TextEncoder()
+const STORED_SESSION_EVENT_LIMIT = 1_000
+const STORED_SESSION_MESSAGE_LIMIT = 250
+const STORED_SESSION_HISTORY_PAGE_LIMIT = 500
+const STORED_SESSION_FIELD_MAX_BYTES = 32 * 1024
 
 export function startBackendTurn(prompt: string, options: BackendOptions, callbacks: BackendCallbacks): BackendRun {
   const cmd = [
@@ -282,10 +300,42 @@ export async function showWorkspaceSession(options: Pick<BackendOptions, "backen
     "--session-id",
     sessionId,
     "--json",
+    "--event-limit",
+    String(STORED_SESSION_EVENT_LIMIT),
+    "--message-limit",
+    String(STORED_SESSION_MESSAGE_LIMIT),
+    "--max-content-bytes",
+    String(STORED_SESSION_FIELD_MAX_BYTES),
   ]
   if (stateDb) args.push("--state-db", stateDb)
   const output = await runBackendJson(options, args)
   return output as StoredSessionDetail
+}
+
+export async function showWorkspaceSessionHistoryPage(
+  options: Pick<BackendOptions, "backendBin" | "repoRoot" | "workspace">,
+  sessionId: string,
+  beforeOrdinal: number,
+  stateDb?: string,
+): Promise<StoredSessionEventPage> {
+  const args = [
+    "db",
+    "session-events",
+    "--workspace",
+    options.workspace,
+    "--session-id",
+    sessionId,
+    "--before-ordinal",
+    String(beforeOrdinal),
+    "--limit",
+    String(STORED_SESSION_HISTORY_PAGE_LIMIT),
+    "--max-content-bytes",
+    String(STORED_SESSION_FIELD_MAX_BYTES),
+    "--json",
+  ]
+  if (stateDb) args.push("--state-db", stateDb)
+  const output = await runBackendJson(options, args)
+  return output as StoredSessionEventPage
 }
 
 export async function listWorktrees(options: Pick<BackendOptions, "backendBin" | "repoRoot" | "appDb" | "workspace">): Promise<Worktree[]> {

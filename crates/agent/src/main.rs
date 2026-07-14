@@ -25,8 +25,8 @@ use harness_runtime::{
 };
 use image::GenericImageView;
 use persistence::{
-    AppDb, StoredMessage, ToolCallRecord, ToolResultRecord, WorkspaceDb, WorktreeRecord,
-    WorktreeStatus, new_session_record, now_rfc3339, workspace_state_path,
+    AppDb, PersistenceError, StoredMessage, ToolCallRecord, ToolResultRecord, WorkspaceDb,
+    WorktreeRecord, WorktreeStatus, new_session_record, now_rfc3339, workspace_state_path,
 };
 use provider_claude::ClaudeProvider;
 use provider_codex::CodexProvider;
@@ -46,13 +46,16 @@ use tools::{StructuredPatch, TextEdit, ToolRuntime};
 
 const MAX_PROMPT_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_REPO_MEMORY_BYTES: usize = 32 * 1024;
-const ORPHANED_SESSION_RECOVERY_MESSAGE: &str = "Recovered after Inductor restarted: the previous agent run was interrupted before it could finish. Inductor will automatically resume the latest interrupted prompt when this session is loaded.";
+const ORPHANED_SESSION_RECOVERY_MESSAGE: &str = "Recovered after Inductor restarted: the previous agent run was interrupted before it could finish. Inductor will automatically resume only when the interrupted chain has no provider error; otherwise it will wait for human input.";
 const RESUME_PROMPT_MARKER: &str = "__INDUCTOR_RESUME__";
 const RESUME_ACTIVITY_MAX_BYTES: usize = 24 * 1024;
 const RESUME_TOOL_OUTPUT_MAX_BYTES: usize = 2 * 1024;
 const RESUME_TOOL_INPUT_MAX_BYTES: usize = 2 * 1024;
 const RESUME_ASSISTANT_OUTPUT_MAX_BYTES: usize = 2 * 1024;
 const RESUME_ERROR_MAX_BYTES: usize = 2 * 1024;
+const RESUME_EVENT_LIMIT: usize = 2_000;
+const RESUME_MESSAGE_LIMIT: usize = 1_000;
+const SESSION_EVENT_PAGE_MAX: usize = 2_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "inductor")]
@@ -309,6 +312,43 @@ enum DbCommand {
 
         #[arg(long)]
         session_id: SessionId,
+
+        #[arg(long)]
+        json: bool,
+
+        /// Return only the newest N durable events, in chronological order.
+        #[arg(long)]
+        event_limit: Option<usize>,
+
+        /// Return only the newest N stored messages, in chronological order.
+        #[arg(long)]
+        message_limit: Option<usize>,
+
+        /// Truncate individual JSON string fields to this many bytes.
+        #[arg(long)]
+        max_content_bytes: Option<usize>,
+    },
+    /// Read one bounded page of durable session events before an exclusive
+    /// ordinal cursor. Intended for incremental transcript history loading.
+    SessionEvents {
+        #[arg(long)]
+        workspace: PathBuf,
+
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+
+        #[arg(long)]
+        session_id: SessionId,
+
+        #[arg(long)]
+        before_ordinal: Option<i64>,
+
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+
+        /// Truncate individual JSON string fields to this many bytes.
+        #[arg(long)]
+        max_content_bytes: Option<usize>,
 
         #[arg(long)]
         json: bool,
@@ -1119,6 +1159,17 @@ fn select_opentui_frontend(
     backend_bin: &Path,
     workspace: &Path,
 ) -> Result<OpenTuiFrontend, String> {
+    let frontend_bin = packaged_opentui_binary(backend_bin);
+    // `cargo build --release` plus `build:tui` is an explicit packaged launch
+    // workflow. Use that optimized sibling instead of paying the source
+    // transpiler/runtime overhead; debug binaries still prefer live source.
+    if is_release_profile_binary(backend_bin) && frontend_bin.exists() {
+        return Ok(OpenTuiFrontend::Packaged {
+            frontend_bin,
+            backend_cwd: workspace.to_path_buf(),
+        });
+    }
+
     if let Some(repo_root) = source_repo_root {
         let tui_dir = opentui_dir(repo_root);
         if opentui_entrypoint(&tui_dir).exists() {
@@ -1129,7 +1180,6 @@ fn select_opentui_frontend(
         }
     }
 
-    let frontend_bin = packaged_opentui_binary(backend_bin);
     if frontend_bin.exists() {
         return Ok(OpenTuiFrontend::Packaged {
             frontend_bin,
@@ -1141,6 +1191,13 @@ fn select_opentui_frontend(
         "Inductor UI frontend is unavailable. Expected either a source checkout at packages/tui/src/index.tsx or a packaged frontend at {}. Build it with `bun run build:tui` or download a release bundle.",
         frontend_bin.display()
     ))
+}
+
+fn is_release_profile_binary(backend_bin: &Path) -> bool {
+    backend_bin
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "release")
 }
 
 fn ensure_opentui_dependencies(repo_root: &Path, tui_dir: &Path) -> Result<(), String> {
@@ -1749,22 +1806,77 @@ async fn run_db_command(command: DbCommand) -> Result<(), String> {
             state_db,
             session_id,
             json: json_output,
+            event_limit,
+            message_limit,
+            max_content_bytes,
         } => {
             let path = state_db.unwrap_or_else(|| workspace_state_path(&workspace));
-            let db = WorkspaceDb::open(&path).map_err(|err| err.to_string())?;
+            let db = open_workspace_db_for_read(&path)?;
             let session = db
                 .get_session(session_id)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| format!("session not found: {session_id}"))?;
-            let messages = db.messages(session_id).map_err(|err| err.to_string())?;
-            let events = db.events(session_id).map_err(|err| err.to_string())?;
+            let message_count = db
+                .message_count(session_id)
+                .map_err(|err| err.to_string())?;
+            let event_count = db.event_count(session_id).map_err(|err| err.to_string())?;
+            let mut messages = match message_limit {
+                Some(limit) => db.messages_tail(session_id, limit),
+                None => db.messages(session_id),
+            }
+            .map_err(|err| err.to_string())?;
+            let (events, event_start_ordinal, event_end_ordinal) = match event_limit {
+                Some(limit) => {
+                    let rows = db
+                        .events_page_before(session_id, None, limit)
+                        .map_err(|err| err.to_string())?;
+                    let start = rows.first().map(|(ordinal, _)| *ordinal);
+                    let end = rows.last().map(|(ordinal, _)| *ordinal);
+                    (
+                        rows.into_iter().map(|(_, event)| event).collect(),
+                        start,
+                        end,
+                    )
+                }
+                None => (
+                    db.events(session_id).map_err(|err| err.to_string())?,
+                    None,
+                    None,
+                ),
+            };
             if json_output {
+                let provider_error_requires_human = provider_error_requires_human(&db, session_id)?;
+                if let Some(max_bytes) = max_content_bytes {
+                    for message in &mut messages {
+                        message.content = truncate_display_text(&message.content, max_bytes);
+                    }
+                }
+                let events = events
+                    .into_iter()
+                    .map(|event| {
+                        let mut value =
+                            serde_json::to_value(event).map_err(|err| err.to_string())?;
+                        if let Some(max_bytes) = max_content_bytes {
+                            truncate_json_strings(&mut value, max_bytes);
+                        }
+                        Ok(value)
+                    })
+                    .collect::<Result<Vec<serde_json::Value>, String>>()?;
+                let messages_truncated = messages.len() < message_count;
+                let events_truncated = events.len() < event_count;
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
                         "session": session,
                         "messages": messages,
                         "events": events,
+                        "message_count": message_count,
+                        "event_count": event_count,
+                        "event_start_ordinal": event_start_ordinal,
+                        "event_end_ordinal": event_end_ordinal,
+                        "messages_truncated": messages_truncated,
+                        "events_truncated": events_truncated,
+                        "provider_error_requires_human": provider_error_requires_human,
                     }))
                     .map_err(|err| err.to_string())?
                 );
@@ -1781,9 +1893,75 @@ async fn run_db_command(command: DbCommand) -> Result<(), String> {
                 );
             }
         }
+        DbCommand::SessionEvents {
+            workspace,
+            state_db,
+            session_id,
+            before_ordinal,
+            limit,
+            max_content_bytes,
+            json: json_output,
+        } => {
+            let path = state_db.unwrap_or_else(|| workspace_state_path(&workspace));
+            let db = open_workspace_db_for_read(&path)?;
+            let limit = limit.min(SESSION_EVENT_PAGE_MAX);
+            let rows = db
+                .events_page_before(session_id, before_ordinal, limit)
+                .map_err(|err| err.to_string())?;
+            let event_start_ordinal = rows.first().map(|(ordinal, _)| *ordinal);
+            let event_end_ordinal = rows.last().map(|(ordinal, _)| *ordinal);
+            let has_older = match event_start_ordinal {
+                Some(ordinal) => db
+                    .has_events_before(session_id, ordinal)
+                    .map_err(|err| err.to_string())?,
+                None => false,
+            };
+            let events = rows
+                .into_iter()
+                .map(|(_, event)| {
+                    let mut value = serde_json::to_value(event).map_err(|err| err.to_string())?;
+                    if let Some(max_bytes) = max_content_bytes {
+                        truncate_json_strings(&mut value, max_bytes);
+                    }
+                    Ok(value)
+                })
+                .collect::<Result<Vec<serde_json::Value>, String>>()?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "events": events,
+                        "event_start_ordinal": event_start_ordinal,
+                        "event_end_ordinal": event_end_ordinal,
+                        "has_older": has_older,
+                    }))
+                    .map_err(|err| err.to_string())?
+                );
+                return Ok(());
+            }
+            for event in events {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).map_err(|err| err.to_string())?
+                );
+            }
+        }
     }
 
     Ok(())
+}
+
+fn open_workspace_db_for_read(path: &Path) -> Result<WorkspaceDb, String> {
+    if !path.exists() {
+        return WorkspaceDb::open(path).map_err(|err| err.to_string());
+    }
+    match WorkspaceDb::open_read_only(path) {
+        Ok(db) => Ok(db),
+        Err(PersistenceError::OutdatedSchema { .. }) => {
+            WorkspaceDb::open(path).map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2529,7 +2707,9 @@ fn is_resume_command(prompt: &str) -> bool {
 }
 
 fn resume_model_prompt(db: &WorkspaceDb, session_id: SessionId) -> Result<String, String> {
-    let events = db.events(session_id).map_err(|err| err.to_string())?;
+    let events = db
+        .events_tail(session_id, RESUME_EVENT_LIMIT)
+        .map_err(|err| err.to_string())?;
     let latest_user_event =
         events
             .iter()
@@ -2544,7 +2724,9 @@ fn resume_model_prompt(db: &WorkspaceDb, session_id: SessionId) -> Result<String
     let (latest_index, latest_prompt) = if let Some(found) = latest_user_event {
         found
     } else {
-        let messages = db.messages(session_id).map_err(|err| err.to_string())?;
+        let messages = db
+            .messages_tail(session_id, RESUME_MESSAGE_LIMIT)
+            .map_err(|err| err.to_string())?;
         let latest = messages
             .iter()
             .rev()
@@ -2678,6 +2860,66 @@ fn truncate_resume_text(text: &str, max_bytes: usize) -> String {
         "{}\n[truncated resume context: omitted {omitted} byte(s); inspect current files or rerun a focused command if more detail is needed]",
         &text[..end]
     )
+}
+
+fn truncate_display_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = text.len().saturating_sub(end);
+    format!(
+        "{}\n[older session content truncated for display: {omitted} byte(s) omitted]",
+        &text[..end]
+    )
+}
+
+fn truncate_json_strings(value: &mut serde_json::Value, max_bytes: usize) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = truncate_display_text(text, max_bytes);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                truncate_json_strings(value, max_bytes);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                truncate_json_strings(value, max_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn provider_error_requires_human(db: &WorkspaceDb, session_id: SessionId) -> Result<bool, String> {
+    let mut blocked = false;
+    db.scan_events_reverse(session_id, |event| match event {
+        SessionEvent::Error { message, .. }
+            if !message.contains("Recovered after Inductor restarted") =>
+        {
+            blocked = true;
+            true
+        }
+        SessionEvent::UserMessage { text, .. } if !is_model_family_internal_prompt(text) => false,
+        _ => true,
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(blocked)
+}
+
+fn is_model_family_internal_prompt(text: &str) -> bool {
+    [
+        "You are now the reasoning role.",
+        "You are now the executor role.",
+        "You are now the reviewer role.",
+    ]
+    .iter()
+    .any(|prefix| text.trim_start().starts_with(prefix))
 }
 
 fn persist_submitted_user_message(
@@ -4119,6 +4361,79 @@ mod tests {
     }
 
     #[test]
+    fn display_history_truncation_is_utf8_safe_and_recursive() {
+        let mut value = serde_json::json!({
+            "output": "éééé",
+            "nested": ["abcdefgh"]
+        });
+
+        truncate_json_strings(&mut value, 5);
+
+        assert!(value["output"].as_str().unwrap().starts_with("éé"));
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap()
+                .contains("truncated for display")
+        );
+        assert!(value["nested"][0].as_str().unwrap().starts_with("abcde"));
+    }
+
+    #[test]
+    fn recovery_error_scan_ignores_automatic_roles_but_stops_at_human_input() {
+        let db = WorkspaceDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        for event in [
+            SessionEvent::UserMessage {
+                session_id,
+                text: "implement the feature".to_string(),
+            },
+            SessionEvent::Error {
+                session_id,
+                message: "provider unavailable".to_string(),
+            },
+            SessionEvent::UserMessage {
+                session_id,
+                text: "You are now the executor role. Continue automatically.".to_string(),
+            },
+            SessionEvent::Error {
+                session_id,
+                message: ORPHANED_SESSION_RECOVERY_MESSAGE.to_string(),
+            },
+        ] {
+            db.append_event(session_id, &event).unwrap();
+        }
+        assert!(provider_error_requires_human(&db, session_id).unwrap());
+
+        db.append_event(
+            session_id,
+            &SessionEvent::UserMessage {
+                session_id,
+                text: "/resume".to_string(),
+            },
+        )
+        .unwrap();
+        db.append_event(
+            session_id,
+            &SessionEvent::Error {
+                session_id,
+                message: ORPHANED_SESSION_RECOVERY_MESSAGE.to_string(),
+            },
+        )
+        .unwrap();
+        assert!(!provider_error_requires_human(&db, session_id).unwrap());
+    }
+
+    #[test]
     fn submitted_multimodal_user_message_persists_visible_text() {
         let workspace = temp_workspace("submitted-multimodal-user-message");
         let db = WorkspaceDb::open(workspace.join("state.db")).unwrap();
@@ -4274,11 +4589,39 @@ mod tests {
     }
 
     #[test]
-    fn select_opentui_frontend_prefers_source_checkout() {
-        let repo = temp_workspace("opentui-source-preferred");
+    fn select_release_opentui_frontend_prefers_packaged_sibling() {
+        let repo = temp_workspace("opentui-release-packaged");
         let workspace = repo.join("workspace");
         let tui_dir = opentui_dir(&repo);
         let backend_dir = repo.join("target").join("release");
+        let backend_bin = backend_dir.join("inductor");
+        let packaged_frontend = backend_dir.join(opentui_binary_name());
+
+        std::fs::create_dir_all(opentui_entrypoint(&tui_dir).parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        std::fs::write(opentui_entrypoint(&tui_dir), "").unwrap();
+        std::fs::write(&backend_bin, "").unwrap();
+        std::fs::write(&packaged_frontend, "").unwrap();
+
+        let selected = select_opentui_frontend(Some(&repo), &backend_bin, &workspace).unwrap();
+        assert_eq!(
+            selected,
+            OpenTuiFrontend::Packaged {
+                frontend_bin: packaged_frontend,
+                backend_cwd: workspace.clone(),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn select_debug_opentui_frontend_prefers_source_checkout() {
+        let repo = temp_workspace("opentui-debug-source-preferred");
+        let workspace = repo.join("workspace");
+        let tui_dir = opentui_dir(&repo);
+        let backend_dir = repo.join("target").join("debug");
         let backend_bin = backend_dir.join("inductor");
         let packaged_frontend = backend_dir.join(opentui_binary_name());
 

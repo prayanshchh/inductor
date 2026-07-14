@@ -65,6 +65,9 @@ export type AppState = {
   title: string
 }
 
+export const RECOVERED_RESTART_MARKER = "Recovered after Inductor restarted"
+const MODEL_FAMILY_INTERNAL_PROMPT = /^You are now the (?:reasoning|executor|reviewer) role\./
+
 export function createInitialState(): AppState {
   return {
     transcript: [],
@@ -96,20 +99,130 @@ export function loadStoredSession(detail: StoredSessionDetail): AppState {
     status: String(detail.session.status ?? "idle").toLowerCase(),
   }
   if (Array.isArray(detail.events) && detail.events.length > 0) {
-    const firstPrompt = firstUserMessage(detail)
-    const startsWithUserEvent = detail.events[0]?.type === "user_message"
-    const withPrompt = firstPrompt && !startsWithUserEvent
-      ? { ...initial, transcript: [{ id: nextId("user"), kind: "user" as const, text: firstPrompt }] }
-      : initial
-    return detail.events.reduce((current, event) => applySessionEvent(current, event), withPrompt)
+    return replayStoredSessionEvents(
+      detail.events,
+      initial,
+      Number(detail.event_count ?? detail.events.length),
+      Boolean(detail.events_truncated),
+      firstUserMessage(detail),
+    )
   }
+  const historyNotice = storedHistoryNotice(
+    Number(detail.event_count ?? 0),
+    detail.events?.length ?? 0,
+    Boolean(detail.events_truncated),
+  )
   const transcript = detail.messages
     .map(storedMessageToTranscriptItem)
     .filter((item): item is TranscriptItem => Boolean(item))
   return {
     ...initial,
-    transcript,
+    transcript: [...historyNotice, ...transcript],
   }
+}
+
+/** Replay a bounded event window into transcript rows for temporary history. */
+export function replayStoredSessionTranscript(
+  events: SessionEvent[],
+  totalEventCount: number,
+  hasOlder: boolean,
+): TranscriptItem[] {
+  return replayStoredSessionEvents(
+    events,
+    createInitialState(),
+    totalEventCount,
+    hasOlder,
+  ).transcript
+}
+
+function replayStoredSessionEvents(
+  events: SessionEvent[],
+  initial: AppState,
+  totalEventCount: number,
+  hasOlder: boolean,
+  firstPrompt?: string,
+) {
+  const historyNotice = storedHistoryNotice(totalEventCount, events.length, hasOlder)
+  const startsWithUserEvent = events[0]?.type === "user_message"
+  const prompt: TranscriptItem[] = firstPrompt && !startsWithUserEvent && !hasOlder
+    ? [{ id: nextId("user"), kind: "user", text: firstPrompt }]
+    : []
+  const withPrompt = {
+    ...initial,
+    transcript: [...historyNotice, ...prompt],
+  }
+  return compactStoredSessionEvents(events)
+    .reduce((current, event) => applySessionEvent(current, event), withPrompt)
+}
+
+function storedHistoryNotice(totalEventCount: number, loadedEventCount: number, hasOlder: boolean): TranscriptItem[] {
+  if (!hasOlder) return []
+  const omittedEvents = Math.max(0, totalEventCount - loadedEventCount)
+  return [{
+    id: nextId("history"),
+    kind: "status",
+    text: `Showing recent session history (${omittedEvents.toLocaleString()} older events kept on disk). Scroll up to load more temporarily.`,
+  }]
+}
+
+/**
+ * A recovered process may resume only when no provider/harness error occurred
+ * after the latest real human prompt. Automatic model-family role prompts do
+ * not count as human intervention and therefore cannot clear an error pause.
+ */
+export function shouldAutoResumeRecoveredSession(detail: StoredSessionDetail) {
+  if (detail.provider_error_requires_human) return false
+  const events = detail.events ?? []
+  let latestHumanPromptIndex = -1
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type !== "user_message") continue
+    const text = typeof event.text === "string" ? event.text.trim() : ""
+    if (text && !MODEL_FAMILY_INTERNAL_PROMPT.test(text)) {
+      latestHumanPromptIndex = index
+      break
+    }
+  }
+
+  let latestMeaningful: SessionEvent | undefined
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].type === "status") continue
+    latestMeaningful = events[index]
+    break
+  }
+  if (!isRestartRecoveryEvent(latestMeaningful)) return false
+
+  return !events.slice(latestHumanPromptIndex + 1).some((event) =>
+    event.type === "error" && !isRestartRecoveryEvent(event),
+  )
+}
+
+function isRestartRecoveryEvent(event: SessionEvent | undefined) {
+  return event?.type === "error"
+    && typeof event.message === "string"
+    && event.message.includes(RECOVERED_RESTART_MARKER)
+}
+
+function compactStoredSessionEvents(events: SessionEvent[]) {
+  const compacted: SessionEvent[] = []
+  for (const event of events) {
+    if (event.type !== "text_delta" && event.type !== "reasoning_delta") {
+      compacted.push(event)
+      continue
+    }
+    const text = event.text ?? event.delta ?? ""
+    if (!text) continue
+    const previous = compacted.at(-1)
+    if (previous?.type === "text_delta") {
+      compacted[compacted.length - 1] = {
+        ...previous,
+        text: `${previous.text ?? ""}${text}`,
+      }
+    } else {
+      compacted.push({ type: "text_delta", text })
+    }
+  }
+  return compacted
 }
 
 export function applySessionEvent(state: AppState, event: SessionEvent): AppState {
@@ -225,11 +338,18 @@ export function applySessionEvent(state: AppState, event: SessionEvent): AppStat
       return event.display_name ? { ...state, title: event.display_name } : state
     case "result":
       if (event.stop_reason === "interrupted") return markAgentStopped(state)
-      return { ...state, running: false, status: String(event.stop_reason ?? "completed"), pendingPermission: undefined, pendingQuestions: undefined }
+      return {
+        ...state,
+        running: false,
+        status: state.status === "waiting_for_human" ? state.status : String(event.stop_reason ?? "completed"),
+        pendingPermission: undefined,
+        pendingQuestions: undefined,
+      }
     case "error":
       return {
         ...state,
         running: false,
+        status: "waiting_for_human",
         transcript: [...state.transcript, { id: nextId("error"), kind: "error", text: event.message ?? "unknown error" }],
       }
     default:

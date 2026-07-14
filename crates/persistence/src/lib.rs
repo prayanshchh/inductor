@@ -12,7 +12,7 @@ use std::{
 use harness_core::{
     AllowRule, AllowRuleKind, ProviderId, SessionEvent, SessionId, SessionStatus, WorkspaceId,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -199,6 +199,10 @@ pub enum PersistenceError {
     TimeFormat(#[from] time::error::Format),
     #[error("database schema version {found} is newer than supported version {supported}")]
     FutureSchema { found: i64, supported: i64 },
+    #[error(
+        "database schema version {found} must be migrated to supported version {supported} before read-only access"
+    )]
+    OutdatedSchema { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
@@ -784,6 +788,34 @@ impl WorkspaceDb {
         Ok(Self { conn })
     }
 
+    /// Open an already-migrated workspace database without taking write locks
+    /// or updating WAL pragmas. This keeps paged transcript reads independent
+    /// from a live agent writer.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        let found = schema_version(&conn)?;
+        if found > WORKSPACE_SCHEMA_VERSION {
+            return Err(PersistenceError::FutureSchema {
+                found,
+                supported: WORKSPACE_SCHEMA_VERSION,
+            });
+        }
+        if found < WORKSPACE_SCHEMA_VERSION {
+            return Err(PersistenceError::OutdatedSchema {
+                found,
+                supported: WORKSPACE_SCHEMA_VERSION,
+            });
+        }
+        Ok(Self { conn })
+    }
+
     pub fn open_default(workspace_dir: impl AsRef<Path>) -> Result<Self> {
         Self::open(workspace_state_path(workspace_dir))
     }
@@ -921,6 +953,43 @@ ORDER BY ordinal ASC
         Ok(rows)
     }
 
+    pub fn message_count(&self, session_id: SessionId) -> Result<usize> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Return the newest messages in chronological order without loading the
+    /// session's full durable transcript into memory.
+    pub fn messages_tail(&self, session_id: SessionId, limit: usize) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT role, content, ordinal
+FROM (
+    SELECT role, content, ordinal
+    FROM messages
+    WHERE session_id = ?1
+    ORDER BY ordinal DESC
+    LIMIT ?2
+)
+ORDER BY ordinal ASC
+"#,
+        )?;
+        let rows = stmt
+            .query_map(params![session_id.to_string(), limit as i64], |row| {
+                Ok(StoredMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    ordinal: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn append_event(&self, session_id: SessionId, event: &SessionEvent) -> Result<i64> {
         let next = next_ordinal(&self.conn, "session_events", session_id)?;
         let event_json = serde_json::to_string(event)?;
@@ -950,6 +1019,124 @@ ORDER BY ordinal ASC
         rows.into_iter()
             .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
             .collect()
+    }
+
+    pub fn event_count(&self, session_id: SessionId) -> Result<usize> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Return the newest events in chronological order. This is the safe path
+    /// for UI and resume snapshots, where replaying an unbounded stream of
+    /// token deltas can otherwise consume gigabytes of memory.
+    pub fn events_tail(&self, session_id: SessionId, limit: usize) -> Result<Vec<SessionEvent>> {
+        Ok(self
+            .events_page_before(session_id, None, limit)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// Return one bounded event page in chronological order. `before_ordinal`
+    /// is an exclusive cursor, so callers can walk backwards through durable
+    /// history without ever materializing the full session.
+    pub fn events_page_before(
+        &self,
+        session_id: SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, SessionEvent)>> {
+        let rows = if let Some(before_ordinal) = before_ordinal {
+            let mut stmt = self.conn.prepare(
+                r#"
+SELECT ordinal, event_json
+FROM (
+    SELECT event_json, ordinal
+    FROM session_events
+    WHERE session_id = ?1
+      AND ordinal < ?2
+    ORDER BY ordinal DESC
+    LIMIT ?3
+)
+ORDER BY ordinal ASC
+"#,
+            )?;
+            stmt.query_map(
+                params![session_id.to_string(), before_ordinal, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                r#"
+SELECT ordinal, event_json
+FROM (
+    SELECT event_json, ordinal
+    FROM session_events
+    WHERE session_id = ?1
+    ORDER BY ordinal DESC
+    LIMIT ?2
+)
+ORDER BY ordinal ASC
+"#,
+            )?;
+            stmt.query_map(params![session_id.to_string(), limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(|(ordinal, raw)| -> Result<(i64, SessionEvent)> {
+                let event = serde_json::from_str(&raw)?;
+                Ok((ordinal, event))
+            })
+            .collect()
+    }
+
+    pub fn has_events_before(&self, session_id: SessionId, ordinal: i64) -> Result<bool> {
+        let exists = self.conn.query_row(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM session_events
+    WHERE session_id = ?1 AND ordinal < ?2
+)
+"#,
+            params![session_id.to_string(), ordinal],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Visit events newest-first without materializing the full session. The
+    /// visitor returns false once enough durable history has been inspected.
+    pub fn scan_events_reverse(
+        &self,
+        session_id: SessionId,
+        mut visitor: impl FnMut(&SessionEvent) -> bool,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            r#"
+SELECT event_json
+FROM session_events
+WHERE session_id = ?1
+ORDER BY ordinal DESC
+"#,
+        )?;
+        let mut rows = stmt.query([session_id.to_string()])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let event = serde_json::from_str(&raw)?;
+            if !visitor(&event) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn upsert_tool_call(&self, call: &ToolCallRecord) -> Result<()> {
@@ -1480,7 +1667,7 @@ mod tests {
             .unwrap();
         }
 
-        let reopened = WorkspaceDb::open(&path).unwrap();
+        let reopened = WorkspaceDb::open_read_only(&path).unwrap();
         let messages = reopened.messages(session_id).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
@@ -1533,6 +1720,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn workspace_db_returns_bounded_history_tails_in_chronological_order() {
+        let db = WorkspaceDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.5",
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        db.replace_messages(
+            session_id,
+            &[
+                StoredMessage::new("User", "one", 0),
+                StoredMessage::new("Assistant", "two", 1),
+                StoredMessage::new("User", "three", 2),
+            ],
+        )
+        .unwrap();
+        for text in ["one", "two", "three"] {
+            db.append_event(
+                session_id,
+                &SessionEvent::TextDelta {
+                    session_id,
+                    text: text.to_string(),
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(db.message_count(session_id).unwrap(), 3);
+        assert_eq!(
+            db.messages_tail(session_id, 2)
+                .unwrap()
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
+        assert_eq!(db.event_count(session_id).unwrap(), 3);
+        assert_eq!(
+            db.events_tail(session_id, 2).unwrap(),
+            vec![
+                SessionEvent::TextDelta {
+                    session_id,
+                    text: "two".to_string(),
+                },
+                SessionEvent::TextDelta {
+                    session_id,
+                    text: "three".to_string(),
+                },
+            ]
+        );
+        let newest_page = db.events_page_before(session_id, None, 2).unwrap();
+        assert_eq!(
+            newest_page
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            db.events_page_before(session_id, Some(1), 2).unwrap(),
+            vec![(
+                0,
+                SessionEvent::TextDelta {
+                    session_id,
+                    text: "one".to_string(),
+                },
+            )]
+        );
+        assert!(db.has_events_before(session_id, 1).unwrap());
+        assert!(!db.has_events_before(session_id, 0).unwrap());
+        let mut reverse = Vec::new();
+        db.scan_events_reverse(session_id, |event| {
+            reverse.push(event.clone());
+            reverse.len() < 2
+        })
+        .unwrap();
+        assert_eq!(
+            reverse,
+            vec![
+                SessionEvent::TextDelta {
+                    session_id,
+                    text: "three".to_string(),
+                },
+                SessionEvent::TextDelta {
+                    session_id,
+                    text: "two".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

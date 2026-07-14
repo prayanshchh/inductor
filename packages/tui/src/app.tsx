@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { stringWidth } from "bun"
-import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, parseColor, type KeyEvent, type OptimizedBuffer } from "@opentui/core"
+import { BoxRenderable, MacOSScrollAccel, SyntaxStyle, TextAttributes, TextareaRenderable, parseColor, type KeyEvent, type OptimizedBuffer, type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { execFile } from "node:child_process"
@@ -16,11 +16,12 @@ import {
   createInitialState,
   loadStoredSession,
   markAgentStopped,
+  shouldAutoResumeRecoveredSession,
   type AppState,
   type ModifiedFile,
   type TranscriptItem,
 } from "./state"
-import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWorkspaceSession, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type ModelRole, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type SkillInfo, type Worktree } from "./backend"
+import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWorkspaceSession, showWorkspaceSessionHistoryPage, startBackendTurn, startCopilotLogin, type AuthStatusEvent, type BackendOptions, type BackendRun, type DevMode, type ModelRole, type PermissionDecision, type ProviderModel, type QuestionAnswer, type QuestionItem, type SessionEvent, type SkillInfo, type Worktree } from "./backend"
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
@@ -42,6 +43,7 @@ import {
 import { deletePromptPlaceholderAtCursor, expandPromptPlaceholders, insertTextAtCursor, parsePromptHistory, recordPromptHistory, serializePromptHistory, shouldCompactPastedText, shouldNavigateHistory, stepPromptHistory, type HistoryDirection, type PromptHistoryState, type PromptPlaceholder } from "./prompt_input"
 import { spawnTerminalSession, type TerminalSession, type TerminalSnapshot } from "./terminal"
 import { isTerminalMouseSequence } from "./terminal_sequences"
+import { appendSessionHistoryEvent, createSessionHistoryWindow, mergeSessionHistoryPage, releaseSessionHistory, type SessionHistoryWindow } from "./session_history"
 export type AppProps = BackendOptions & {
   exitApp(): void
   registerCtrlCHandler(handler: (() => void) | undefined): void
@@ -70,13 +72,24 @@ type AgentSlot = {
   role: string
   stateDb?: string
   state: AppState
+  history?: SessionHistoryWindow
+  lastEventAt?: number
 }
 
 /** Ephemeral per-run bookkeeping for a slot's live subprocess. */
 type OrchestrationPhase = "initial" | "executor_report" | "review_feedback"
 type OrchestrationDecision = "continue" | "review" | "complete" | undefined
 type QueuedPrompt = { visiblePrompt: string; prompt: string; active?: boolean; skills?: string[]; modelRole?: ModelRole; orchestrationRound?: number; orchestrationPhase?: OrchestrationPhase }
-type RunFlags = { stopping: boolean; exitAfter: boolean; forceTimer?: ReturnType<typeof setTimeout>; queued: QueuedPrompt[]; activeQueued?: QueuedPrompt; steering?: QueuedPrompt }
+type RunFlags = {
+  stopping: boolean
+  exitAfter: boolean
+  forceTimer?: ReturnType<typeof setTimeout>
+  queued: QueuedPrompt[]
+  activeQueued?: QueuedPrompt
+  steering?: QueuedPrompt
+  /** The last turn stopped on a provider error that needs a human decision. */
+  pausedForHuman?: QueuedPrompt
+}
 type PaletteKind = "commands" | "models" | "model_family" | "connect" | "agents" | "modes" | "permissions" | "skills" | "files" | undefined
 type CommandAction = "agents" | "clear" | "connect" | "exit" | "help" | "mode" | "model" | "model_family" | "new" | "permissions" | "pr" | "resume" | "review" | "sessions" | "skills"
 type Command = { name: string; description: string; action: CommandAction }
@@ -96,7 +109,6 @@ type PrFlow = { step: "base" | "message"; base: string; worktree: Worktree }
 type NoticeTone = "cyan" | "red" | "muted"
 type ComposerNotice = { text: string; tone: NoticeTone }
 const permissionActions = ["allow", "allow_always", "deny"] as const
-const RECOVERED_RESTART_MARKER = "Recovered after Inductor restarted"
 const RESUME_PROMPT_MARKER = "__INDUCTOR_RESUME__"
 
 const theme = {
@@ -299,6 +311,9 @@ const modelFamilyWizardRoles: readonly ModelRole[] = ["reasoning", "executor", "
 
 export function App(props: AppProps) {
   let input!: TextareaRenderable
+  let transcriptScrollBox: ScrollBoxRenderable | undefined
+  let historyAnchorTimer: ReturnType<typeof setTimeout> | undefined
+  let historyGcTimer: ReturnType<typeof setTimeout> | undefined
   let replacingPrompt = false
   let lastCtrlCAt = 0
   let stopArmTimer: ReturnType<typeof setTimeout> | undefined
@@ -332,6 +347,8 @@ export function App(props: AppProps) {
       role: init.role ?? "Build",
       stateDb: init.stateDb,
       state: init.state ?? createInitialState(),
+      history: init.history,
+      lastEventAt: init.lastEventAt,
     }
   }
   const initialAgent = makeAgentSlot()
@@ -345,6 +362,7 @@ export function App(props: AppProps) {
 
   const focusedAgent = createMemo(() => store.agents.find((a) => a.key === store.focusedKey) ?? store.agents[0])
   const fstate = createMemo(() => focusedAgent().state)
+  const focusedTranscript = createMemo(() => focusedAgent().history?.temporaryTranscript ?? fstate().transcript)
   function agentIndex(key: string) {
     return store.agents.findIndex((a) => a.key === key)
   }
@@ -470,7 +488,7 @@ export function App(props: AppProps) {
     queuedVersion()
     return queuedPromptsFor(store.focusedKey)
   })
-  const hasTranscript = createMemo(() => fstate().transcript.length > 0 || fstate().running || focusedQueuedPrompts().length > 0 || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
+  const hasTranscript = createMemo(() => focusedTranscript().length > 0 || fstate().running || focusedQueuedPrompts().length > 0 || Boolean(fstate().pendingPermission) || Boolean(fstate().pendingQuestions))
   // Full filesystem path the focused agent runs in: its managed worktree when
   // one exists, otherwise the workspace Inductor was opened in.
   const focusedWorktreePath = createMemo(() => {
@@ -587,7 +605,14 @@ export function App(props: AppProps) {
     return commandItems()
   })
 
-  const timer = setInterval(() => setNow(Date.now()), 120)
+  let lastIdleClockUpdate = Date.now()
+  const timer = setInterval(() => {
+    const current = Date.now()
+    const active = runs.size > 0 || store.agents.some((slot) => slot.state.running)
+    if (!active && current - lastIdleClockUpdate < 1_000) return
+    lastIdleClockUpdate = current
+    setNow(current)
+  }, 120)
   const composerNotice = createMemo(() => {
     const state = fstate()
     return notice() ?? defaultComposerNotice(state.status, state.running, state.pendingPermission)
@@ -610,6 +635,8 @@ export function App(props: AppProps) {
     props.registerCtrlCHandler(undefined)
     props.registerSelectionTransform(undefined)
     clearInterval(timer)
+    if (historyAnchorTimer) clearTimeout(historyAnchorTimer)
+    if (historyGcTimer) clearTimeout(historyGcTimer)
     clearStopArmTimer()
     for (const flags of runFlags.values()) {
       if (flags.forceTimer) clearTimeout(flags.forceTimer)
@@ -651,6 +678,11 @@ export function App(props: AppProps) {
       return
     }
     if (fstate().pendingPermission && handlePermissionKey(event)) {
+      event.preventDefault()
+      event.stopPropagation()
+      return
+    }
+    if (!palette() && handleTranscriptNavigationKey(event)) {
       event.preventDefault()
       event.stopPropagation()
       return
@@ -700,13 +732,17 @@ export function App(props: AppProps) {
 
     const key = store.focusedKey
     const backendPrompt = resumePromptFromUserPrompt(visiblePrompt, fstate()) ?? prompt
-    const queued: QueuedPrompt = {
-      visiblePrompt,
-      prompt: backendPrompt,
-      skills: uniqueStrings([...activeSkills(), ...promptSkills]),
-      modelRole: focusedAgent().modelFamilyEnabled ? "reasoning" : undefined,
-      orchestrationPhase: focusedAgent().modelFamilyEnabled ? "initial" : undefined,
-    }
+    const flags = runFlagsFor(key)
+    const pausedForHuman = flags.pausedForHuman
+    const queued: QueuedPrompt = isResumePrompt(visiblePrompt) && pausedForHuman
+      ? { ...pausedForHuman, visiblePrompt, prompt: backendPrompt, active: false }
+      : {
+          visiblePrompt,
+          prompt: backendPrompt,
+          skills: uniqueStrings([...activeSkills(), ...promptSkills]),
+          modelRole: focusedAgent().modelFamilyEnabled ? "reasoning" : undefined,
+          orchestrationPhase: focusedAgent().modelFamilyEnabled ? "initial" : undefined,
+        }
     const running = fstate().running || runs.has(key)
     if (running) {
       if (steer) replaceCurrentRun(key, queued)
@@ -769,6 +805,7 @@ export function App(props: AppProps) {
     if (!agentSlot) return
 
     const flags = runFlagsFor(key)
+    if (flags.pausedForHuman === queued || isResumePrompt(queued.visiblePrompt)) flags.pausedForHuman = undefined
     const wasQueued = flags.activeQueued === queued || flags.queued.includes(queued)
     flags.stopping = false
     flags.exitAfter = false
@@ -783,6 +820,8 @@ export function App(props: AppProps) {
     }
 
     setNotice(undefined)
+    releaseTemporaryHistory(key, false)
+    patchAgent(key, { lastEventAt: Date.now() })
     updateAgentState(key, (next) => addUserMessage(next, queued.visiblePrompt))
     const runRole = agentSlot.modelFamilyEnabled ? (queued.modelRole ?? "reasoning") : "reasoning"
     const runConfig = agentSlot.modelFamilyEnabled
@@ -807,6 +846,7 @@ export function App(props: AppProps) {
       skills: queued.skills ?? activeSkills(),
     }, {
       onEvent(event) {
+        patchAgent(key, { lastEventAt: Date.now() })
         if (event.session_id && !focusedAgentSessionMatches(key, event.session_id)) {
           patchAgent(key, { sessionId: event.session_id })
           // First turn just created this session's worktree — surface it (and
@@ -819,12 +859,21 @@ export function App(props: AppProps) {
         }
         if (event.type === "permission_request" && store.focusedKey === key) setPermissionSelected(0)
         if (event.type === "questions_requested" && store.focusedKey === key) resetQuestionUi(event.questions)
+        // Provider/harness errors require a human decision before the
+        // model-family chain may advance. Tool failures use tool_call_error
+        // and remain ordinary agent-loop feedback.
+        if (event.type === "error") {
+          flags.pausedForHuman = queued
+          updateAgentState(key, (next) => ({ ...next, running: false, status: "waiting_for_human" }))
+        }
         if (flags.stopping) {
           if (event.type === "result" || event.type === "error") {
             updateAgentState(key, (next) => markAgentStopped(next))
           }
+          appendHistoryEvent(key, event)
           return
         }
+        appendHistoryEvent(key, event)
         updateAgentState(key, (next) => applySessionEvent(next, event))
       },
       onStderr(text) {
@@ -859,6 +908,12 @@ export function App(props: AppProps) {
           } else {
             setNotice({ text: "stopped agent", tone: "red" })
           }
+          return
+        }
+        if (flags.pausedForHuman === queued) {
+          patchAgent(key, { activeModelRole: undefined })
+          updateAgentState(key, (next) => ({ ...next, running: false, status: "waiting_for_human" }))
+          setNotice({ text: "provider limit/error — waiting for human input (type /resume when ready)", tone: "red" })
           return
         }
         void refreshWorktrees()
@@ -1804,11 +1859,116 @@ export function App(props: AppProps) {
     }
   }
 
+  function appendHistoryEvent(key: string, event: SessionEvent) {
+    const slot = store.agents[agentIndex(key)]
+    if (!slot?.history) return
+    patchAgent(key, {
+      history: appendSessionHistoryEvent(slot.history, event, slot.state),
+    })
+  }
+
+  function releaseTemporaryHistory(key: string, announce = true) {
+    const slot = store.agents[agentIndex(key)]
+    const history = slot?.history
+    if (!history || (!history.temporaryTranscript && !history.loading)) return
+    patchAgent(key, { history: releaseSessionHistory(history) })
+    if (historyGcTimer) clearTimeout(historyGcTimer)
+    historyGcTimer = setTimeout(() => {
+      historyGcTimer = undefined
+      Bun.gc(true)
+    }, 0)
+    if (key !== store.focusedKey) return
+    setExpanded(new Set<string>())
+    if (announce) setNotice({ text: "older history released from RAM; it remains available on disk", tone: "muted" })
+  }
+
+  function handleTranscriptMouseScroll(event: { scroll?: { direction?: string } }) {
+    const direction = event.scroll?.direction
+    if (direction === "up" || direction === "down") queueMicrotask(() => checkTranscriptScrollPosition(direction))
+  }
+
+  function handleTranscriptNavigationKey(event: KeyEvent) {
+    const key = (event.name || event.sequence || "").toLowerCase().replaceAll("_", "")
+    const box = transcriptScrollBox
+    if (!box || (key !== "pageup" && key !== "pagedown")) return false
+    const direction = key === "pageup" ? "up" : "down"
+    box.scrollBy(direction === "up" ? -1 : 1, "viewport")
+    queueMicrotask(() => checkTranscriptScrollPosition(direction))
+    return true
+  }
+
+  function checkTranscriptScrollPosition(direction: "up" | "down") {
+    const box = transcriptScrollBox
+    if (!box) return
+    const maxScrollTop = Math.max(0, box.scrollHeight - box.viewport.height)
+    if (direction === "up" && box.scrollTop <= 1) {
+      void loadOlderHistoryPage(box)
+      return
+    }
+    if (direction === "down" && box.scrollTop >= maxScrollTop - 1) {
+      releaseTemporaryHistory(store.focusedKey)
+    }
+  }
+
+  async function loadOlderHistoryPage(box: ScrollBoxRenderable) {
+    const key = store.focusedKey
+    const slot = focusedAgent()
+    const history = slot.history
+    if (!slot.sessionId || !history || history.loading || !history.hasOlder) return
+
+    const beforeOrdinal = history.beforeOrdinal
+    const oldScrollHeight = box.scrollHeight
+    const oldScrollTop = box.scrollTop
+    patchAgent(key, { history: { ...history, loading: true } })
+    setNotice({ text: "loading an older history page from disk…", tone: "muted" })
+    try {
+      const page = await showWorkspaceSessionHistoryPage(props, slot.sessionId, beforeOrdinal, slot.stateDb)
+      const latest = store.agents[agentIndex(key)]
+      if (!latest?.history?.loading || latest.history.beforeOrdinal !== beforeOrdinal) return
+      if (page.events.length === 0) {
+        patchAgent(key, { history: { ...latest.history, loading: false, hasOlder: false } })
+        setNotice({ text: "oldest session event reached", tone: "muted" })
+        return
+      }
+      patchAgent(key, { history: mergeSessionHistoryPage(latest.history, page) })
+      preserveHistoryViewport(box, key, oldScrollHeight, oldScrollTop)
+      setNotice({
+        text: `${page.events.length.toLocaleString()} older events loaded temporarily · return to the bottom to release them`,
+        tone: "muted",
+      })
+    } catch (error) {
+      const latest = store.agents[agentIndex(key)]
+      if (latest?.history) patchAgent(key, { history: { ...latest.history, loading: false } })
+      setNotice({ text: error instanceof Error ? error.message : "Could not load older history", tone: "red" })
+    }
+  }
+
+  function preserveHistoryViewport(box: ScrollBoxRenderable, key: string, oldHeight: number, oldTop: number) {
+    if (historyAnchorTimer) clearTimeout(historyAnchorTimer)
+    let attempts = 0
+    const restore = () => {
+      attempts += 1
+      if (transcriptScrollBox !== box || store.focusedKey !== key) return
+      const addedHeight = Math.max(0, box.scrollHeight - oldHeight)
+      if (addedHeight > 0 || attempts >= 8) {
+        box.scrollTop = oldTop + addedHeight
+        historyAnchorTimer = undefined
+        return
+      }
+      historyAnchorTimer = setTimeout(restore, 16)
+    }
+    queueMicrotask(restore)
+  }
+
   function focusAgent(key: string) {
+    if (key !== store.focusedKey) releaseTemporaryHistory(store.focusedKey, false)
     setStore("focusedKey", key)
     setExpanded(new Set<string>())
     setNotice(undefined)
-    queueMicrotask(() => input?.focus())
+    queueMicrotask(() => {
+      transcriptScrollBox?.scrollTo(Number.MAX_SAFE_INTEGER)
+      input?.focus()
+    })
   }
 
   async function loadWorktree(worktree: Worktree) {
@@ -1833,12 +1993,16 @@ export function App(props: AppProps) {
         devMode: "worktree",
         stateDb: worktree.state_db ?? undefined,
         state: loadStoredSession(detail),
+        history: createSessionHistoryWindow(detail),
       })
       setStore("agents", (agents) => [...agents, slot])
       setStore("focusedKey", slot.key)
       setExpanded(new Set<string>())
       setNotice({ text: worktree.exists ? "session loaded" : "session loaded (worktree archived — read-only)", tone: "muted" })
-      queueMicrotask(() => input?.focus())
+      queueMicrotask(() => {
+        transcriptScrollBox?.scrollTo(Number.MAX_SAFE_INTEGER)
+        input?.focus()
+      })
     } catch (error) {
       setNotice({ text: error instanceof Error ? error.message : "Could not load session", tone: "red" })
     }
@@ -1884,19 +2048,10 @@ export function App(props: AppProps) {
       devMode: "worktree",
       stateDb: worktree.state_db ?? undefined,
       state: loadStoredSession(detail),
+      history: createSessionHistoryWindow(detail),
     })
     setStore("agents", (agents) => [...agents, slot])
     return slot.key
-  }
-
-  function shouldAutoResumeRecoveredSession(detail: Awaited<ReturnType<typeof showWorkspaceSession>>) {
-    const events = detail.events ?? []
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index]
-      if (event.type === "status") continue
-      return event.type === "error" && typeof event.message === "string" && event.message.includes(RECOVERED_RESTART_MARKER)
-    }
-    return false
   }
 
   function latestUserPromptFromSession(detail: Awaited<ReturnType<typeof showWorkspaceSession>>) {
@@ -2209,7 +2364,15 @@ export function App(props: AppProps) {
             borderColor={theme.border}
           >
             <Show when={hasTranscript()} fallback={<StartScreen height={dimensions().height} />}>
+              <Show when={fstate().running}>
+                <box height={1} flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.surface2}>
+                  <text fg={theme.cyan} selectable={false}>
+                    {runningGlyph(now())} {providerActivityText(fstate().status, focusedAgent().lastEventAt, now())}
+                  </text>
+                </box>
+              </Show>
               <scrollbox
+                ref={(ref: ScrollBoxRenderable) => { transcriptScrollBox = ref }}
                 flexGrow={1}
                 minHeight={0}
                 overflow="hidden"
@@ -2220,15 +2383,16 @@ export function App(props: AppProps) {
                 viewportOptions={{ overflow: "hidden" }}
                 contentOptions={{ overflow: "hidden" }}
                 verticalScrollbarOptions={{ visible: false }}
+                onMouseScroll={handleTranscriptMouseScroll}
               >
                 <Timeline
-                  items={fstate().transcript}
+                  items={focusedTranscript()}
                   queuedPrompts={focusedQueuedPrompts()}
                   pendingPermission={fstate().pendingPermission}
                   pendingQuestions={fstate().pendingQuestions}
                   running={fstate().running}
                   runningStatus={fstate().status}
-                  activityGlyph={runningGlyph(now())}
+                  activityGlyph={fstate().running ? runningGlyph(now()) : ""}
                   permissionSelected={permissionSelected()}
                   selectPermission={setPermissionSelected}
                   questionIndex={questionIndex()}
@@ -2815,11 +2979,19 @@ function Timeline(props: {
       {/* `Index` keeps transcript rows mounted as the same assistant item text grows, which avoids remount flicker while the live markdown re-renders. */}
       <Index each={props.items}>
         {(item) => (
-          <TimelineItem
-            item={item()}
-            expanded={props.expanded.has(item().id)}
-            toggle={() => props.toggleExpanded(item().id)}
-          />
+          // A prepended history page changes which item occupies each Index
+          // slot. Key the row body by its stable id so a user/tool/error branch
+          // is remounted instead of reusing the previous branch with missing
+          // fields (which rendered as blank errors or "undefined").
+          <Show keyed when={item().id}>
+            {(_id) => (
+              <TimelineItem
+                item={item()}
+                expanded={props.expanded.has(item().id)}
+                toggle={() => props.toggleExpanded(item().id)}
+              />
+            )}
+          </Show>
         )}
       </Index>
       <Show when={props.pendingQuestions}>
@@ -2870,6 +3042,13 @@ function TimelineItem(props: { item: TranscriptItem; expanded: boolean; toggle: 
     return (
       <TimelineShell marker="!" color={theme.red} label="error">
         <text fg={theme.red} selectable={true} selectionBg={theme.selectionBg} selectionFg={theme.text}>{props.item.text}</text>
+      </TimelineShell>
+    )
+  }
+  if (props.item.kind === "status") {
+    return (
+      <TimelineShell marker="…" color={theme.muted} label="history">
+        <text fg={theme.muted}>{props.item.text}</text>
       </TimelineShell>
     )
   }
@@ -3933,6 +4112,14 @@ function agentActivityText(status: string) {
   if (status === "streaming") return "writing response"
   if (status === "running" || !status || status === "idle") return "agent is working"
   return status.replaceAll("_", " ")
+}
+
+function providerActivityText(status: string, lastEventAt: number | undefined, now: number) {
+  const activity = agentActivityText(status)
+  if (!lastEventAt) return activity
+  const quietFor = Math.max(0, now - lastEventAt)
+  if (quietFor < 2_000) return activity
+  return `${activity} · no new provider event for ${formatElapsed(quietFor)}`
 }
 
 function toolLabel(name: string) {

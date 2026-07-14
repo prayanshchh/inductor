@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { applyPermissionDecision, applySessionEvent, addUserMessage, createInitialState, loadStoredSession } from "../src/state"
+import type { SessionEvent, StoredSessionDetail } from "../src/backend"
+import { applyPermissionDecision, applySessionEvent, addUserMessage, createInitialState, loadStoredSession, shouldAutoResumeRecoveredSession } from "../src/state"
 
 describe("transcript reducer", () => {
   test("streams assistant text into a single row", () => {
@@ -8,6 +9,68 @@ describe("transcript reducer", () => {
     state = applySessionEvent(state, { type: "text_delta", text: " world" })
 
     expect(state.transcript).toEqual([{ id: expect.any(String), kind: "assistant", text: "hello world" }])
+  })
+
+  test("pauses any provider error for human intervention", () => {
+    let state = addUserMessage(createInitialState(), "continue the work")
+    state = applySessionEvent(state, {
+      type: "error",
+      message: "provider returned an unexpected response",
+    })
+
+    expect(state.running).toBe(false)
+    expect(state.status).toBe("waiting_for_human")
+  })
+
+  test("does not auto-resume a recovered model-family chain after any provider error", () => {
+    const detail = storedSessionDetail([
+      { type: "user_message", text: "implement the feature" },
+      { type: "error", message: "provider returned HTTP 500" },
+      { type: "result", stop_reason: "error" },
+      { type: "user_message", text: "You are now the executor role. Continue automatically." },
+      { type: "error", message: "Recovered after Inductor restarted: interrupted" },
+      { type: "status", status: "idle" },
+    ])
+
+    expect(shouldAutoResumeRecoveredSession(detail)).toBe(false)
+  })
+
+  test("allows recovered auto-resume only after new human intervention", () => {
+    const detail = storedSessionDetail([
+      { type: "user_message", text: "implement the feature" },
+      { type: "error", message: "provider unavailable" },
+      { type: "user_message", text: "/resume" },
+      { type: "status", status: "streaming" },
+      { type: "error", message: "Recovered after Inductor restarted: interrupted" },
+      { type: "status", status: "idle" },
+    ])
+
+    expect(shouldAutoResumeRecoveredSession(detail)).toBe(true)
+  })
+
+  test("tool errors do not block recovered auto-resume", () => {
+    const detail = storedSessionDetail([
+      { type: "user_message", text: "run the checks" },
+      { type: "tool_call_error", message: "test command failed" },
+      { type: "error", message: "Recovered after Inductor restarted: interrupted" },
+      { type: "status", status: "idle" },
+    ])
+
+    expect(shouldAutoResumeRecoveredSession(detail)).toBe(true)
+  })
+
+  test("compacts bounded stored deltas and shows that older history stays on disk", () => {
+    const detail = storedSessionDetail(Array.from({ length: 1_000 }, () => ({ type: "text_delta", text: "x" })))
+    detail.event_count = 100_000
+    detail.events_truncated = true
+
+    const state = loadStoredSession(detail)
+    const replayed = loadStoredSession(detail)
+
+    expect(state.transcript).toHaveLength(2)
+    expect(state.transcript[0]).toMatchObject({ kind: "status", text: expect.stringContaining("99,000 older events") })
+    expect(state.transcript[1]).toMatchObject({ kind: "assistant", text: "x".repeat(1_000) })
+    expect(replayed.transcript[1]).toMatchObject({ kind: "assistant", text: "x".repeat(1_000) })
   })
 
   test("starts a new assistant row after each user turn", () => {
@@ -486,3 +549,19 @@ describe("transcript reducer", () => {
     expect(state.transcript.filter((item) => item.kind === "error" && item.text === "stopped agent")).toHaveLength(1)
   })
 })
+
+function storedSessionDetail(events: SessionEvent[]): StoredSessionDetail {
+  return {
+    session: {
+      id: "s-recovery",
+      provider_id: "codex",
+      model: "gpt-5.6-sol",
+      status: "idle",
+      display_name: "Recovered session",
+      created_at: "2026-07-12T00:00:00Z",
+      updated_at: "2026-07-12T00:00:00Z",
+    },
+    messages: [],
+    events,
+  }
+}
