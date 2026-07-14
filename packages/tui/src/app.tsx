@@ -24,6 +24,7 @@ import { archiveWorktree, listProviderModels, listSkills, listWorktrees, showWor
 import { readClipboard } from "./clipboard"
 import { createUnifiedPatchFromContent, normalizeDiffForRendering, normalizeUnifiedPatch, patchFilesFromUnifiedPatch } from "./diff_patch"
 import { openExternalDiffViewer } from "./diff_viewer"
+import { completionNotificationOutput, notifyAgentRunCompleted } from "./notification"
 import {
   appendPromptToken,
   findActiveMention,
@@ -51,6 +52,7 @@ export type AppProps = BackendOptions & {
 type EffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
 type ModelRoleConfig = { provider: string; model: string; effort: EffortValue }
 type ModelFamily = Record<ModelRole, ModelRoleConfig>
+const CONTEXT_INPUT_LIMIT_TOKENS = 250_000
 
 /** One concurrent agent: its session, worktree, provider/model and transcript. */
 type AgentSlot = {
@@ -465,7 +467,7 @@ export function App(props: AppProps) {
 
   const dimensions = useTerminalDimensions()
   const availableInputWidth = createMemo(() => Math.max(1, dimensions().width - 6))
-  const contextPercent = createMemo(() => Math.min(99, Math.round((fstate().tokens / 200_000) * 100)))
+  const contextPercent = createMemo(() => Math.min(100, Math.round((fstate().tokens / CONTEXT_INPUT_LIMIT_TOKENS) * 100)))
   const focusedQueuedPrompts = createMemo(() => {
     queuedVersion()
     return queuedPromptsFor(store.focusedKey)
@@ -867,6 +869,13 @@ export function App(props: AppProps) {
           setNotice({ text: `Starting ${roleLabel(followup.modelRole ?? "reasoning").toLowerCase()} role...`, tone: "cyan" })
           startTurn(key, followup)
           return
+        }
+        const completedSlot = store.agents[agentIndex(key)]
+        if (completedSlot) {
+          notifyAgentRunCompleted(
+            completedSlot.state.title,
+            completionNotificationOutput(completedSlot.state.transcript, completedSlot.state.status, code),
+          )
         }
         patchAgent(key, { activeModelRole: undefined })
         updateAgentState(key, (next) => ({ ...next, running: false, status: code === 0 ? "idle" : `exited ${code ?? "unknown"}` }))

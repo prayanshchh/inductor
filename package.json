@@ -9,7 +9,7 @@
   "scripts": {
     "build:tui": "bun ./packages/tui/build.ts",
     "bundle:release": "bash scripts/release/build-bundle.sh",
-    "postinstall": "npm ci --prefix crates/provider-claude/js",
+    "postinstall": "npm ci --prefix crates/provider-claude/js && npm ci --prefix crates/provider-copilot/js",
     "tui": "bun --cwd packages/tui dev",
     "typecheck": "bun --cwd packages/tui typecheck",
     "test:tui": "bun --cwd packages/tui test"

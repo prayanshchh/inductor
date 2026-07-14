@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "node claude_agent_sdk_bridge.mjs < /dev/null"
+    "test": "node --check claude_agent_sdk_bridge.mjs"
   },
   "keywords": [],
   "author": "",
