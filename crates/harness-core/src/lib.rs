@@ -188,6 +188,17 @@ impl ModelRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderContextCheckpoint {
+    pub provider_id: String,
+    pub model: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub covered_through_ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRequest {
     pub session_id: SessionId,
     pub model: String,
@@ -202,6 +213,8 @@ pub struct TurnRequest {
     pub metadata: serde_json::Value,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_checkpoint: Option<ProviderContextCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +441,28 @@ pub enum SessionEvent {
         compacted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+    },
+    ContextCheckpoint {
+        session_id: SessionId,
+        provider_id: String,
+        model: String,
+        kind: String,
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    ContextCompaction {
+        session_id: SessionId,
+        provider_id: String,
+        phase: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     ModelRoleChanged {
         session_id: SessionId,

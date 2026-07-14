@@ -81,7 +81,11 @@ impl ModelBasedNamer {
                 (provider, auth)
             }
             ProviderKind::Copilot => {
-                let provider = Box::new(CopilotProvider::new()?);
+                let provider = if let Some(cwd) = &self.config.cwd {
+                    Box::new(CopilotProvider::with_cwd(cwd.clone())?)
+                } else {
+                    Box::new(CopilotProvider::new()?)
+                };
                 let auth = RuntimeCredentialLoader::load(reference)?.into_provider_auth();
                 (provider, auth)
             }
@@ -127,6 +131,7 @@ impl SessionNamer for ModelBasedNamer {
             tool_names: Vec::new(),
             metadata: serde_json::Value::Null,
             images: Vec::new(),
+            context_checkpoint: None,
         };
 
         let cancel = CancellationToken::new();
@@ -261,6 +266,7 @@ pub async fn generate_pull_request_description(
         tool_names: Vec::new(),
         metadata: serde_json::Value::Null,
         images: Vec::new(),
+        context_checkpoint: None,
     };
 
     let cancel = CancellationToken::new();

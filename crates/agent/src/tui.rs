@@ -19,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use context::{DEFAULT_CONTEXT_SOFT_TOKENS, MAX_CONTEXT_TOKENS};
 use diff::{DiffLineKind, DiffRequest, FileStatus, diff_worktree};
 use harness_core::SessionId;
 use persistence::{WorkspaceDb, workspace_state_path};
@@ -372,26 +373,15 @@ struct ProviderUsage {
     note: String,
 }
 
-/// Approximate max context window (tokens) for a model, used to compute the
-/// context bar and the auto-compact threshold. Sources: Anthropic context-window
-/// docs (Opus/Sonnet 4.6 = 1M, Sonnet 4.5/Haiku = 200K) and OpenAI model docs
-/// (gpt-5 / gpt-5-codex = 400K).
-fn context_window_for(model: &str) -> u64 {
-    let m = model.to_lowercase();
-    if m.contains("opus") || m.contains("sonnet") {
-        1_000_000
-    } else if m.contains("haiku") {
-        200_000
-    } else if m.contains("gpt-5") || m.contains("codex") {
-        400_000
-    } else {
-        200_000
-    }
+/// Inductor uses one provider-independent input ceiling even when a model
+/// advertises a larger native window.
+fn context_window_for(_model: &str) -> u64 {
+    MAX_CONTEXT_TOKENS as u64
 }
 
-/// Fraction of the context window at which we auto-compact (research consensus:
-/// 85% is safer than waiting for ~95%).
-const AUTO_COMPACT_PCT: f64 = 0.85;
+/// Compact at 200k, retaining a 50k reserve below the hard ceiling.
+const AUTO_COMPACT_PCT: f64 =
+    DEFAULT_CONTEXT_SOFT_TOKENS as f64 / MAX_CONTEXT_TOKENS as f64;
 
 /// Read provider limit windows by scraping the provider's TUI.
 fn read_provider_usage(provider: &str) -> ProviderUsage {
@@ -5190,10 +5180,10 @@ mod tests {
 
     #[test]
     fn context_window_per_model() {
-        assert_eq!(context_window_for("opus"), 1_000_000);
-        assert_eq!(context_window_for("claude-sonnet-4-6"), 1_000_000);
-        assert_eq!(context_window_for("haiku"), 200_000);
-        assert_eq!(context_window_for("gpt-5.5"), 400_000);
+        assert_eq!(context_window_for("opus"), 250_000);
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 250_000);
+        assert_eq!(context_window_for("haiku"), 250_000);
+        assert_eq!(context_window_for("gpt-5.5"), 250_000);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "name": "@inductor/provider-copilot-sdk-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --check copilot_sdk_bridge.mjs && node copilot_sdk_bridge.mjs --self-test"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.6"
+  }
+}
