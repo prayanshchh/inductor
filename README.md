@@ -58,6 +58,12 @@ curl -fsSL https://raw.githubusercontent.com/prayanshchh/inductor/main/scripts/i
   | INDUCTOR_REPO=prayanshchh/inductor sh
 ```
 
+Update an installed release in place:
+
+```sh
+inductor update
+```
+
 Authenticate with Claude Code or Codex before starting, or connect GitHub Copilot from inside Inductor.
 
 ```sh

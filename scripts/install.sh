@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="${INDUCTOR_REPO:-prayanshchhablani/inductor}"
+repo="${INDUCTOR_REPO:-prayanshchh/inductor}"
 release_base_url="${INDUCTOR_DOWNLOAD_BASE_URL:-https://github.com/${repo}/releases/download}"
 version_override="${INDUCTOR_VERSION:-}"
 install_dir_override="${INDUCTOR_INSTALL_DIR:-}"
@@ -74,6 +74,25 @@ bundle_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 
 install_dir="$install_dir_override"
 install_mode="direct"
+if [ -n "$install_dir" ]; then
+  if [ ! -d "$install_dir" ]; then
+    if mkdir -p "$install_dir" 2>/dev/null; then
+      :
+    elif command -v sudo >/dev/null 2>&1; then
+      install_mode="sudo"
+    else
+      fail "could not create install directory: ${install_dir}"
+    fi
+  fi
+  if [ "$install_mode" = "direct" ] && [ ! -w "$install_dir" ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      install_mode="sudo"
+    else
+      fail "install directory is not writable: ${install_dir}"
+    fi
+  fi
+fi
+
 if [ -z "$install_dir" ]; then
   for candidate in "/opt/homebrew/bin" "/usr/local/bin" "$HOME/.local/bin"; do
     if [ -d "$candidate" ] && [ -w "$candidate" ]; then

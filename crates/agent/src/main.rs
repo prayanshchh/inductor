@@ -57,6 +57,9 @@ const RESUME_ERROR_MAX_BYTES: usize = 2 * 1024;
 const RESUME_EVENT_LIMIT: usize = 2_000;
 const RESUME_MESSAGE_LIMIT: usize = 1_000;
 const SESSION_EVENT_PAGE_MAX: usize = 2_000;
+const DEFAULT_UPDATE_REPO: &str = "prayanshchh/inductor";
+const DEFAULT_INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/prayanshchh/inductor/main/scripts/install.sh";
 
 #[derive(Debug, Parser)]
 #[command(name = "inductor")]
@@ -207,6 +210,25 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+    /// Download and install the latest Inductor release over this installation.
+    Update {
+        /// GitHub OWNER/REPO to update from. Defaults to the public Inductor release repo.
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Install a specific release tag instead of the latest release.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Directory containing the inductor binaries to replace. Defaults to
+        /// the directory containing the currently running inductor executable.
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
+
+        /// Override the installer script URL. Mainly useful for release smoke tests.
+        #[arg(long)]
+        install_script_url: Option<String>,
     },
 }
 
@@ -833,6 +855,12 @@ async fn main() {
         Some(Command::Tool { command }) => run_tool_command(command).await,
         Some(Command::Terminal { command }) => run_terminal_command(command).await,
         Some(Command::Worktree { command }) => run_worktree_command(command).await,
+        Some(Command::Update {
+            repo,
+            version,
+            install_dir,
+            install_script_url,
+        }) => run_update_command(repo, version, install_dir, install_script_url).await,
         None => {
             run_opentui_command(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -849,6 +877,65 @@ async fn main() {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+}
+
+async fn run_update_command(
+    repo: Option<String>,
+    version: Option<String>,
+    install_dir: Option<PathBuf>,
+    install_script_url: Option<String>,
+) -> Result<(), String> {
+    let install_dir = match install_dir {
+        Some(path) => path,
+        None => std::env::current_exe()
+            .map_err(|err| format!("could not resolve current executable: {err}"))?
+            .parent()
+            .ok_or_else(|| "current executable has no parent directory".to_string())?
+            .to_path_buf(),
+    };
+    let repo = repo
+        .or_else(|| std::env::var("INDUCTOR_REPO").ok())
+        .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string());
+    let install_script_url = install_script_url
+        .or_else(|| std::env::var("INDUCTOR_INSTALL_SCRIPT_URL").ok())
+        .unwrap_or_else(|| DEFAULT_INSTALL_SCRIPT_URL.to_string());
+
+    println!("Updating Inductor from {repo}");
+    println!("Installing into {}", install_dir.display());
+    if let Some(version) = version.as_deref() {
+        println!("Requested release: {version}");
+    }
+
+    let mut command =
+        build_update_command(&repo, version.as_deref(), &install_dir, &install_script_url);
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to launch Inductor updater: {err}"))?;
+    if !status.success() {
+        return Err(format!("Inductor updater exited with {status}"));
+    }
+
+    Ok(())
+}
+
+fn build_update_command(
+    repo: &str,
+    version: Option<&str>,
+    install_dir: &Path,
+    install_script_url: &str,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("curl -fsSL \"$1\" | sh")
+        .arg("inductor-update")
+        .arg(install_script_url)
+        .env("INDUCTOR_REPO", repo)
+        .env("INDUCTOR_INSTALL_DIR", install_dir);
+    if let Some(version) = version {
+        command.env("INDUCTOR_VERSION", version);
+    }
+    command
 }
 
 async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
@@ -4730,6 +4817,74 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn update_command_downloads_installer_for_current_install_dir() {
+        let install_dir = PathBuf::from("/usr/local/bin");
+        let command = build_update_command(
+            "owner/repo",
+            None,
+            &install_dir,
+            "https://example.test/install.sh",
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(command.get_program(), "sh");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "curl -fsSL \"$1\" | sh",
+                "inductor-update",
+                "https://example.test/install.sh"
+            ]
+        );
+        assert_eq!(
+            env.get("INDUCTOR_REPO"),
+            Some(&Some("owner/repo".to_string()))
+        );
+        assert_eq!(
+            env.get("INDUCTOR_INSTALL_DIR"),
+            Some(&Some("/usr/local/bin".to_string()))
+        );
+        assert!(!env.contains_key("INDUCTOR_VERSION"));
+    }
+
+    #[test]
+    fn update_command_can_pin_release_version() {
+        let command = build_update_command(
+            DEFAULT_UPDATE_REPO,
+            Some("v1.2.3"),
+            Path::new("/tmp/inductor-bin"),
+            DEFAULT_INSTALL_SCRIPT_URL,
+        );
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            env.get("INDUCTOR_VERSION"),
+            Some(&Some("v1.2.3".to_string()))
+        );
     }
 
     #[test]
