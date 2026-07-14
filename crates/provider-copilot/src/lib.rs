@@ -1,10 +1,14 @@
 use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::try_stream;
+use context::{DEFAULT_CONTEXT_SOFT_TOKENS, MAX_CONTEXT_TOKENS};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use harness_core::{
@@ -20,7 +24,11 @@ use reqwest::header::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::time::sleep;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, Command},
+    time::{Instant, sleep, sleep_until, timeout},
+};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_COPILOT_API_URL: &str = "https://api.githubcopilot.com";
@@ -32,6 +40,8 @@ const DEFAULT_USER_AGENT: &str = "GithubCopilot/1.0";
 const DEFAULT_COPILOT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_COPILOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COPILOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_COPILOT_SDK_SCRIPT: &str = "js/copilot_sdk_bridge.mjs";
+const DEFAULT_COPILOT_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct CopilotProvider {
@@ -39,6 +49,8 @@ pub struct CopilotProvider {
     github_api_url: String,
     copilot_api_url: String,
     token_cache: Arc<Mutex<Option<CopilotBearerToken>>>,
+    sdk_command: Option<BridgeCommand>,
+    cwd: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -49,12 +61,22 @@ struct CopilotBearerToken {
 
 impl CopilotProvider {
     pub fn new() -> anyhow::Result<Self> {
-        Self::with_urls(
+        let mut provider = Self::with_urls(
             std::env::var("INDUCTOR_GITHUB_API_URL")
                 .unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_string()),
             std::env::var("INDUCTOR_COPILOT_API_URL")
                 .unwrap_or_else(|_| DEFAULT_COPILOT_API_URL.to_string()),
-        )
+        )?;
+        provider.sdk_command = Some(BridgeCommand::from_env(Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        ))));
+        Ok(provider)
+    }
+
+    pub fn with_cwd(cwd: PathBuf) -> anyhow::Result<Self> {
+        let mut provider = Self::new()?;
+        provider.cwd = cwd;
+        Ok(provider)
     }
 
     pub fn with_urls(
@@ -69,6 +91,8 @@ impl CopilotProvider {
             github_api_url: trim_trailing_slash(github_api_url.into()),
             copilot_api_url: trim_trailing_slash(copilot_api_url.into()),
             token_cache: Arc::new(Mutex::new(None)),
+            sdk_command: None,
+            cwd: std::env::current_dir()?,
         })
     }
 
@@ -212,6 +236,18 @@ impl ProviderPlugin for CopilotProvider {
         _question_responses: provider_core::QuestionResponses,
         _question_requests: provider_core::QuestionRequests,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+        if let Some(command) = self.sdk_command.clone() {
+            return stream_sdk_turn(
+                command,
+                self.cwd.clone(),
+                auth.expose_secret().to_string(),
+                req,
+                cancel,
+                tool_responses,
+            )
+            .await;
+        }
+
         let bearer = self.bearer_token(auth).await?;
         let mut headers = copilot_headers(&bearer.token)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -230,6 +266,27 @@ impl ProviderPlugin for CopilotProvider {
             loop {
                 let mut safe_stream_retries_remaining = 1usize;
                 'request_attempt: loop {
+                match compact_copilot_messages(&mut messages) {
+                    Ok(Some((original_tokens, token_count))) => {
+                        yield SessionEvent::ContextPrepared {
+                            session_id,
+                            token_count: token_count as u64,
+                            original_token_count: original_tokens as u64,
+                            compacted: true,
+                            summary: Some("Copilot tool-loop history compacted locally".to_string()),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(tokens) => {
+                        yield SessionEvent::Error {
+                            session_id,
+                            message: format!(
+                                "Inductor refused to send an estimated {tokens}-token Copilot input because the hard ceiling is {MAX_CONTEXT_TOKENS} tokens"
+                            ),
+                        };
+                        return;
+                    }
+                }
                 let request = provider
                     .client
                     .post(provider.chat_url())
@@ -417,6 +474,312 @@ impl ProviderPlugin for CopilotProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BridgeCommand {
+    command: String,
+    args: Vec<String>,
+}
+
+impl BridgeCommand {
+    fn from_env(manifest_dir: &Path) -> Self {
+        if let Ok(value) = std::env::var("INDUCTOR_COPILOT_SDK_COMMAND") {
+            let mut parts = value.split_whitespace();
+            if let Some(command) = parts.next() {
+                return Self {
+                    command: command.to_string(),
+                    args: parts.map(str::to_string).collect(),
+                };
+            }
+        }
+        Self {
+            command: "node".to_string(),
+            args: vec![
+                manifest_dir
+                    .join(DEFAULT_COPILOT_SDK_SCRIPT)
+                    .display()
+                    .to_string(),
+            ],
+        }
+    }
+}
+
+struct SdkBridge {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr: Arc<Mutex<String>>,
+}
+
+const MAX_BRIDGE_STDERR: usize = 4096;
+
+impl SdkBridge {
+    async fn spawn(command: BridgeCommand, cwd: &Path) -> anyhow::Result<Self> {
+        let mut child = Command::new(&command.command)
+            .args(&command.args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open Copilot SDK bridge stdout"))?;
+        let stdin = child.stdin.take();
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(mut child_stderr) = child.stderr.take() {
+            let sink = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                let mut buffer = String::new();
+                let _ = child_stderr.read_to_string(&mut buffer).await;
+                if !buffer.is_empty()
+                    && let Ok(mut guard) = sink.lock()
+                {
+                    guard.push_str(&buffer);
+                    if guard.len() > MAX_BRIDGE_STDERR {
+                        let start = guard.len() - MAX_BRIDGE_STDERR;
+                        *guard = guard[start..].to_string();
+                    }
+                }
+            });
+        }
+        Ok(Self {
+            child,
+            stdin,
+            lines: BufReader::new(stdout).lines(),
+            stderr,
+        })
+    }
+
+    async fn send_value(&mut self, value: &Value) -> anyhow::Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("failed to open Copilot SDK bridge stdin"))?;
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        stdin.write_all(&line).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn read_event(&mut self) -> anyhow::Result<Option<Value>> {
+        match self.lines.next_line().await? {
+            Some(line) => Ok(Some(serde_json::from_str(&line)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn diagnostics(&mut self) -> String {
+        let status = match timeout(Duration::from_secs(2), self.child.wait()).await {
+            Ok(Ok(status)) => status
+                .code()
+                .map(|code| format!("exit code {code}"))
+                .unwrap_or_else(|| "terminated by signal".to_string()),
+            _ => "still running".to_string(),
+        };
+        let stderr = self
+            .stderr
+            .lock()
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            format!(" ({status})")
+        } else {
+            format!(" ({status}): {stderr}")
+        }
+    }
+
+    async fn cancel(&mut self) {
+        let _ = self.send_value(&json!({ "type": "cancel" })).await;
+        self.stdin.take();
+        if timeout(DEFAULT_COPILOT_CANCEL_GRACE, self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+impl Drop for SdkBridge {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+async fn stream_sdk_turn(
+    command: BridgeCommand,
+    cwd: PathBuf,
+    github_token: String,
+    req: TurnRequest,
+    cancel: CancellationToken,
+    mut tool_responses: ToolResponses,
+) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<SessionEvent>> + Send>>> {
+    let session_id = req.session_id;
+    let checkpoint_model = req.model.clone();
+    let model = normalize_copilot_model(&req.model).to_string();
+    let idle_timeout = copilot_idle_timeout();
+    let stream = try_stream! {
+        yield SessionEvent::Status {
+            session_id,
+            status: SessionStatus::Starting,
+        };
+        let mut bridge = SdkBridge::spawn(command, &cwd).await?;
+        let allowed = req.tool_names.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+        let request = json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "github_token": github_token,
+            "model": model,
+            "checkpoint_model": checkpoint_model,
+            "prompt": req.prompt,
+            "system_prompt": req.system_prompt,
+            "messages": req.messages,
+            "images": req.images,
+            "context_checkpoint": req.context_checkpoint,
+            "tool_definitions": tools::tool_definitions()
+                .into_iter()
+                .filter(|definition| allowed.contains(definition.name.as_str()))
+                .collect::<Vec<_>>(),
+        });
+        timeout(idle_timeout, bridge.send_value(&request))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out writing to Copilot SDK bridge"))??;
+        yield SessionEvent::Status {
+            session_id,
+            status: SessionStatus::Streaming,
+        };
+
+        let mut pending_tools: HashMap<String, String> = HashMap::new();
+        let mut tool_results_open = true;
+        let mut last_activity = Instant::now();
+        loop {
+            let step = tokio::select! {
+                _ = cancel.cancelled() => CopilotBridgeStep::Cancelled,
+                event = bridge.read_event() => CopilotBridgeStep::Event(event),
+                result = tool_responses.recv(), if tool_results_open => CopilotBridgeStep::ToolResult(result),
+                _ = sleep_until(last_activity + idle_timeout) => CopilotBridgeStep::Idle,
+            };
+            match step {
+                CopilotBridgeStep::Cancelled => {
+                    bridge.cancel().await;
+                    yield SessionEvent::Result { session_id, stop_reason: StopReason::Interrupted };
+                    return;
+                }
+                CopilotBridgeStep::Idle => {
+                    bridge.cancel().await;
+                    yield SessionEvent::Error {
+                        session_id,
+                        message: format!(
+                            "Copilot SDK produced no events for {} seconds; killed the stale run",
+                            idle_timeout.as_secs()
+                        ),
+                    };
+                    return;
+                }
+                CopilotBridgeStep::ToolResult(result) => {
+                    last_activity = Instant::now();
+                    match result {
+                        Some(result) => {
+                            if let Some(bridge_id) = pending_tools.remove(&result.tool_call_id.to_string()) {
+                                bridge.send_value(&json!({
+                                    "type": "tool_result",
+                                    "id": bridge_id,
+                                    "output": result.output,
+                                    "is_error": result.is_error,
+                                })).await?;
+                            }
+                        }
+                        None => tool_results_open = false,
+                    }
+                }
+                CopilotBridgeStep::Event(event) => {
+                    last_activity = Instant::now();
+                    let Some(value) = event? else {
+                        let diagnostics = bridge.diagnostics().await;
+                        yield SessionEvent::Error {
+                            session_id,
+                            message: format!("Copilot SDK bridge exited before returning a result{diagnostics}"),
+                        };
+                        return;
+                    };
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("tool_request") => {
+                            let bridge_id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                            let tool_call_id = ToolCallId::new();
+                            pending_tools.insert(tool_call_id.to_string(), bridge_id);
+                            yield SessionEvent::ToolCallRequested {
+                                session_id,
+                                tool_call_id,
+                                name: value.get("name").and_then(Value::as_str).unwrap_or("tool").to_string(),
+                                input_json: value.get("input").cloned().unwrap_or(Value::Null),
+                            };
+                        }
+                        Some("text_delta") => {
+                            if let Some(text) = value.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                                yield SessionEvent::TextDelta { session_id, text: text.to_string() };
+                            }
+                        }
+                        Some("usage") => yield SessionEvent::Usage {
+                            session_id,
+                            input_tokens: value.get("input_tokens").and_then(Value::as_u64),
+                            output_tokens: value.get("output_tokens").and_then(Value::as_u64),
+                            cache_read_tokens: value.get("cache_read_tokens").and_then(Value::as_u64),
+                            total_cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+                        },
+                        Some("compaction") => yield SessionEvent::ContextCompaction {
+                            session_id,
+                            provider_id: "copilot".to_string(),
+                            phase: value.get("phase").and_then(Value::as_str).unwrap_or("unknown").to_string(),
+                            pre_tokens: value.get("pre_tokens").and_then(Value::as_u64),
+                            post_tokens: value.get("post_tokens").and_then(Value::as_u64),
+                            summary: value.get("summary").and_then(Value::as_str).map(str::to_string),
+                            details: value.get("details").cloned(),
+                        },
+                        Some("context_checkpoint") => yield SessionEvent::ContextCheckpoint {
+                            session_id,
+                            provider_id: "copilot".to_string(),
+                            model: value.get("model").and_then(Value::as_str).unwrap_or(DEFAULT_COPILOT_MODEL).to_string(),
+                            kind: value.get("kind").and_then(Value::as_str).unwrap_or("copilot_infinite_session").to_string(),
+                            payload: value.get("payload").cloned().unwrap_or(Value::Null),
+                            summary: value.get("summary").and_then(Value::as_str).map(str::to_string),
+                        },
+                        Some("result") => {
+                            yield SessionEvent::Result {
+                                session_id,
+                                stop_reason: if value.get("stop_reason").and_then(Value::as_str) == Some("cancelled") {
+                                    StopReason::Interrupted
+                                } else {
+                                    StopReason::EndTurn
+                                },
+                            };
+                            return;
+                        }
+                        Some("error") => {
+                            yield SessionEvent::Error {
+                                session_id,
+                                message: value.get("message").and_then(Value::as_str).unwrap_or("Copilot SDK bridge failed").to_string(),
+                            };
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
+    Ok(Box::pin(stream))
+}
+
+enum CopilotBridgeStep {
+    Event(anyhow::Result<Option<Value>>),
+    ToolResult(Option<ProviderToolResponse>),
+    Idle,
+    Cancelled,
+}
+
 fn copilot_messages(req: &TurnRequest) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = req.system_prompt.as_deref() {
@@ -448,6 +811,215 @@ fn copilot_messages(req: &TurnRequest) -> Vec<Value> {
 
     messages.extend(req.messages.iter().filter_map(copilot_message));
     messages
+}
+
+/// Copilot's OpenAI-compatible endpoint has no opaque server compaction item,
+/// so keep its provider-owned tool loop below the same Inductor budget. The
+/// newest structured tool exchange is retained when it fits; exceptionally
+/// large exchanges become a bounded textual handoff.
+fn compact_copilot_messages(messages: &mut Vec<Value>) -> Result<Option<(usize, usize)>, usize> {
+    let original_tokens = copilot_messages_token_estimate(messages);
+    if original_tokens <= DEFAULT_CONTEXT_SOFT_TOKENS {
+        return Ok(None);
+    }
+
+    let system_count = usize::from(
+        messages
+            .first()
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("system"),
+    );
+    let conversation = &messages[system_count..];
+    if conversation.is_empty() {
+        return if original_tokens <= MAX_CONTEXT_TOKENS {
+            Ok(None)
+        } else {
+            Err(original_tokens)
+        };
+    }
+
+    let keep_start = conversation
+        .iter()
+        .rposition(copilot_message_has_tool_calls)
+        .unwrap_or_else(|| conversation.len().saturating_sub(4));
+
+    let mut compacted = messages[..system_count].to_vec();
+    if keep_start > 0 {
+        compacted.push(copilot_compaction_summary(&conversation[..keep_start]));
+    }
+    compacted.extend_from_slice(&conversation[keep_start..]);
+
+    if copilot_messages_token_estimate(&compacted) > DEFAULT_CONTEXT_SOFT_TOKENS {
+        compacted.truncate(system_count);
+        compacted.push(copilot_compaction_summary(conversation));
+    }
+
+    let token_count = copilot_messages_token_estimate(&compacted);
+    if token_count > MAX_CONTEXT_TOKENS {
+        return Err(token_count);
+    }
+    *messages = compacted;
+    Ok(Some((original_tokens, token_count)))
+}
+
+fn copilot_message_has_tool_calls(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("assistant")
+        && message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+}
+
+fn copilot_messages_token_estimate(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .map(copilot_message_token_estimate)
+        .sum::<usize>()
+        .max(1)
+}
+
+fn copilot_message_token_estimate(message: &Value) -> usize {
+    let mut tokens = message
+        .get("role")
+        .and_then(Value::as_str)
+        .map_or(0, approximate_text_tokens);
+
+    match message.get("content") {
+        Some(Value::String(content)) => tokens += approximate_text_tokens(content),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                    // Base64 byte length is not a text-token estimate. Reserve a
+                    // conservative fixed amount while the provider prices the
+                    // image from its decoded dimensions.
+                    tokens += 1_024;
+                } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    tokens += approximate_text_tokens(text);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(function) = call.get("function") {
+            tokens += function
+                .get("name")
+                .and_then(Value::as_str)
+                .map_or(0, approximate_text_tokens);
+            tokens += function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map_or(0, approximate_text_tokens);
+        }
+    }
+    tokens.max(1)
+}
+
+fn approximate_text_tokens(text: &str) -> usize {
+    text.chars()
+        .count()
+        .div_ceil(4)
+        .max(text.split_whitespace().count())
+        .max(1)
+}
+
+fn copilot_compaction_summary(messages: &[Value]) -> Value {
+    const FIRST_MESSAGES: usize = 4;
+    const RECENT_MESSAGES: usize = 32;
+    const PREVIEW_CHARS: usize = 1_000;
+
+    let mut indexes = (0..messages.len().min(FIRST_MESSAGES)).collect::<Vec<_>>();
+    let recent_start = messages.len().saturating_sub(RECENT_MESSAGES);
+    for index in recent_start..messages.len() {
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+
+    let mut content = format!(
+        "[Inductor compacted {} earlier Copilot message(s) to stay below the {}-token input ceiling.]",
+        messages.len(),
+        MAX_CONTEXT_TOKENS
+    );
+    for index in indexes {
+        let message = &messages[index];
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        content.push_str("\n- ");
+        content.push_str(role);
+        content.push_str(": ");
+        content.push_str(&copilot_message_preview(message, PREVIEW_CHARS));
+    }
+    if messages.len() > FIRST_MESSAGES + RECENT_MESSAGES {
+        content.push_str(&format!(
+            "\n- ... {} middle message(s) omitted",
+            messages.len() - FIRST_MESSAGES - RECENT_MESSAGES
+        ));
+    }
+    content.push_str("\nContinue from this handoff without repeating completed tool calls.");
+
+    json!({
+        "role": "user",
+        "content": content,
+    })
+}
+
+fn copilot_message_preview(message: &Value, limit: usize) -> String {
+    let mut parts = Vec::new();
+    match message.get("content") {
+        Some(Value::String(content)) => parts.push(content.clone()),
+        Some(Value::Array(content)) => {
+            for part in content {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                } else if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                    parts.push("[image]".to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let arguments = call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        parts.push(format!("called {name} with {arguments}"));
+    }
+
+    let preview = parts
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&preview, limit)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let mut output = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    output
 }
 
 fn copilot_message(message: &ModelMessage) -> Option<Value> {
@@ -981,6 +1553,7 @@ mod tests {
             tool_names: tools::tool_names(),
             metadata: Value::Null,
             images: Vec::new(),
+            context_checkpoint: None,
         }
     }
 
@@ -1013,6 +1586,52 @@ mod tests {
 
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn oversized_copilot_history_is_compacted_below_soft_limit() {
+        let mut messages = vec![json!({"role": "system", "content": "system"})];
+        messages.extend((0..8).map(|index| {
+            json!({
+                "role": "user",
+                "content": format!("message {index} {}", "word ".repeat(40_000)),
+            })
+        }));
+
+        let result = compact_copilot_messages(&mut messages).unwrap();
+
+        assert!(result.is_some());
+        assert!(copilot_messages_token_estimate(&messages) <= DEFAULT_CONTEXT_SOFT_TOKENS);
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Inductor compacted"))
+        }));
+    }
+
+    #[test]
+    fn copilot_compaction_preserves_latest_structured_tool_exchange_when_it_fits() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "word ".repeat(210_000)}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "latest result"}),
+        ];
+
+        compact_copilot_messages(&mut messages).unwrap();
+
+        assert!(messages.iter().any(copilot_message_has_tool_calls));
+        assert!(messages.iter().any(|message| message["role"] == "tool"));
+        assert!(copilot_messages_token_estimate(&messages) <= DEFAULT_CONTEXT_SOFT_TOKENS);
     }
 
     #[test]

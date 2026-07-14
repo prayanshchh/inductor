@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const APP_SCHEMA_VERSION: i64 = 3;
-const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+const WORKSPACE_SCHEMA_VERSION: i64 = 3;
 
 const APP_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -185,6 +185,28 @@ CREATE INDEX idx_tool_calls_session ON tool_calls(session_id);
 ALTER TABLE sessions ADD COLUMN display_name TEXT;
 "#,
     },
+    Migration {
+        version: 3,
+        sql: r#"
+CREATE TABLE context_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    provider_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    summary TEXT,
+    covered_through_ordinal INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, generation),
+    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_context_checkpoints_latest
+    ON context_checkpoints(session_id, provider_id, model, generation DESC);
+"#,
+    },
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -295,6 +317,19 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub ordinal: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextCheckpointRecord {
+    pub session_id: SessionId,
+    pub generation: i64,
+    pub provider_id: String,
+    pub model: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub summary: Option<String>,
+    pub covered_through_ordinal: i64,
+    pub created_at: String,
 }
 
 impl StoredMessage {
@@ -990,6 +1025,97 @@ ORDER BY ordinal ASC
         Ok(rows)
     }
 
+    pub fn save_context_checkpoint(
+        &self,
+        session_id: SessionId,
+        provider_id: &str,
+        model: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        summary: Option<&str>,
+        covered_through_ordinal: i64,
+    ) -> Result<ContextCheckpointRecord> {
+        let generation = self.conn.query_row(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM context_checkpoints WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let created_at = now_rfc3339()?;
+        self.conn.execute(
+            r#"
+INSERT INTO context_checkpoints (
+    session_id, generation, provider_id, model, kind, payload_json,
+    summary, covered_through_ordinal, created_at
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+"#,
+            params![
+                session_id.to_string(),
+                generation,
+                provider_id,
+                model,
+                kind,
+                serde_json::to_string(payload)?,
+                summary,
+                covered_through_ordinal,
+                created_at,
+            ],
+        )?;
+        Ok(ContextCheckpointRecord {
+            session_id,
+            generation,
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            kind: kind.to_string(),
+            payload: payload.clone(),
+            summary: summary.map(str::to_string),
+            covered_through_ordinal,
+            created_at,
+        })
+    }
+
+    pub fn latest_context_checkpoint(
+        &self,
+        session_id: SessionId,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Option<ContextCheckpointRecord>> {
+        self.conn
+            .query_row(
+                r#"
+SELECT generation, kind, payload_json, summary, covered_through_ordinal, created_at
+FROM context_checkpoints
+WHERE session_id = ?1 AND provider_id = ?2 AND model = ?3
+ORDER BY generation DESC
+LIMIT 1
+"#,
+                params![session_id.to_string(), provider_id, model],
+                |row| {
+                    let payload_json: String = row.get(2)?;
+                    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(ContextCheckpointRecord {
+                        session_id,
+                        generation: row.get(0)?,
+                        provider_id: provider_id.to_string(),
+                        model: model.to_string(),
+                        kind: row.get(1)?,
+                        payload,
+                        summary: row.get(3)?,
+                        covered_through_ordinal: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn append_event(&self, session_id: SessionId, event: &SessionEvent) -> Result<i64> {
         let next = next_ordinal(&self.conn, "session_events", session_id)?;
         let event_json = serde_json::to_string(event)?;
@@ -1672,6 +1798,60 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "Assistant");
+    }
+
+    #[test]
+    fn workspace_db_versions_provider_checkpoints_without_removing_ui_history() {
+        let db = WorkspaceDb::in_memory().unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = SessionId::new();
+        let session = new_session_record(
+            session_id,
+            workspace_id,
+            ProviderId("codex".to_string()),
+            "gpt-5.5",
+        )
+        .unwrap();
+        db.upsert_session(&session).unwrap();
+        db.replace_messages(
+            session_id,
+            &[
+                StoredMessage::new("User", "first", 0),
+                StoredMessage::new("Assistant", "second", 1),
+                StoredMessage::new("User", "third", 2),
+            ],
+        )
+        .unwrap();
+
+        db.save_context_checkpoint(
+            session_id,
+            "codex",
+            "gpt-5.5",
+            "codex_responses_compaction",
+            &json!([{"type": "compaction", "encrypted_content": "v1"}]),
+            None,
+            1,
+        )
+        .unwrap();
+        db.save_context_checkpoint(
+            session_id,
+            "codex",
+            "gpt-5.5",
+            "codex_responses_compaction",
+            &json!([{"type": "compaction", "encrypted_content": "v2"}]),
+            None,
+            2,
+        )
+        .unwrap();
+
+        let latest = db
+            .latest_context_checkpoint(session_id, "codex", "gpt-5.5")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.generation, 2);
+        assert_eq!(latest.covered_through_ordinal, 2);
+        assert_eq!(latest.payload[0]["encrypted_content"], "v2");
+        assert_eq!(db.messages(session_id).unwrap().len(), 3);
     }
 
     #[test]

@@ -35,8 +35,8 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use harness_core::{
     ApprovalPolicy, DiagnosticFile, ImageAttachment, MessagePart, ModelMessage, ModelRole,
-    PatchFile, PermissionDecision, PermissionRequestId, RiskFlag, SessionEvent, SessionId,
-    SessionStatus, StopReason, ToolCallId, TurnRequest,
+    PatchFile, PermissionDecision, PermissionRequestId, ProviderContextCheckpoint, RiskFlag,
+    SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId, TurnRequest,
 };
 use provider_core::{ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Map, Value, json};
@@ -197,6 +197,7 @@ impl TranscriptMessage {
 pub struct SessionState {
     pub session_id: SessionId,
     pub transcript: Vec<TranscriptMessage>,
+    pub context_checkpoint: Option<ProviderContextCheckpoint>,
 }
 
 impl SessionState {
@@ -204,6 +205,7 @@ impl SessionState {
         Self {
             session_id,
             transcript: Vec::new(),
+            context_checkpoint: None,
         }
     }
 
@@ -211,7 +213,13 @@ impl SessionState {
         Self {
             session_id,
             transcript,
+            context_checkpoint: None,
         }
+    }
+
+    pub fn with_context_checkpoint(mut self, checkpoint: ProviderContextCheckpoint) -> Self {
+        self.context_checkpoint = Some(checkpoint);
+        self
     }
 
     pub fn push(&mut self, role: Role, content: impl Into<String>) {
@@ -219,7 +227,17 @@ impl SessionState {
     }
 
     pub fn context_messages(&self) -> Vec<ContextMessage> {
-        self.transcript
+        let start = self
+            .context_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| {
+                usize::try_from(checkpoint.covered_through_ordinal)
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1))
+            })
+            .filter(|start| *start <= self.transcript.len())
+            .unwrap_or(0);
+        self.transcript[start..]
             .iter()
             .map(|message| ContextMessage::new(message.role.label(), message.content.clone()))
             .collect()
@@ -821,10 +839,23 @@ impl ProviderRequestPreparer {
             &input.config.prompt,
             &input.config.hooks,
         );
+        // Native provider sessions own the normal 248k compaction boundary.
+        // The shared layer only intervenes at the 250k hard ceiling so it can
+        // still bootstrap an oversized legacy transcript safely.
+        let provider_limits = match input.config.provider_family {
+            ProviderFamily::Codex | ProviderFamily::Claude | ProviderFamily::Copilot => {
+                ContextLimits::new(
+                    input.config.context.limits.hard_tokens,
+                    input.config.context.limits.hard_tokens,
+                    input.config.context.limits.tool_result_inline_bytes,
+                )
+            }
+            ProviderFamily::Generic => input.config.context.limits.clone(),
+        };
         let prepared_context = prepare_context(
             &system_preamble,
             &input.state.context_messages(),
-            &input.config.context.limits,
+            &provider_limits,
             &counter,
         )?;
 
@@ -848,6 +879,7 @@ impl ProviderRequestPreparer {
             ),
             metadata: request_metadata(input.config, input.round),
             images: input.turn_images,
+            context_checkpoint: input.state.context_checkpoint.clone(),
         };
 
         Ok(PreparedProviderTurn {

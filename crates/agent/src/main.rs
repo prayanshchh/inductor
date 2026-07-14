@@ -8,16 +8,17 @@ use auth::{AuthDetector, ProviderKind, RuntimeCredentialLoader};
 use base64::{Engine as _, engine::general_purpose};
 use clap::{Parser, Subcommand, ValueEnum};
 use context::{
-    ApproxTokenCounter, ContextLimits, ContextMessage, ModelEffort, ProviderFamily, TokenCounter,
-    compact_messages, prepare_context, translate_effort,
+    ApproxTokenCounter, ContextLimits, ContextMessage, DEFAULT_CONTEXT_SOFT_TOKENS,
+    MAX_CONTEXT_TOKENS, ModelEffort, ProviderFamily, TokenCounter, compact_messages,
+    prepare_context, translate_effort,
 };
 use diff::{DiffRequest, diff_worktree};
 use futures_util::StreamExt;
 use git::{CreateWorktreeRequest, WorktreeManager};
 use harness_core::{
     ApprovalPolicy, ImageAttachment, ModelRole, PermissionDecision, PermissionRequestId,
-    PermissionResponse, ProviderId, QuestionAnswer, QuestionResponse, SessionEvent, SessionId,
-    SessionStatus, StopReason, ToolCallId, TurnRequest, WorkspaceId,
+    PermissionResponse, ProviderContextCheckpoint, ProviderId, QuestionAnswer, QuestionResponse,
+    SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId, TurnRequest, WorkspaceId,
 };
 use harness_runtime::{
     AllowStore, ApprovalRequest, Approver, AutoApprove, HarnessConfig, Role, SessionState,
@@ -137,10 +138,10 @@ enum Command {
         #[arg(long, hide = true)]
         no_sandbox: bool,
 
-        #[arg(long, default_value_t = 16_000)]
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_SOFT_TOKENS)]
         soft_tokens: usize,
 
-        #[arg(long, default_value_t = 24_000)]
+        #[arg(long, default_value_t = MAX_CONTEXT_TOKENS)]
         hard_tokens: usize,
 
         #[arg(long, default_value_t = 4 * 1024)]
@@ -265,10 +266,10 @@ enum ContextCommand {
         #[arg(long)]
         text: String,
 
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_SOFT_TOKENS)]
         soft_tokens: usize,
 
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = MAX_CONTEXT_TOKENS)]
         hard_tokens: usize,
     },
     Effort {
@@ -959,6 +960,7 @@ async fn run_provider_command(command: ProviderCommand) -> Result<(), String> {
                 tool_names: Vec::new(),
                 metadata: serde_json::Value::Null,
                 images: Vec::new(),
+                context_checkpoint: None,
             };
             let cancel = CancellationToken::new();
             // The smoke-test `provider turn` command auto-approves: it never
@@ -1018,7 +1020,7 @@ fn provider_plugin_for_kind(
             CodexProvider::new().map_err(|err| err.to_string())?,
         )),
         ProviderKind::Copilot => Ok(Box::new(
-            CopilotProvider::new().map_err(|err| err.to_string())?,
+            CopilotProvider::with_cwd(cwd).map_err(|err| err.to_string())?,
         )),
     }
 }
@@ -2103,7 +2105,9 @@ async fn run_harness_command(
     let mut provider_plugin: Box<dyn ProviderPlugin> = match provider {
         ProviderKind::Claude => Box::new(ClaudeProvider::with_cwd(workspace_path.clone())),
         ProviderKind::Codex => Box::new(CodexProvider::new().map_err(|err| err.to_string())?),
-        ProviderKind::Copilot => Box::new(CopilotProvider::new().map_err(|err| err.to_string())?),
+        ProviderKind::Copilot => Box::new(
+            CopilotProvider::with_cwd(workspace_path.clone()).map_err(|err| err.to_string())?,
+        ),
     };
 
     let memory_file = repo_memory_file(&memory_source_workspace, &workspace_path)
@@ -2174,11 +2178,29 @@ async fn run_harness_command(
         .into_iter()
         .map(stored_message_to_transcript)
         .collect::<Result<Vec<_>, _>>()?;
+    let loaded_checkpoint = workspace_db
+        .latest_context_checkpoint(session_id, &provider_id.0, &model)
+        .map_err(|err| err.to_string())?
+        .filter(|checkpoint| {
+            checkpoint.covered_through_ordinal >= 0
+                && checkpoint.covered_through_ordinal < loaded_messages.len() as i64
+        })
+        .map(|checkpoint| ProviderContextCheckpoint {
+            provider_id: checkpoint.provider_id,
+            model: checkpoint.model,
+            kind: checkpoint.kind,
+            payload: checkpoint.payload,
+            summary: checkpoint.summary,
+            covered_through_ordinal: checkpoint.covered_through_ordinal,
+        });
     let mut state = if loaded_messages.is_empty() {
         SessionState::new(session_id)
     } else {
         SessionState::with_transcript(session_id, loaded_messages)
     };
+    if let Some(checkpoint) = loaded_checkpoint {
+        state = state.with_context_checkpoint(checkpoint);
+    }
     let should_silently_name = state.transcript.is_empty() && session_record.display_name.is_none();
 
     let mut config = HarnessConfig::new(model.clone());
@@ -2296,6 +2318,11 @@ async fn run_harness_command(
                 .with_memory_file(memory_file.clone());
                 if matches!(provider, ProviderKind::Claude) {
                     provider_plugin = Box::new(ClaudeProvider::with_cwd(workspace_path.clone()));
+                } else if matches!(provider, ProviderKind::Copilot) {
+                    provider_plugin = Box::new(
+                        CopilotProvider::with_cwd(workspace_path.clone())
+                            .map_err(|err| err.to_string())?,
+                    );
                 }
             }
         }
@@ -2328,6 +2355,8 @@ async fn run_harness_command(
 
     let mut final_status = SessionStatus::Completed;
     let mut saw_terminal_result = false;
+    let mut pending_context_checkpoint: Option<(String, String, String, Value, Option<String>)> =
+        None;
     loop {
         let next_event = tokio::select! {
             request = question_request_rx.recv() => {
@@ -2377,6 +2406,22 @@ async fn run_harness_command(
             }
         };
         match &event {
+            SessionEvent::ContextCheckpoint {
+                provider_id,
+                model,
+                kind,
+                payload,
+                summary,
+                ..
+            } => {
+                pending_context_checkpoint = Some((
+                    provider_id.clone(),
+                    model.clone(),
+                    kind.clone(),
+                    payload.clone(),
+                    summary.clone(),
+                ));
+            }
             SessionEvent::PermissionRequest {
                 tool_name,
                 request_id,
@@ -2486,6 +2531,22 @@ async fn run_harness_command(
     workspace_db
         .replace_messages(session_id, &stored_messages)
         .map_err(|err| err.to_string())?;
+    if let Some((checkpoint_provider, checkpoint_model, kind, payload, summary)) =
+        pending_context_checkpoint
+        && let Some(covered_through_ordinal) = stored_messages.len().checked_sub(1)
+    {
+        workspace_db
+            .save_context_checkpoint(
+                session_id,
+                &checkpoint_provider,
+                &checkpoint_model,
+                &kind,
+                &payload,
+                summary.as_deref(),
+                covered_through_ordinal as i64,
+            )
+            .map_err(|err| err.to_string())?;
+    }
 
     // Generate session name if not already set and we have user messages
     if session_record.display_name.is_none() && final_status == SessionStatus::Completed {
@@ -2975,6 +3036,8 @@ fn persist_event(db: &WorkspaceDb, event: &SessionEvent) -> persistence::Result<
         | SessionEvent::ReasoningDelta { session_id, .. }
         | SessionEvent::ReasoningEnd { session_id, .. }
         | SessionEvent::ContextPrepared { session_id, .. }
+        | SessionEvent::ContextCheckpoint { session_id, .. }
+        | SessionEvent::ContextCompaction { session_id, .. }
         | SessionEvent::ModelRoleChanged { session_id, .. }
         | SessionEvent::StepStart { session_id, .. }
         | SessionEvent::StepFinish { session_id, .. }

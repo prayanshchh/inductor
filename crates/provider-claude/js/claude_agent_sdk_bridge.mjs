@@ -468,7 +468,17 @@ async function run(request) {
     canUseTool: (toolName, toolInput, opts) =>
       requestPermission(toolName, toolInput, opts, approvalPolicy),
     abortController,
+    persistSession: true,
+    settings: {
+      autoCompactEnabled: true,
+      autoCompactWindow: 248000,
+    },
   };
+
+  const resumeSessionId = request.context_checkpoint?.payload?.session_id;
+  if (typeof resumeSessionId === "string" && resumeSessionId.length > 0) {
+    options.resume = resumeSessionId;
+  }
 
   if (request.model) {
     options.model = request.model;
@@ -480,7 +490,39 @@ async function run(request) {
       options,
     });
 
+    let sdkSessionId =
+      typeof resumeSessionId === "string" && resumeSessionId.length > 0
+        ? resumeSessionId
+        : null;
+    let latestCompaction = null;
+
     for await (const message of stream) {
+      if (typeof message.session_id === "string" && message.session_id.length > 0) {
+        sdkSessionId = message.session_id;
+      }
+      if (message.type === "system" && message.subtype === "status") {
+        if (message.status === "compacting") {
+          write({ type: "compaction_status", status: "started", session_id: sdkSessionId });
+        } else if (message.compact_result) {
+          write({
+            type: "compaction_status",
+            status: message.compact_result,
+            error: message.compact_error ?? null,
+            session_id: sdkSessionId,
+          });
+        }
+      }
+      if (message.type === "system" && message.subtype === "compact_boundary") {
+        latestCompaction = {
+          boundary_uuid: message.uuid,
+          compact_metadata: message.compact_metadata,
+        };
+        write({
+          type: "compaction_boundary",
+          session_id: sdkSessionId,
+          ...latestCompaction,
+        });
+      }
       emitToolBlocks(message);
       switch (message.type) {
         case "stream_event":
@@ -499,6 +541,19 @@ async function run(request) {
                 typeof message.total_cost_usd === "number"
                   ? message.total_cost_usd
                   : null,
+            });
+          }
+          if (sdkSessionId) {
+            write({
+              type: "context_checkpoint",
+              provider_id: "claude",
+              model: request.checkpoint_model || request.model,
+              kind: "claude_agent_sdk_session",
+              payload: {
+                session_id: sdkSessionId,
+                compaction: latestCompaction,
+              },
+              summary: null,
             });
           }
           if (message.subtype === "error" || message.is_error) {

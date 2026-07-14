@@ -92,6 +92,13 @@ pub trait TokenCounter: Send + Sync {
     fn count_tokens(&self, text: &str) -> usize;
 }
 
+/// Start compacting before the provider ceiling so instructions, tool schemas,
+/// and the next model output still have room in the 250k context window.
+pub const DEFAULT_CONTEXT_SOFT_TOKENS: usize = 248_000;
+/// Inductor never intentionally sends more than this many estimated text tokens
+/// to a provider.
+pub const MAX_CONTEXT_TOKENS: usize = 250_000;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ApproxTokenCounter;
 
@@ -113,8 +120,8 @@ pub struct ContextLimits {
 impl Default for ContextLimits {
     fn default() -> Self {
         Self {
-            soft_tokens: 16_000,
-            hard_tokens: 24_000,
+            soft_tokens: DEFAULT_CONTEXT_SOFT_TOKENS,
+            hard_tokens: MAX_CONTEXT_TOKENS,
             tool_result_inline_bytes: 4 * 1024,
         }
     }
@@ -122,9 +129,11 @@ impl Default for ContextLimits {
 
 impl ContextLimits {
     pub fn new(soft_tokens: usize, hard_tokens: usize, tool_result_inline_bytes: usize) -> Self {
+        let hard_tokens = hard_tokens.clamp(1, MAX_CONTEXT_TOKENS);
+        let soft_tokens = soft_tokens.clamp(1, hard_tokens);
         Self {
             soft_tokens,
-            hard_tokens: hard_tokens.max(soft_tokens),
+            hard_tokens,
             tool_result_inline_bytes,
         }
     }
@@ -162,9 +171,13 @@ pub fn prepare_context(
     limits: &ContextLimits,
     counter: &dyn TokenCounter,
 ) -> Result<PreparedContext, ContextError> {
+    // Deserialized/runtime-provided limits can bypass `ContextLimits::new`, so
+    // enforce the global ceiling again at the actual provider boundary.
+    let hard_limit = limits.hard_tokens.clamp(1, MAX_CONTEXT_TOKENS);
+    let soft_limit = limits.soft_tokens.clamp(1, hard_limit);
     let prompt = render_prompt(system_preamble, messages);
     let original_token_count = counter.count_tokens(&prompt);
-    if original_token_count <= limits.soft_tokens {
+    if original_token_count <= soft_limit {
         return Ok(PreparedContext {
             prompt,
             messages: messages.to_vec(),
@@ -175,16 +188,21 @@ pub fn prepare_context(
         });
     }
 
-    let compacted_messages = compact_messages(messages);
-    let summary = compacted_messages
-        .first()
-        .map(|message| message.content.clone());
+    let (compacted_messages, summarized_count) =
+        compact_messages_to_fit(system_preamble, messages, soft_limit, hard_limit, counter);
+    let summary = (summarized_count > 0)
+        .then(|| {
+            compacted_messages
+                .first()
+                .map(|message| message.content.clone())
+        })
+        .flatten();
     let prompt = render_prompt(system_preamble, &compacted_messages);
     let token_count = counter.count_tokens(&prompt);
-    if token_count > limits.hard_tokens {
+    if token_count > hard_limit {
         return Err(ContextError::HardLimitExceeded {
             tokens: token_count,
-            hard_limit: limits.hard_tokens,
+            hard_limit,
         });
     }
 
@@ -212,18 +230,124 @@ pub fn render_prompt(system_preamble: &str, messages: &[ContextMessage]) -> Stri
 }
 
 pub fn compact_messages(messages: &[ContextMessage]) -> Vec<ContextMessage> {
-    if messages.len() <= 4 {
-        return messages.to_vec();
+    compact_messages_keep_recent(messages, 4).0
+}
+
+fn compact_messages_to_fit(
+    system_preamble: &str,
+    messages: &[ContextMessage],
+    target_tokens: usize,
+    hard_limit: usize,
+    counter: &dyn TokenCounter,
+) -> (Vec<ContextMessage>, usize) {
+    if messages.is_empty() {
+        return (Vec::new(), 0);
     }
 
-    let split_at = messages.len().saturating_sub(4);
-    let mut compacted = Vec::with_capacity(5);
+    let mut keep_recent = messages.len().min(4);
+    loop {
+        let (mut compacted, summarized_count) = compact_messages_keep_recent(messages, keep_recent);
+        if counter.count_tokens(&render_prompt(system_preamble, &compacted)) <= target_tokens {
+            return (compacted, summarized_count);
+        }
+        if keep_recent > 1 {
+            keep_recent -= 1;
+            continue;
+        }
+
+        // A preview-rich summary is useful when there is room, but the newest
+        // message takes priority when the budget is tight.
+        if summarized_count > 0 {
+            compacted[0].content = format!("Compacted {summarized_count} earlier message(s).");
+        }
+        truncate_latest_message_to_fit(
+            system_preamble,
+            &mut compacted,
+            target_tokens,
+            hard_limit,
+            counter,
+        );
+        return (compacted, summarized_count);
+    }
+}
+
+fn compact_messages_keep_recent(
+    messages: &[ContextMessage],
+    keep_recent: usize,
+) -> (Vec<ContextMessage>, usize) {
+    if messages.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let keep_recent = keep_recent.clamp(1, messages.len());
+    let split_at = messages.len().saturating_sub(keep_recent);
+    if split_at == 0 {
+        return (messages.to_vec(), 0);
+    }
+
+    let mut compacted = Vec::with_capacity(keep_recent + 1);
     compacted.push(ContextMessage::new(
         "System",
         summarize_messages(&messages[..split_at]),
     ));
     compacted.extend_from_slice(&messages[split_at..]);
-    compacted
+    (compacted, split_at)
+}
+
+fn truncate_latest_message_to_fit(
+    system_preamble: &str,
+    messages: &mut [ContextMessage],
+    target_tokens: usize,
+    hard_limit: usize,
+    counter: &dyn TokenCounter,
+) {
+    let Some(last_index) = messages.len().checked_sub(1) else {
+        return;
+    };
+    let original = messages[last_index].content.chars().collect::<Vec<_>>();
+    if original.is_empty() {
+        return;
+    }
+
+    messages[last_index].content.clear();
+    if counter.count_tokens(&render_prompt(system_preamble, messages)) > target_tokens {
+        return;
+    }
+
+    let mut low = 0usize;
+    let mut high = original.len() + 1;
+    while low + 1 < high {
+        let keep = low + (high - low) / 2;
+        messages[last_index].content = middle_compact_chars(&original, keep, hard_limit);
+        if counter.count_tokens(&render_prompt(system_preamble, messages)) <= target_tokens {
+            low = keep;
+        } else {
+            high = keep;
+        }
+    }
+
+    messages[last_index].content = middle_compact_chars(&original, low, hard_limit);
+}
+
+fn middle_compact_chars(chars: &[char], keep: usize, hard_limit: usize) -> String {
+    if keep >= chars.len() {
+        return chars.iter().collect();
+    }
+    if keep == 0 {
+        return String::new();
+    }
+
+    let head = keep.div_ceil(2);
+    let tail = keep / 2;
+    let omitted = chars.len() - keep;
+    let mut output = chars[..head].iter().collect::<String>();
+    output.push_str(&format!(
+        "\n\n[Inductor omitted {omitted} character(s) to keep provider input under the {hard_limit}-token ceiling.]\n\n"
+    ));
+    if tail > 0 {
+        output.extend(chars[chars.len() - tail..].iter());
+    }
+    output
 }
 
 pub fn summarize_messages(messages: &[ContextMessage]) -> String {
@@ -391,6 +515,22 @@ mod tests {
     }
 
     #[test]
+    fn defaults_use_250k_ceiling_with_early_compaction() {
+        let limits = ContextLimits::default();
+
+        assert_eq!(limits.soft_tokens, DEFAULT_CONTEXT_SOFT_TOKENS);
+        assert_eq!(limits.hard_tokens, MAX_CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn explicit_limits_cannot_exceed_global_ceiling() {
+        let limits = ContextLimits::new(300_000, 400_000, 100);
+
+        assert_eq!(limits.soft_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(limits.hard_tokens, MAX_CONTEXT_TOKENS);
+    }
+
+    #[test]
     fn below_soft_limit_does_not_compact() {
         let counter = ApproxTokenCounter;
         let messages = vec![ContextMessage::new("User", "short")];
@@ -422,12 +562,12 @@ mod tests {
         .unwrap();
 
         assert!(prepared.compacted);
-        assert!(prepared.prompt.contains("Compacted 6 earlier message"));
+        assert!(prepared.prompt.contains("Compacted"));
         assert!(prepared.prompt.contains("message 9"));
     }
 
     #[test]
-    fn above_hard_limit_errors_after_compaction() {
+    fn oversized_recent_messages_are_compacted_below_hard_limit() {
         let counter = ApproxTokenCounter;
         let messages = (0..10)
             .map(|index| {
@@ -435,9 +575,26 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let error = prepare_context(
+        let prepared = prepare_context(
             "system",
             &messages,
+            &ContextLimits::new(100, 150, 100),
+            &counter,
+        )
+        .unwrap();
+
+        assert!(prepared.compacted);
+        assert!(prepared.token_count <= 150);
+        assert!(prepared.prompt.contains("message 9"));
+        assert!(prepared.prompt.contains("Inductor omitted"));
+    }
+
+    #[test]
+    fn oversized_system_preamble_still_reports_hard_limit() {
+        let counter = ApproxTokenCounter;
+        let error = prepare_context(
+            &"system ".repeat(200),
+            &[],
             &ContextLimits::new(10, 20, 100),
             &counter,
         )

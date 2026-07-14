@@ -137,6 +137,33 @@ fn render_prompt_includes_preamble_and_transcript() {
 }
 
 #[test]
+fn provider_checkpoint_hides_only_covered_messages_from_provider_context() {
+    let session_id = SessionId::new();
+    let state = SessionState::with_transcript(
+        session_id,
+        vec![
+            TranscriptMessage::new(Role::User, "old user message"),
+            TranscriptMessage::new(Role::Assistant, "old assistant message"),
+            TranscriptMessage::new(Role::User, "new tail message"),
+        ],
+    )
+    .with_context_checkpoint(ProviderContextCheckpoint {
+        provider_id: "codex".to_string(),
+        model: "gpt-5.5".to_string(),
+        kind: "codex_responses_compaction".to_string(),
+        payload: json!([{"type": "compaction", "encrypted_content": "opaque"}]),
+        summary: None,
+        covered_through_ordinal: 1,
+    });
+
+    let context = state.context_messages();
+
+    assert_eq!(state.transcript.len(), 3, "UI history remains complete");
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].content, "new tail message");
+}
+
+#[test]
 fn context_preparation_compacts_when_soft_limit_is_exceeded() {
     let mut state = SessionState::new(SessionId::new());
     for index in 0..10 {
@@ -199,6 +226,7 @@ fn provider_request_preparer_builds_complete_turn_request() {
     };
     let mut config = HarnessConfig::new("gpt-5.5");
     config.provider_family = ProviderFamily::Codex;
+    config.context.limits = ContextLimits::new(1, 250_000, 1024);
     config.model_effort = ModelEffort::High;
     config.approval_policy = ApprovalPolicy::OnRequest;
     config.model_role = Some(ModelRole::Executor);
@@ -215,7 +243,7 @@ fn provider_request_preparer_builds_complete_turn_request() {
 
     assert!(matches!(
         prepared.context_event,
-        SessionEvent::ContextPrepared { token_count, .. } if token_count > 0
+        SessionEvent::ContextPrepared { token_count, compacted: false, .. } if token_count > 1
     ));
     assert_eq!(prepared.request.session_id, state.session_id);
     assert_eq!(prepared.request.model, "gpt-5.5");

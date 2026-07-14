@@ -10,8 +10,8 @@ use async_stream::try_stream;
 use futures_core::Stream;
 use harness_core::{
     ImageAttachment, ModelInfo, ModelMessage, PermissionDecision, PermissionRequestId,
-    ProviderCapabilities, SessionEvent, SessionId, SessionStatus, StopReason, ToolCallId,
-    TurnRequest,
+    ProviderCapabilities, ProviderContextCheckpoint, SessionEvent, SessionId, SessionStatus,
+    StopReason, ToolCallId, TurnRequest,
 };
 use provider_core::{PermissionResponses, ProviderAuth, ProviderPlugin, ProviderToolResponse};
 use serde_json::{Value, json};
@@ -154,7 +154,9 @@ impl ProviderPlugin for ClaudeProvider {
             .and_then(Value::as_str)
             .unwrap_or("never")
             .to_string();
+        let checkpoint_model = req.model.clone();
         let model = normalize_claude_model(&req.model).to_string();
+        let context_checkpoint = req.context_checkpoint;
         let idle_timeout = claude_idle_timeout();
 
         let stream = try_stream! {
@@ -168,11 +170,13 @@ impl ProviderPlugin for ClaudeProvider {
                 prompt,
                 cwd,
                 model,
+                checkpoint_model,
                 messages,
                 images,
                 system_prompt,
                 approval_policy,
                 tool_names,
+                context_checkpoint,
             };
             if let Err(error) = timeout(idle_timeout, bridge.send_request(&request)).await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!(
@@ -509,11 +513,13 @@ struct BridgeRequest {
     prompt: String,
     cwd: PathBuf,
     model: String,
+    checkpoint_model: String,
     messages: Vec<ModelMessage>,
     images: Vec<ImageAttachment>,
     system_prompt: Option<String>,
     approval_policy: String,
     tool_names: Vec<String>,
+    context_checkpoint: Option<ProviderContextCheckpoint>,
 }
 
 struct SdkBridge {
@@ -604,6 +610,7 @@ impl SdkBridge {
             "prompt": request.prompt,
             "cwd": request.cwd,
             "model": request.model,
+            "checkpoint_model": request.checkpoint_model,
             "messages": request.messages,
             "images": request.images,
             "system_prompt": request.system_prompt,
@@ -612,6 +619,7 @@ impl SdkBridge {
                 .into_iter()
                 .filter(|definition| allowed.contains(definition.name.as_str()))
                 .collect::<Vec<_>>(),
+            "context_checkpoint": request.context_checkpoint,
         }))
         .await
     }
@@ -727,6 +735,55 @@ fn bridge_event_to_session_event(session_id: SessionId, value: &Value) -> Option
             output_tokens: value.get("output_tokens").and_then(Value::as_u64),
             cache_read_tokens: value.get("cache_read_tokens").and_then(Value::as_u64),
             total_cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+        }),
+        "compaction_status" => Some(SessionEvent::ContextCompaction {
+            session_id,
+            provider_id: "claude".to_string(),
+            phase: value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            pre_tokens: None,
+            post_tokens: None,
+            summary: None,
+            details: Some(value.clone()),
+        }),
+        "compaction_boundary" => Some(SessionEvent::ContextCompaction {
+            session_id,
+            provider_id: "claude".to_string(),
+            phase: "boundary".to_string(),
+            pre_tokens: value
+                .pointer("/compact_metadata/pre_tokens")
+                .and_then(Value::as_u64),
+            post_tokens: value
+                .pointer("/compact_metadata/post_tokens")
+                .and_then(Value::as_u64),
+            summary: None,
+            details: Some(value.clone()),
+        }),
+        "context_checkpoint" => Some(SessionEvent::ContextCheckpoint {
+            session_id,
+            provider_id: value
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .unwrap_or("claude")
+                .to_string(),
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CLAUDE_MODEL)
+                .to_string(),
+            kind: value
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("claude_agent_sdk_session")
+                .to_string(),
+            payload: value.get("payload").cloned().unwrap_or(Value::Null),
+            summary: value
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         _ => None,
     }
@@ -861,6 +918,52 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn bridge_compaction_boundary_keeps_sdk_metadata() {
+        let session_id = SessionId::new();
+        let value = json!({
+            "type": "compaction_boundary",
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": 248_100,
+                "post_tokens": 12_000
+            }
+        });
+
+        let event = bridge_event_to_session_event(session_id, &value).unwrap();
+
+        assert!(matches!(
+            event,
+            SessionEvent::ContextCompaction {
+                phase,
+                pre_tokens: Some(248_100),
+                post_tokens: Some(12_000),
+                details: Some(_),
+                ..
+            } if phase == "boundary"
+        ));
+    }
+
+    #[test]
+    fn bridge_checkpoint_keeps_resumable_claude_session() {
+        let session_id = SessionId::new();
+        let value = json!({
+            "type": "context_checkpoint",
+            "provider_id": "claude",
+            "model": "sonnet",
+            "kind": "claude_agent_sdk_session",
+            "payload": {"session_id": "sdk-session-1"}
+        });
+
+        let event = bridge_event_to_session_event(session_id, &value).unwrap();
+
+        assert!(matches!(
+            event,
+            SessionEvent::ContextCheckpoint { payload, .. }
+                if payload["session_id"] == "sdk-session-1"
         ));
     }
 

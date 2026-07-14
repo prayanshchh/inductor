@@ -1,6 +1,7 @@
 use std::{pin::Pin, time::Duration};
 
 use async_stream::try_stream;
+use context::DEFAULT_CONTEXT_SOFT_TOKENS;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use harness_core::{
@@ -91,7 +92,11 @@ impl CodexProvider {
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "stream": true,
-            "store": false
+            "store": false,
+            "context_management": [{
+                "type": "compaction",
+                "compact_threshold": DEFAULT_CONTEXT_SOFT_TOKENS
+            }]
         });
         if let Some(effort) = req.metadata.get("model_effort").and_then(Value::as_str) {
             // The Responses API nests effort under `reasoning`; a top-level
@@ -144,11 +149,19 @@ fn normalize_codex_reasoning_effort(model: &str, effort: &str) -> &'static str {
 }
 
 fn codex_input_messages(req: &TurnRequest) -> Vec<Value> {
-    if req.messages.is_empty() {
+    let mut input = req
+        .context_checkpoint
+        .as_ref()
+        .filter(|checkpoint| checkpoint.kind == "codex_responses_compaction")
+        .and_then(|checkpoint| checkpoint.payload.as_array().cloned())
+        .unwrap_or_default();
+    let tail = if req.messages.is_empty() {
         legacy_input_messages(req)
     } else {
         req.messages.iter().filter_map(codex_message).collect()
-    }
+    };
+    input.extend(tail);
+    input
 }
 
 fn legacy_input_messages(req: &TurnRequest) -> Vec<Value> {
@@ -462,7 +475,22 @@ impl ProviderPlugin for CodexProvider {
                     }
                 }
 
+                input.extend(output_items);
+                prune_input_before_latest_compaction(&mut input);
+
                 if pending_function_calls.is_empty() {
+                    if input.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("compaction")
+                    }) {
+                        yield SessionEvent::ContextCheckpoint {
+                            session_id,
+                            provider_id: provider.id().to_string(),
+                            model: req.model.clone(),
+                            kind: "codex_responses_compaction".to_string(),
+                            payload: Value::Array(input.clone()),
+                            summary: None,
+                        };
+                    }
                     yield SessionEvent::Result {
                         session_id,
                         stop_reason: StopReason::EndTurn,
@@ -470,7 +498,6 @@ impl ProviderPlugin for CodexProvider {
                     return;
                 }
 
-                input.extend(output_items);
                 for pending in pending_function_calls {
                     let tool_result = loop {
                         let response = tokio::select! {
@@ -745,6 +772,13 @@ fn parse_response_stream_event_detail(
                     });
                     parsed
                 }
+                // Server-side compaction is opaque. Replay the item exactly as
+                // returned, then discard input preceding the newest item before
+                // the next stateless Responses request.
+                Some("compaction") => {
+                    parsed.output_items.push(item.clone());
+                    parsed
+                }
                 // OpenAI-hosted web search runs server-side — surface it for
                 // display only (no local execution / permission needed).
                 Some("web_search_call") => {
@@ -804,6 +838,18 @@ fn function_call_input_item(name: &str, call_id: &str, item: &Value) -> Value {
         "name": name,
         "arguments": arguments,
     })
+}
+
+fn prune_input_before_latest_compaction(input: &mut Vec<Value>) {
+    let Some(index) = input
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+    else {
+        return;
+    };
+    if index > 0 {
+        input.drain(..index);
+    }
 }
 
 fn function_call_output_item(
@@ -917,8 +963,7 @@ fn extend_models_from_env(models: &mut Vec<ModelInfo>, env_key: &str) {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use harness_core::ImageAttachment;
-    use harness_core::SessionId;
+    use harness_core::{ImageAttachment, ProviderContextCheckpoint, SessionId};
     use secrecy::SecretString;
     use std::time::Duration;
     use tokio::{
@@ -940,6 +985,7 @@ mod tests {
                 .collect(),
             metadata: Value::Null,
             images: Vec::new(),
+            context_checkpoint: None,
         }
     }
 
@@ -998,6 +1044,11 @@ mod tests {
         assert!(body["instructions"].as_str().unwrap().contains("Inductor"));
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["content"][0]["text"], "say hello");
+        assert_eq!(body["context_management"][0]["type"], "compaction");
+        assert_eq!(
+            body["context_management"][0]["compact_threshold"],
+            DEFAULT_CONTEXT_SOFT_TOKENS
+        );
     }
 
     #[test]
@@ -1079,6 +1130,7 @@ mod tests {
                 height: Some(20),
                 file_size: 6,
             }],
+            context_checkpoint: None,
         });
 
         let content = body["input"][0]["content"].as_array().unwrap();
@@ -1240,6 +1292,67 @@ data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_06
         assert!(parsed.output_items.is_empty());
         assert!(parsed.function_calls.is_empty());
         assert!(parsed.events.is_empty());
+    }
+
+    #[test]
+    fn compaction_output_item_is_preserved_for_stateless_replay() {
+        let session_id = SessionId::new();
+        let raw = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"compaction","id":"cmp_1","encrypted_content":"opaque"}}
+"#;
+
+        let parsed = parse_response_stream_event_detail(session_id, raw);
+
+        assert_eq!(
+            parsed.output_items,
+            vec![json!({
+                "type": "compaction",
+                "id": "cmp_1",
+                "encrypted_content": "opaque"
+            })]
+        );
+        assert!(parsed.function_calls.is_empty());
+        assert!(parsed.events.is_empty());
+    }
+
+    #[test]
+    fn persisted_compaction_checkpoint_is_replayed_unchanged_before_new_tail() {
+        let opaque = json!({
+            "type": "compaction",
+            "id": "cmp_persisted",
+            "encrypted_content": "opaque-provider-bytes"
+        });
+        let mut request = text_request("new work");
+        request.messages = vec![ModelMessage::text("user", "new work")];
+        request.context_checkpoint = Some(ProviderContextCheckpoint {
+            provider_id: "codex".to_string(),
+            model: "gpt-test".to_string(),
+            kind: "codex_responses_compaction".to_string(),
+            payload: json!([opaque.clone()]),
+            summary: None,
+            covered_through_ordinal: 7,
+        });
+
+        let input = codex_input_messages(&request);
+
+        assert_eq!(input[0], opaque);
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "new work");
+    }
+
+    #[test]
+    fn input_before_latest_compaction_item_is_dropped() {
+        let mut input = vec![
+            json!({"role": "user", "content": "old context"}),
+            json!({"type": "compaction", "encrypted_content": "opaque"}),
+            json!({"type": "function_call", "call_id": "call_1"}),
+        ];
+
+        prune_input_before_latest_compaction(&mut input);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(input[1]["type"], "function_call");
     }
 
     #[test]
